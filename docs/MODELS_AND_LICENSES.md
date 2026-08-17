@@ -31,9 +31,9 @@ gradio==6.17.0
 本项目固定存储路径：
 
 ```text
-G:\duikouxing\models\dots.tts-soar
-G:\duikouxing\models\dots.tts-mf
-G:\duikouxing\.cache\huggingface
+E:\duikouxing\models\dots.tts-soar
+E:\duikouxing\models\dots.tts-mf
+E:\duikouxing\.cache\huggingface
 ```
 
 ## 2. MuseTalk 1.5
@@ -51,8 +51,8 @@ G:\duikouxing\.cache\huggingface
 本项目固定仓库和权重路径为：
 
 ```text
-G:\duikouxing\external\MuseTalk
-G:\duikouxing\external\MuseTalk\models
+E:\duikouxing\external\MuseTalk
+E:\duikouxing\external\MuseTalk\models
 ```
 
 官方 Python 依赖：

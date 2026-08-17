@@ -1,4 +1,10 @@
 # Copied from studio-dots-ai/dots.tts constraints/recommended.txt at 2026-08-17.
+# Windows adaptation (2026-08-17):
+# - gradio==6.17.0 does not exist on PyPI (max 6.9.0); this project does not
+#   use the dots.tts web UI, so setup_conda.ps1 installs dots.tts with --no-deps
+#   and skips gradio entirely.
+# - WeTextProcessing needs pynini, which has no Windows wheel on PyPI;
+#   setup_conda.ps1 installs pynini from the conda-forge channel instead.
 torch==2.8.0
 torchaudio==2.8.0
 transformers==4.57.0
@@ -8,9 +14,9 @@ numpy==2.2.6
 pydantic==2.12.5
 PyYAML==6.0.3
 safetensors==0.8.0rc0
-gradio==6.17.0
+# gradio==6.17.0  # not on PyPI; skipped (no web UI usage)
 accelerate==1.12.0
 tensorboard==2.20.0
 ruff==0.15.12
-qwen-asr==0.0.6
-
+# qwen-asr==0.0.6  # optional extra; pins transformers==4.57.6 which conflicts
+                   # with the recommended 4.57.0; not used by this project

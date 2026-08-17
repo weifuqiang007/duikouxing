@@ -1,14 +1,14 @@
 # 安装部署手册
 
-项目根目录固定为 `G:\duikouxing`。公司 RTX 3060 12GB 与家庭 RTX 4070 12GB 分别独立安装，不假设两台电脑能联网互访。
+项目根目录为本仓库所在目录（本机为 `E:\duikouxing`），不得位于 C 盘；配置中的相对路径均相对 `config/` 目录解析，换盘部署时无需修改。公司 RTX 3060 12GB 与家庭 RTX 4070 12GB 分别独立安装，不假设两台电脑能联网互访。
 
 ## 1. 固定版本
 
 | 环境 | 路径 | Python |
 |---|---|---|
-| 编排 | `G:\duikouxing\.conda-envs\digital-human` | 3.11.9 |
-| dots.tts | `G:\duikouxing\.conda-envs\dots-tts` | 3.11.9 |
-| MuseTalk | `G:\duikouxing\.conda-envs\musetalk` | 3.10.14 |
+| 编排 | `E:\duikouxing\.conda-envs\digital-human` | 3.11.9 |
+| dots.tts | `E:\duikouxing\.conda-envs\dots-tts` | 3.11.9 |
+| MuseTalk | `E:\duikouxing\.conda-envs\musetalk` | 3.10.14 |
 
 不得将三个环境合并。
 
@@ -17,29 +17,29 @@
 安装和运行脚本强制设置：
 
 ```text
-HF_HOME=G:\duikouxing\.cache\huggingface
-HF_HUB_CACHE=G:\duikouxing\.cache\huggingface\hub
-TORCH_HOME=G:\duikouxing\.cache\torch
-PIP_CACHE_DIR=G:\duikouxing\.cache\pip
-XDG_CACHE_HOME=G:\duikouxing\.cache
-TEMP=G:\duikouxing\.tmp
-TMP=G:\duikouxing\.tmp
+HF_HOME=E:\duikouxing\.cache\huggingface
+HF_HUB_CACHE=E:\duikouxing\.cache\huggingface\hub
+TORCH_HOME=E:\duikouxing\.cache\torch
+PIP_CACHE_DIR=E:\duikouxing\.cache\pip
+XDG_CACHE_HOME=E:\duikouxing\.cache
+TEMP=E:\duikouxing\.tmp
+TMP=E:\duikouxing\.tmp
 ```
 
 dots.tts 权重放在：
 
 ```text
-G:\duikouxing\models\dots.tts-soar
-G:\duikouxing\models\dots.tts-mf
+E:\duikouxing\models\dots.tts-soar
+E:\duikouxing\models\dots.tts-mf
 ```
 
 MuseTalk 为保持官方目录结构，放在：
 
 ```text
-G:\duikouxing\external\MuseTalk\models
+E:\duikouxing\external\MuseTalk\models
 ```
 
-以上全部位于 `G:\duikouxing` 下，不使用 C 盘默认模型缓存。
+以上全部位于 `E:\duikouxing` 下，不使用 C 盘默认模型缓存。
 
 ## 3. 系统依赖
 
@@ -64,7 +64,7 @@ ffprobe -version
 ## 4. 一键建立 Conda 环境
 
 ```powershell
-Set-Location G:\duikouxing
+Set-Location E:\duikouxing
 .\scripts\setup_conda.ps1
 ```
 
@@ -82,9 +82,9 @@ dots.tts 环境按照 PyTorch 官方历史版本命令安装 `torch==2.8.0`、`t
 安装后验证 Python 版本：
 
 ```powershell
-conda run -p G:\duikouxing\.conda-envs\digital-human python --version
-conda run -p G:\duikouxing\.conda-envs\dots-tts python --version
-conda run -p G:\duikouxing\.conda-envs\musetalk python --version
+conda run -p E:\duikouxing\.conda-envs\digital-human python --version
+conda run -p E:\duikouxing\.conda-envs\dots-tts python --version
+conda run -p E:\duikouxing\.conda-envs\musetalk python --version
 ```
 
 预期分别为 3.11.9、3.11.9、3.10.14。
@@ -92,7 +92,7 @@ conda run -p G:\duikouxing\.conda-envs\musetalk python --version
 ## 5. 下载模型
 
 ```powershell
-Set-Location G:\duikouxing
+Set-Location E:\duikouxing
 .\scripts\download_models.ps1
 ```
 
@@ -112,7 +112,7 @@ MuseTalk 权重文件名和来源严格对应固定提交中的官方 `download_
 完成后生成：
 
 ```text
-G:\duikouxing\model-checksums.json
+E:\duikouxing\model-checksums.json
 ```
 
 该文件记录全部权重 SHA-256、文件大小和绝对路径。
@@ -133,7 +133,7 @@ runtime:
 检查：
 
 ```powershell
-G:\duikouxing\.conda-envs\digital-human\python.exe `
+E:\duikouxing\.conda-envs\digital-human\python.exe `
   -m digital_human.cli doctor --profile office
 ```
 
@@ -155,7 +155,7 @@ runtime:
 检查：
 
 ```powershell
-G:\duikouxing\.conda-envs\digital-human\python.exe `
+E:\duikouxing\.conda-envs\digital-human\python.exe `
   -m digital_human.cli doctor --profile home
 ```
 

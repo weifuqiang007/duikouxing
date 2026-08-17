@@ -2,10 +2,11 @@ job_id: "demo-001"
 consent_confirmed: false
 local_only: true
 
-source_video: "G:/duikouxing/samples/source.mp4"
+# 相对路径基于 config/ 目录解析。
+source_video: "../samples/source.mp4"
 
 # 推荐单独准备 10～20 秒干净参考音频；如果留空，则从 source_video 截取。
-reference_audio: "G:/duikouxing/samples/reference.wav"
+reference_audio: "../samples/reference.wav"
 reference_start_seconds: 0.0
 reference_duration_seconds: 15.0
 

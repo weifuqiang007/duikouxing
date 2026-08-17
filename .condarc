@@ -1,0 +1,8 @@
+channels:
+  - defaults
+default_channels:
+  - https://mirror.nju.edu.cn/anaconda/pkgs/main
+  - https://mirror.nju.edu.cn/anaconda/pkgs/r
+show_channel_urls: true
+pkgs_dirs:
+  - E:/duikouxing/.conda-pkgs

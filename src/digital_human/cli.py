@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
+from .annotate import select_mouth_roi
 from .composite import preview_roi
-from .config import ConfigurationError, load_job_config, load_local_config
+from .config import (
+    ConfigurationError,
+    MouthROI,
+    load_job_config,
+    load_local_config,
+)
 from .pipeline import Pipeline
 from .process import CommandError, conda_run, run_command
 
@@ -151,6 +158,23 @@ def _doctor(local_path: Path) -> int:
     return 1 if failed else 0
 
 
+def _write_back_mouth_roi(path: Path, roi: MouthROI) -> None:
+    """只替换 mouth_roi 块里的数值行，保留文件中所有注释和其他内容。"""
+    text = path.read_text(encoding="utf-8")
+    for key, value in (
+        ("center_x", roi.center_x),
+        ("center_y", roi.center_y),
+        ("width", roi.width),
+        ("height", roi.height),
+    ):
+        text, replaced = re.subn(
+            rf"(?m)^(\s*{key}:\s*)[0-9.]+", rf"\g<1>{value}", text, count=1
+        )
+        if replaced != 1:
+            raise ConfigurationError(f"任务配置中找不到 mouth_roi.{key} 字段: {path}")
+    path.write_text(text, encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地口型数字人流水线")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -164,6 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
     preview = sub.add_parser("preview-roi", help="生成嘴部 ROI 首帧预览")
     preview.add_argument("--job", type=Path, required=True)
     preview.add_argument("--output", type=Path, default=Path("roi-preview.jpg"))
+    annotate = sub.add_parser(
+        "annotate-roi", help="交互式拖拽标注嘴部 ROI 并写回任务配置"
+    )
+    annotate.add_argument("--job", type=Path, required=True)
+    annotate.add_argument(
+        "--at-seconds", type=float, default=0.0, help="抓取该时间点的视频帧（默认首帧）"
+    )
+    annotate.add_argument(
+        "--output", type=Path, default=Path("roi-annotated.jpg"), help="标注结果复核图"
+    )
     run = sub.add_parser("run", help="执行完整任务")
     run.add_argument("--job", type=Path, required=True)
     run.add_argument("--config", type=Path)
@@ -183,6 +217,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return _doctor(_local_path(args))
         job = load_job_config(args.job.resolve())
+        if args.command == "annotate-roi":
+            roi = select_mouth_roi(job.source_video, job.mouth_roi, args.at_seconds)
+            if roi is None:
+                print("已取消，配置未修改")
+                return 1
+            _write_back_mouth_roi(args.job.resolve(), roi)
+            preview_roi(job.source_video, roi, args.output.resolve())
+            # 输出保持 ASCII：conda run 在 GBK 控制台回显中文会崩溃
+            print(
+                f"mouth_roi saved to {args.job}: "
+                f"center=({roi.center_x}, {roi.center_y}) "
+                f"size=({roi.width} x {roi.height})"
+            )
+            print(f"review image: {args.output.resolve()}")
+            return 0
         if args.command == "preview-roi":
             preview_roi(job.source_video, job.mouth_roi, args.output.resolve())
             print(args.output.resolve())

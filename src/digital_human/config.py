@@ -11,7 +11,8 @@ class ConfigurationError(ValueError):
     """Raised when a local or job configuration is invalid."""
 
 
-PROJECT_STORAGE_ROOT = Path("G:/duikouxing").resolve()
+# 项目根目录（src/digital_human/config.py 的上两级），环境、模型、任务必须位于此目录下。
+PROJECT_STORAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -91,8 +92,8 @@ def load_local_config(path: Path) -> LocalConfig:
             orchestrator_env=_resolve(str(envs["orchestrator_prefix"]), base),
             dots_env=_resolve(str(envs["dots_tts_prefix"]), base),
             musetalk_env=_resolve(str(envs["musetalk_prefix"]), base),
-            dots_quality_model=str(models["dots_quality"]),
-            dots_fast_model=str(models["dots_fast"]),
+            dots_quality_model=str(_resolve(str(models["dots_quality"]), base)),
+            dots_fast_model=str(_resolve(str(models["dots_fast"]), base)),
             musetalk_repo=_resolve(str(paths["musetalk_repo"]), base),
             jobs_root=_resolve(str(paths["jobs_root"]), base),
             expected_gpu=str(runtime["expected_gpu"]),
@@ -123,13 +124,17 @@ def validate_local_config(config: LocalConfig) -> None:
     )
     for path in local_paths:
         if not path.is_relative_to(PROJECT_STORAGE_ROOT):
-            raise ConfigurationError(f"环境、模型和任务路径必须位于 G:/duikouxing 下: {path}")
+            raise ConfigurationError(
+                f"环境、模型和任务路径必须位于 {PROJECT_STORAGE_ROOT} 下: {path}"
+            )
     for model in (config.dots_quality_model, config.dots_fast_model):
         model_path = Path(model)
         if model_path.is_absolute() and not model_path.resolve().is_relative_to(
             PROJECT_STORAGE_ROOT
         ):
-            raise ConfigurationError(f"本地模型路径必须位于 G:/duikouxing 下: {model}")
+            raise ConfigurationError(
+                f"本地模型路径必须位于 {PROJECT_STORAGE_ROOT} 下: {model}"
+            )
 
 
 def load_job_config(path: Path) -> JobConfig:

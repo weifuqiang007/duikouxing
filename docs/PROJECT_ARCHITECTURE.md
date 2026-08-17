@@ -97,9 +97,9 @@ flowchart LR
 
 | 环境 | 职责 | GPU |
 |---|---|---|
-| `G:\duikouxing\.conda-envs\digital-human` | 编排、FFmpeg、ROI 合成、日志 | Python 3.11.9 |
-| `G:\duikouxing\.conda-envs\dots-tts` | 声音克隆 | Python 3.11.9 |
-| `G:\duikouxing\.conda-envs\musetalk` | 口型生成 | Python 3.10.14 |
+| `E:\duikouxing\.conda-envs\digital-human` | 编排、FFmpeg、ROI 合成、日志 | Python 3.11.9 |
+| `E:\duikouxing\.conda-envs\dots-tts` | 声音克隆 | Python 3.11.9 |
+| `E:\duikouxing\.conda-envs\musetalk` | 口型生成 | Python 3.10.14 |
 
 环境之间仅通过 WAV、MP4、YAML、JSON 文件和子进程退出码通信。
 
@@ -109,8 +109,8 @@ flowchart LR
 
 | 配置 | 机器 | 任务目录 | MuseTalk batch |
 |---|---|---|---:|
-| `config/local.office.yaml` | 公司 RTX 3060 12GB | `G:\duikouxing\jobs-office` | 2 |
-| `config/local.home.yaml` | 家庭 RTX 4070 12GB | `G:\duikouxing\jobs-home` | 4 |
+| `config/local.office.yaml` | 公司 RTX 3060 12GB | `E:\duikouxing\jobs-office` | 2 |
+| `config/local.home.yaml` | 家庭 RTX 4070 12GB | `E:\duikouxing\jobs-home` | 4 |
 
 通过 CLI 的 `--profile office|home` 或 `scripts/run_job.ps1 -Profile` 切换。任务 YAML 不保存硬件参数，因此同一个任务配置可在两台电脑之间复制；机器相关的批次、GPU 型号检查和输出根目录由 profile 管理。
 
