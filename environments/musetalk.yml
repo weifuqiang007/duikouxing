@@ -1,0 +1,6 @@
+channels:
+  - defaults
+dependencies:
+  - python=3.10.14
+  - pip=24.2
+

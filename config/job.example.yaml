@@ -1,0 +1,40 @@
+job_id: "demo-001"
+consent_confirmed: false
+local_only: true
+
+source_video: "G:/duikouxing/samples/source.mp4"
+
+# 推荐单独准备 10～20 秒干净参考音频；如果留空，则从 source_video 截取。
+reference_audio: "G:/duikouxing/samples/reference.wav"
+reference_start_seconds: 0.0
+reference_duration_seconds: 15.0
+
+# 必须与参考音频实际内容逐字一致。
+reference_text: "这里填写参考音频实际说出的文字。"
+script: "这里填写希望人物说出的新话术。"
+
+tts:
+  profile: "auto"          # auto 使用 office/home 配置；也可强制 quality 或 fast
+  language: "ZH"
+  max_chars_per_segment: 60
+  guidance_scale: 1.2
+  seed: 42
+
+video:
+  fps: 25
+  duration_policy: "pingpong"  # cut 或 pingpong
+
+lipsync:
+  # batch_size 和 use_float16 默认由 office/home 机器配置决定。
+  parsing_mode: "jaw"
+  extra_margin: 10
+  left_cheek_width: 90
+  right_cheek_width: 90
+
+# 归一化坐标，范围 0～1。必须先运行 preview-roi 人工确认。
+mouth_roi:
+  center_x: 0.50
+  center_y: 0.40
+  width: 0.16
+  height: 0.11
+  feather_pixels: 18

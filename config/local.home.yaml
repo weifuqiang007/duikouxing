@@ -1,0 +1,27 @@
+profile: "home"
+
+environments:
+  orchestrator_prefix: "G:/duikouxing/.conda-envs/digital-human"
+  dots_tts_prefix: "G:/duikouxing/.conda-envs/dots-tts"
+  musetalk_prefix: "G:/duikouxing/.conda-envs/musetalk"
+
+executables:
+  conda: "conda"
+  ffmpeg: "ffmpeg"
+  ffprobe: "ffprobe"
+
+models:
+  dots_quality: "G:/duikouxing/models/dots.tts-soar"
+  dots_fast: "G:/duikouxing/models/dots.tts-mf"
+
+paths:
+  musetalk_repo: "G:/duikouxing/external/MuseTalk"
+  jobs_root: "G:/duikouxing/jobs-home"
+
+runtime:
+  expected_gpu: "RTX 4070"
+  gpu_id: 0
+  musetalk_batch_size: 4
+  use_float16: true
+  tts_profile: "quality"
+
