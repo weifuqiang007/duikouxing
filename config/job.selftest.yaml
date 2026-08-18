@@ -1,0 +1,78 @@
+job_id: "selftest-001"
+consent_confirmed: true   # 本人测试素材，本人知情同意
+local_only: true
+backend: "liveportrait"
+
+# 相对路径基于 config/ 目录解析。
+source_video: "../samples/source.mp4"
+
+# 第一步运行 prepare-driving 时必须保持 null。跟随导读录完后，将 iPhone 视频复制到
+# samples/driving.mov，再把这里改为 "../samples/driving.mov"。
+driving_video: null
+
+# 推荐单独准备 10～20 秒干净参考音频；如果留空，则从 source_video 截取。
+reference_audio: null
+reference_start_seconds: 0.0
+reference_duration_seconds: 15.0
+
+# 本人测试用的固定句子，勿改动：reference_text 必须与源视频实际说出的内容逐字一致。
+reference_text: "我是魏富强，今天是八月十八号。这段视频用来做声音参考，测试真人驱动口型流程。画面里的背景和动作都不重要，重要的是吐字清晰。"
+script: "我是魏富强，这是一段测试话术，用来验证口型迁移的效果，说完这句就结束了。"
+
+tts:
+  profile: "auto"          # auto 使用 office/home 配置；也可强制 quality 或 fast
+  language: "ZH"
+  max_chars_per_segment: 60
+  guidance_scale: 1.2
+  seed: 42
+  # 导读和最终音轨都包含首尾静音，便于驱动首帧建立中性表情基准。
+  lead_silence_seconds: 0.5
+  tail_silence_seconds: 0.5
+
+video:
+  fps: 25
+  duration_policy: "pingpong"  # cut 或 pingpong
+
+lipsync:
+  # batch_size 和 use_float16 默认由 office/home 机器配置决定。
+  parsing_mode: "jaw"
+  extra_margin: 10
+  left_cheek_width: 90
+  right_cheek_width: 90
+
+# LivePortrait 真人表演驱动。exp 会连同自然的脸颊/下颌微动一起迁移；
+# lip 只迁移嘴部，用于 A/B 对照。禁止 all，避免把驱动者的头部姿态带进客户视频。
+performance_drive:
+  animation_region: "exp"       # exp（默认推荐）或 lip
+  driving_multiplier: 0.85      # 建议 A/B：0.75、0.85、1.0
+  smooth_variance: 0.0000003
+  duration_tolerance_ratio: 0.12 # 跟录视频与导读相差超过 12% 时拒绝运行
+  use_half_precision: true
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+
+# 默认使用 MuseTalk 的完整下半脸动作，只从原视频回填毛孔/痘坑等高频细节。
+# fixed_roi 仅用于回归对比，会在人物原本开口说话时产生贴片感。
+composite:
+  mode: "dynamic_texture"       # dynamic_texture 或 fixed_roi
+  texture_strength: 0.55        # 高频纹理回填强度，建议 0.45～0.65
+  detail_sigma: 1.2             # 高低频分离尺度
+  mask_feather_pixels: 6
+  temporal_ema: 0.80            # 人脸框时序平滑，越大越稳定
+  optical_flow: true            # 将原片纹理对齐到 MuseTalk 局部形变
+  detect_interval: 5
+  change_threshold: 2.5
+
+# 归一化坐标，范围 0～1。dynamic_texture 中仅作为人脸检测失败时的安全定位；
+# fixed_roi 中才作为实际像素混合蒙版。仍建议先运行 preview-roi 人工确认。
+mouth_roi:
+  center_x: 0.50
+  center_y: 0.40
+  width: 0.16
+  height: 0.11
+  feather_pixels: 18

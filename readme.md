@@ -127,6 +127,7 @@ $Python = 'G:\duikouxing2\.conda-envs\digital-human\python.exe'
 - [安装细节](docs/INSTALLATION.md)
 - [模型、权重和许可证](docs/MODELS_AND_LICENSES.md)
 - [真人录制规范](docs/RECORDING_GUIDE.md)
+- [本人素材自测流程](docs/SELFTEST_PLAN.md)
 
 ## 当前边界
 
