@@ -1,12 +1,17 @@
 job_id: "demo-001"
 consent_confirmed: false
 local_only: true
+backend: "liveportrait"
 
 # 相对路径基于 config/ 目录解析。
 source_video: "../samples/source.mp4"
 
+# 第一步运行 prepare-driving 时必须保持 null。跟随导读录完后，将 iPhone 视频复制到
+# samples/driving.mov，再把这里改为 "../samples/driving.mov"。
+driving_video: null
+
 # 推荐单独准备 10～20 秒干净参考音频；如果留空，则从 source_video 截取。
-reference_audio: "../samples/reference.wav"
+reference_audio: null
 reference_start_seconds: 0.0
 reference_duration_seconds: 15.0
 
@@ -20,6 +25,9 @@ tts:
   max_chars_per_segment: 60
   guidance_scale: 1.2
   seed: 42
+  # 导读和最终音轨都包含首尾静音，便于驱动首帧建立中性表情基准。
+  lead_silence_seconds: 0.5
+  tail_silence_seconds: 0.5
 
 video:
   fps: 25
@@ -31,6 +39,22 @@ lipsync:
   extra_margin: 10
   left_cheek_width: 90
   right_cheek_width: 90
+
+# LivePortrait 真人表演驱动。exp 会连同自然的脸颊/下颌微动一起迁移；
+# lip 只迁移嘴部，用于 A/B 对照。禁止 all，避免把驱动者的头部姿态带进客户视频。
+performance_drive:
+  animation_region: "exp"       # exp（默认推荐）或 lip
+  driving_multiplier: 0.85       # 建议 A/B：0.75、0.85、1.0
+  smooth_variance: 0.0000003
+  duration_tolerance_ratio: 0.12 # 跟录视频与导读相差超过 12% 时拒绝运行
+  use_half_precision: true
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
 
 # 默认使用 MuseTalk 的完整下半脸动作，只从原视频回填毛孔/痘坑等高频细节。
 # fixed_roi 仅用于回归对比，会在人物原本开口说话时产生贴片感。

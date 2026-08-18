@@ -1,57 +1,24 @@
 # 安装部署手册
 
-项目根目录为本仓库所在目录（本机为 `G:\duikouxing`），不得位于 C 盘；配置中的相对路径均相对 `config/` 目录解析，换盘部署时无需修改。公司 RTX 3060 12GB 与家庭 RTX 4070 12GB 分别独立安装，不假设两台电脑能联网互访。
+项目根目录是 `G:\duikouxing2`。公司RTX 3060 12GB和家庭RTX 4070 12GB分别独立安装；两台机器不需要联网互访。所有相对路径随仓库移动，不允许把环境、权重或缓存放到C盘。
 
-## 1. 固定版本
+## 固定环境
 
-| 环境 | 路径 | Python |
-|---|---|---|
-| 编排 | `G:\duikouxing\.conda-envs\digital-human` | 3.11.9 |
-| dots.tts | `G:\duikouxing\.conda-envs\dots-tts` | 3.11.9 |
-| MuseTalk | `G:\duikouxing\.conda-envs\musetalk` | 3.10.14 |
+| 环境 | 项目内路径 | Python | 主要用途 |
+|---|---|---:|---|
+| 编排 | `.conda-envs/digital-human` | 3.11.9 | CLI、配置、FFmpeg编排 |
+| dots.tts | `.conda-envs/dots-tts` | 3.11.9 | 客户声音克隆 |
+| LivePortrait | `.conda-envs/liveportrait` | 3.10.13 | 真人表演驱动和paste-back |
+| MuseTalk兼容 | `.conda-envs/musetalk` | 3.10.14 | 旧后端，不参与本方案 |
 
-不得将三个环境合并。
+环境不能合并。LivePortrait固定使用PyTorch 2.3.0、torchvision 0.18.0、torchaudio 2.3.0的CUDA 12.1 wheel。
 
-## 2. 项目内存储规则
+## 系统依赖
 
-安装和运行脚本强制设置：
-
-```text
-HF_HOME=G:\duikouxing\.cache\huggingface
-HF_HUB_CACHE=G:\duikouxing\.cache\huggingface\hub
-TORCH_HOME=G:\duikouxing\.cache\torch
-PIP_CACHE_DIR=G:\duikouxing\.cache\pip
-XDG_CACHE_HOME=G:\duikouxing\.cache
-TEMP=G:\duikouxing\.tmp
-TMP=G:\duikouxing\.tmp
-```
-
-dots.tts 权重放在：
-
-```text
-G:\duikouxing\models\dots.tts-soar
-G:\duikouxing\models\dots.tts-mf
-```
-
-MuseTalk 为保持官方目录结构，放在：
-
-```text
-G:\duikouxing\external\MuseTalk\models
-```
-
-以上全部位于 `G:\duikouxing` 下，不使用 C 盘默认模型缓存。
-
-## 3. 系统依赖
-
-两台电脑分别安装：
-
-- 当前稳定 NVIDIA 驱动。
-- Miniconda/Anaconda。
-- Git。
-- FFmpeg，并确保 `ffmpeg`、`ffprobe` 在 PATH。
-- G 盘建议至少保留 100GB，批量生产建议 200GB 以上。
-
-检查：
+- Windows 10/11、当前稳定NVIDIA驱动。
+- Miniconda或Anaconda、Git。
+- FFmpeg和FFprobe在PATH中。
+- 建议项目盘预留至少60GB；保留旧MuseTalk全套权重时建议100GB。
 
 ```powershell
 nvidia-smi
@@ -61,138 +28,74 @@ ffmpeg -version
 ffprobe -version
 ```
 
-## 4. 一键建立 Conda 环境
+## 安装顺序
 
 ```powershell
-Set-Location G:\duikouxing
+Set-Location G:\duikouxing2
 .\scripts\setup_conda.ps1
+.\scripts\download_voice_model.ps1
+.\scripts\setup_liveportrait.ps1
+.\scripts\download_liveportrait_models.ps1
 ```
 
-脚本执行内容：
+`setup_conda.ps1` 建立编排和声音环境，并安装当前项目为editable包；它也保留旧MuseTalk环境以兼容原功能。`setup_liveportrait.ps1` 克隆官方仓库、校验remote、固定提交并安装独立依赖。两个下载脚本只把文件放入本仓库。
 
-1. 根据 `environments/*.yml` 创建三个前缀环境。
-2. 在编排环境安装本项目与测试依赖。
-3. 在 dots.tts 环境安装 `dots.tts==0.3.1`。
-4. 将 MuseTalk 官方仓库克隆到 `external/MuseTalk`。
-5. 固定 MuseTalk 提交 `0a89dec45a0192b824e3cf4daf96c239440c5ed8`。
-6. 按官方要求安装 PyTorch 2.0.1、cu118 wheel 和 MMLab 组件。
-
-dots.tts 环境按照 PyTorch 官方历史版本命令安装 `torch==2.8.0`、`torchaudio==2.8.0` 的 CUDA 12.8 wheel，并使用项目内的 `constraints/dots-tts-recommended.txt` 固定官方推荐依赖。两台电脑都需要较新的 NVIDIA 驱动以支持该 CUDA runtime。
-
-安装后验证 Python 版本：
+如果代码更新后编排环境已经存在，执行：
 
 ```powershell
-conda run -p G:\duikouxing\.conda-envs\digital-human python --version
-conda run -p G:\duikouxing\.conda-envs\dots-tts python --version
-conda run -p G:\duikouxing\.conda-envs\musetalk python --version
+conda run -p .\.conda-envs\digital-human pip install -e ".[dev]"
 ```
 
-预期分别为 3.11.9、3.11.9、3.10.14。
+## 项目内存储
 
-## 5. 下载模型
-
-```powershell
-Set-Location G:\duikouxing
-.\scripts\download_models.ps1
-```
-
-脚本下载：
-
-- `dots-studio/dots.tts-soar`。
-- `dots-studio/dots.tts-mf`。
-- MuseTalk 1.5 主权重。
-- SD VAE。
-- Whisper Tiny。
-- DWPose。
-- SyncNet。
-- Face Parse BiSeNet 和 ResNet18。
-
-MuseTalk 权重文件名和来源严格对应固定提交中的官方 `download_weights.bat`，但由独立下载环境逐项执行；不会让官方批处理在 MuseTalk 运行环境中升级 `huggingface_hub`，从而避免破坏固定依赖。
-
-完成后生成：
+运行脚本覆盖以下变量：
 
 ```text
-G:\duikouxing\model-checksums.json
+HF_HOME=<项目>/.cache/huggingface
+HF_HUB_CACHE=<项目>/.cache/huggingface/hub
+TORCH_HOME=<项目>/.cache/torch
+PIP_CACHE_DIR=<项目>/.cache/pip
+XDG_CACHE_HOME=<项目>/.cache
+TEMP=<项目>/.tmp
+TMP=<项目>/.tmp
 ```
 
-该文件记录全部权重 SHA-256、文件大小和绝对路径。
+权重位置：
 
-## 6. 公司电脑配置
-
-配置文件：[local.office.yaml](../config/local.office.yaml)
-
-```yaml
-runtime:
-  expected_gpu: "RTX 3060"
-  gpu_id: 0
-  musetalk_batch_size: 2
-  use_float16: true
-  tts_profile: "quality"
+```text
+models/dots.tts-soar
+external/LivePortrait/pretrained_weights/liveportrait
+external/LivePortrait/pretrained_weights/insightface
 ```
 
-检查：
+## 验证
 
 ```powershell
-G:\duikouxing\.conda-envs\digital-human\python.exe `
-  -m digital_human.cli doctor --profile office
+conda run -p .\.conda-envs\digital-human python --version
+conda run -p .\.conda-envs\dots-tts python --version
+conda run -p .\.conda-envs\liveportrait python --version
+
+.\.conda-envs\digital-human\python.exe `
+  -m digital_human.cli doctor --profile office --backend liveportrait
 ```
 
-如果稳定，可人工将 batch 调到 4；出现 OOM 则保持 2，不能通过升级/混装依赖解决。
+家庭电脑把 `office` 换成 `home`。doctor检查FFmpeg、FFprobe、dots.tts CUDA、LivePortrait CUDA、当前GPU型号、选中的SOAR权重、全部关键LivePortrait权重和官方提交。
 
-## 7. 家庭电脑配置
+## 3060、4070与4090
 
-配置文件：[local.home.yaml](../config/local.home.yaml)
+- 3060/4070均设置 `use_half_precision: true`、`source_max_dim: 1280`，一次只跑一个任务。
+- 出现黑块而非OOM时，先设置 `use_half_precision: false`复测。
+- 12GB显存出现OOM时先将 `source_max_dim`降至960；不要混装或升级依赖。
+- 4090 24GB可以使用相同代码和环境；新增机器配置时复制local yaml，修改GPU字符串和任务目录即可。
 
-```yaml
-runtime:
-  expected_gpu: "RTX 4070"
-  gpu_id: 0
-  musetalk_batch_size: 4
-  use_float16: true
-  tts_profile: "quality"
-```
+## 网络失败处理
 
-检查：
+脚本默认使用 `https://hf-mirror.com`，也允许运行前设置自己的 `HF_ENDPOINT`。权重脚本下载结束后逐文件检查；失败时可重跑，Hugging Face下载器会续传。不要下载来源不明的一键整合包。
 
-```powershell
-G:\duikouxing\.conda-envs\digital-human\python.exe `
-  -m digital_human.cli doctor --profile home
-```
+## 禁止事项
 
-两张卡显存都是 12GB，4070 的主要优势是速度，不应因为型号较新就使用超过显存的模型。
-
-## 8. 配置切换
-
-推荐通过脚本显式指定：
-
-```powershell
-.\scripts\run_job.ps1 -Profile office -Job .\config\job.local.yaml
-.\scripts\run_job.ps1 -Profile home -Job .\config\job.local.yaml
-```
-
-也可以设置当前终端默认值：
-
-```powershell
-$env:DIGITAL_HUMAN_PROFILE = "office"
-# 或
-$env:DIGITAL_HUMAN_PROFILE = "home"
-```
-
-任务输出分别存入 `jobs-office` 和 `jobs-home`，避免两台电脑交换文件时覆盖同名任务。
-
-## 9. 首次验证
-
-1. 使用 10 秒、不含真实证件的视频。
-2. 运行 `doctor`。
-3. 生成 ROI 预览并人工确认。
-4. 运行完整任务。
-5. 通过验收后再处理真实授权素材。
-
-## 10. 禁止事项
-
-- 禁止使用默认 `conda create -n` 将大环境建立在系统盘。
-- 禁止将模型下载到 `%USERPROFILE%\.cache`。
-- 禁止合并 dots.tts 与 MuseTalk 环境。
-- 禁止擅自升级 MuseTalk 的 PyTorch/NumPy。
-- 禁止使用来源不明的一键整合包。
-- 禁止上传真实身份证到 Hugging Face Space、Colab 或云端 Demo。
+- 不在正在执行任务的 `G:\duikouxing` 中运行本分支脚本。
+- 不使用 `conda create -n` 把大型环境建立到默认系统目录。
+- 不手工改变LivePortrait仓库提交。
+- 不把`pretrained_weights`移动到其他目录后用软链接指向C盘。
+- 不用微信压缩iPhone驱动视频。

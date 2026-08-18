@@ -19,6 +19,7 @@ def _job(tmp_path: Path) -> JobConfig:
         consent_confirmed=True,
         local_only=True,
         source_video=source,
+        driving_video=None,
         reference_audio=None,
         reference_start_seconds=0,
         reference_duration_seconds=10,
@@ -27,6 +28,8 @@ def _job(tmp_path: Path) -> JobConfig:
         tts={},
         video={},
         lipsync={},
+        performance_drive={"animation_region": "exp"},
+        backend="liveportrait",
         composite={"mode": "dynamic_texture"},
         mouth_roi=MouthROI(0.5, 0.5, 0.2, 0.1, 10),
     )
@@ -50,6 +53,13 @@ def test_invalid_composite_mode_is_rejected(tmp_path: Path) -> None:
         validate_job(invalid)
 
 
+def test_invalid_liveportrait_region_is_rejected(tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    invalid = JobConfig(**{**job.__dict__, "performance_drive": {"animation_region": "all"}})
+    with pytest.raises(ConfigurationError, match="animation_region"):
+        validate_job(invalid)
+
+
 def test_machine_profiles_are_separate() -> None:
     root = Path(__file__).resolve().parents[1]
     office = load_local_config(root / "config" / "local.office.yaml")
@@ -61,3 +71,5 @@ def test_machine_profiles_are_separate() -> None:
     assert home.expected_gpu == "RTX 4070"
     assert home.musetalk_batch_size == 4
     assert office.jobs_root != home.jobs_root
+    assert office.liveportrait_repo.name == "LivePortrait"
+    assert home.liveportrait_env.name == "liveportrait"

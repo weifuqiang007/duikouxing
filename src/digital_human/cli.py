@@ -53,7 +53,7 @@ def _local_path(args: argparse.Namespace) -> Path:
     return args.config.resolve() if args.config else _profile_path(args.profile)
 
 
-def _doctor(local_path: Path) -> int:
+def _doctor(local_path: Path, backend: str) -> int:
     local = load_local_config(local_path)
     checks = [
         ("FFmpeg", [local.ffmpeg, "-version"]),
@@ -64,25 +64,28 @@ def _doctor(local_path: Path) -> int:
                 local.conda,
                 local.dots_env,
                 [
-                "python",
-                "-c",
-                "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
-                ],
-            ),
-        ),
-        (
-            "MuseTalk CUDA",
-            conda_run(
-                local.conda,
-                local.musetalk_env,
-                [
-                "python",
-                "-c",
-                "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
+                    "python",
+                    "-c",
+                    "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
                 ],
             ),
         ),
     ]
+    backend_env = local.liveportrait_env if backend == "liveportrait" else local.musetalk_env
+    checks.append(
+        (
+            f"{backend} CUDA",
+            conda_run(
+                local.conda,
+                backend_env,
+                [
+                    "python",
+                    "-c",
+                    "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
+                ],
+            ),
+        )
+    )
     failed = False
     for name, command in checks:
         try:
@@ -92,9 +95,7 @@ def _doctor(local_path: Path) -> int:
             failed = True
             print(f"[FAIL] {name}: {exc}")
     try:
-        gpu_names = run_command(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
-        ).stdout
+        gpu_names = run_command(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]).stdout
         if local.expected_gpu.lower() in gpu_names.lower():
             print(f"[OK] GPU profile {local.profile}: {gpu_names.strip()}")
         else:
@@ -117,21 +118,62 @@ def _doctor(local_path: Path) -> int:
         local.musetalk_repo / "models" / "whisper" / "pytorch_model.bin",
         local.musetalk_repo / "models" / "whisper" / "preprocessor_config.json",
         local.musetalk_repo / "models" / "face-parse-bisent" / "79999_iter.pth",
-        local.musetalk_repo
-        / "models"
-        / "face-parse-bisent"
-        / "resnet18-5c106cde.pth",
+        local.musetalk_repo / "models" / "face-parse-bisent" / "resnet18-5c106cde.pth",
     ]
-    for path in required:
-        if path.is_file():
-            print(f"[OK] 权重: {path}")
-        else:
-            failed = True
-            print(f"[FAIL] 缺少权重: {path}")
-    for name, model_value in (
-        ("dots.tts SOAR", local.dots_quality_model),
-        ("dots.tts MF", local.dots_fast_model),
-    ):
+    if backend == "musetalk":
+        for path in required:
+            if path.is_file():
+                print(f"[OK] 权重: {path}")
+            else:
+                failed = True
+                print(f"[FAIL] 缺少权重: {path}")
+    liveportrait_required = [
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "liveportrait"
+        / "base_models"
+        / "appearance_feature_extractor.pth",
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "liveportrait"
+        / "base_models"
+        / "motion_extractor.pth",
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "liveportrait"
+        / "base_models"
+        / "spade_generator.pth",
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "liveportrait"
+        / "base_models"
+        / "warping_module.pth",
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "liveportrait"
+        / "retargeting_models"
+        / "stitching_retargeting_module.pth",
+        local.liveportrait_repo / "pretrained_weights" / "liveportrait" / "landmark.onnx",
+        local.liveportrait_repo
+        / "pretrained_weights"
+        / "insightface"
+        / "models"
+        / "buffalo_l"
+        / "det_10g.onnx",
+    ]
+    if backend == "liveportrait":
+        for path in liveportrait_required:
+            if path.is_file():
+                print(f"[OK] LivePortrait 权重: {path}")
+            else:
+                failed = True
+                print(f"[FAIL] 缺少 LivePortrait 权重: {path}")
+    selected_model = (
+        ("dots.tts SOAR", local.dots_quality_model)
+        if local.tts_profile == "quality"
+        else ("dots.tts MF", local.dots_fast_model)
+    )
+    for name, model_value in (selected_model,):
         model_path = Path(model_value)
         if model_path.is_absolute():
             if model_path.is_dir():
@@ -141,21 +183,37 @@ def _doctor(local_path: Path) -> int:
                 print(f"[FAIL] {name} 本地目录不存在: {model_path}")
         else:
             print(f"[WARN] {name} 使用远程 ID，不能保证断网运行: {model_value}")
-    expected_commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
-    try:
-        actual_commit = run_command(
-            ["git", "-C", local.musetalk_repo, "rev-parse", "HEAD"]
-        ).stdout.strip()
-        if actual_commit == expected_commit:
-            print(f"[OK] MuseTalk commit: {actual_commit}")
-        else:
+    if backend == "musetalk":
+        expected_commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+        try:
+            actual_commit = run_command(
+                ["git", "-C", local.musetalk_repo, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            if actual_commit == expected_commit:
+                print(f"[OK] MuseTalk commit: {actual_commit}")
+            else:
+                failed = True
+                print(f"[FAIL] MuseTalk commit 不匹配: {actual_commit}，预期 {expected_commit}")
+        except Exception as exc:
             failed = True
-            print(
-                f"[FAIL] MuseTalk commit 不匹配: {actual_commit}，预期 {expected_commit}"
-            )
-    except Exception as exc:
-        failed = True
-        print(f"[FAIL] 无法检查 MuseTalk commit: {exc}")
+            print(f"[FAIL] 无法检查 MuseTalk commit: {exc}")
+    if backend == "liveportrait":
+        expected_liveportrait_commit = "9b294b3d0536135442ea73cb01e6cb3ca7029dd3"
+        try:
+            actual_commit = run_command(
+                ["git", "-C", local.liveportrait_repo, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            if actual_commit == expected_liveportrait_commit:
+                print(f"[OK] LivePortrait commit: {actual_commit}")
+            else:
+                failed = True
+                print(
+                    "[FAIL] LivePortrait commit 不匹配: "
+                    f"{actual_commit}，预期 {expected_liveportrait_commit}"
+                )
+        except Exception as exc:
+            failed = True
+            print(f"[FAIL] 无法检查 LivePortrait commit: {exc}")
     return 1 if failed else 0
 
 
@@ -168,9 +226,7 @@ def _write_back_mouth_roi(path: Path, roi: MouthROI) -> None:
         ("width", roi.width),
         ("height", roi.height),
     ):
-        text, replaced = re.subn(
-            rf"(?m)^(\s*{key}:\s*)[0-9.]+", rf"\g<1>{value}", text, count=1
-        )
+        text, replaced = re.subn(rf"(?m)^(\s*{key}:\s*)[0-9.]+", rf"\g<1>{value}", text, count=1)
         if replaced != 1:
             raise ConfigurationError(f"任务配置中找不到 mouth_roi.{key} 字段: {path}")
     path.write_text(text, encoding="utf-8")
@@ -181,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="检查环境和权重")
     doctor.add_argument("--config", type=Path)
+    doctor.add_argument("--backend", choices=["liveportrait", "musetalk"], default="liveportrait")
     doctor.add_argument(
         "--profile",
         choices=["office", "home"],
@@ -189,9 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     preview = sub.add_parser("preview-roi", help="生成嘴部 ROI 首帧预览")
     preview.add_argument("--job", type=Path, required=True)
     preview.add_argument("--output", type=Path, default=Path("roi-preview.jpg"))
-    annotate = sub.add_parser(
-        "annotate-roi", help="交互式拖拽标注嘴部 ROI 并写回任务配置"
-    )
+    annotate = sub.add_parser("annotate-roi", help="交互式拖拽标注嘴部 ROI 并写回任务配置")
     annotate.add_argument("--job", type=Path, required=True)
     annotate.add_argument(
         "--at-seconds", type=float, default=0.0, help="抓取该时间点的视频帧（默认首帧）"
@@ -208,9 +263,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     run.add_argument("--force", action="store_true")
-    refine = sub.add_parser(
-        "refine", help="复用已有 MuseTalk 结果，只重跑纹理合成和音轨封装"
+    prepare = sub.add_parser("prepare-driving", help="生成客户音色导读音频和真人录制话术")
+    prepare.add_argument("--job", type=Path, required=True)
+    prepare.add_argument("--config", type=Path)
+    prepare.add_argument(
+        "--profile",
+        choices=["office", "home"],
+        default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
+    prepare.add_argument("--force", action="store_true")
+    refine = sub.add_parser("refine", help="复用已有 MuseTalk 结果，只重跑纹理合成和音轨封装")
     refine.add_argument("--job", type=Path, required=True)
     refine.add_argument("--config", type=Path)
     refine.add_argument(
@@ -227,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "doctor":
-            return _doctor(_local_path(args))
+            return _doctor(_local_path(args), args.backend)
         job = load_job_config(args.job.resolve())
         if args.command == "annotate-roi":
             roi = select_mouth_roi(job.source_video, job.mouth_roi, args.at_seconds)
@@ -253,7 +315,14 @@ def main(argv: list[str] | None = None) -> int:
             output = Pipeline(local, job, force=args.force).run()
             print(output)
             return 0
+        if args.command == "prepare-driving":
+            local = load_local_config(_local_path(args))
+            output = Pipeline(local, job, force=args.force).prepare_driving_guide()
+            print(output)
+            return 0
         if args.command == "refine":
+            if job.backend != "musetalk":
+                raise RuntimeError("refine 仅适用于 MuseTalk；LivePortrait 使用官方 paste-back")
             local = load_local_config(_local_path(args))
             root = local.jobs_root / job.job_id
             work = root / "work"
@@ -272,11 +341,7 @@ def main(argv: list[str] | None = None) -> int:
                 int(job.video.get("fps", 25)),
                 job.composite,
             )
-            output = (
-                args.output.resolve()
-                if args.output
-                else root / "output" / "final-refined.mp4"
-            )
+            output = args.output.resolve() if args.output else root / "output" / "final-refined.mp4"
             mux_audio(local.ffmpeg, silent, audio, output)
             print(output)
             return 0

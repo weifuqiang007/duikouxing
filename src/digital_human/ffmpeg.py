@@ -75,7 +75,13 @@ def extract_reference_audio(
     )
 
 
-def concat_and_normalize_audio(ffmpeg: str, inputs: list[Path], output: Path) -> None:
+def concat_and_normalize_audio(
+    ffmpeg: str,
+    inputs: list[Path],
+    output: Path,
+    lead_silence_seconds: float = 0.0,
+    tail_silence_seconds: float = 0.0,
+) -> None:
     if not inputs:
         raise ValueError("没有可拼接的音频")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -85,8 +91,16 @@ def concat_and_normalize_audio(ffmpeg: str, inputs: list[Path], output: Path) ->
     concat_inputs = "".join(f"[{index}:a]" for index in range(len(inputs)))
     filter_graph = (
         f"{concat_inputs}concat=n={len(inputs)}:v=0:a=1[joined];"
-        "[joined]loudnorm=I=-16:LRA=11:TP=-1.5[out]"
+        "[joined]loudnorm=I=-16:LRA=11:TP=-1.5[normalized]"
     )
+    if lead_silence_seconds > 0 or tail_silence_seconds > 0:
+        delay_ms = round(max(0.0, lead_silence_seconds) * 1000)
+        filter_graph += (
+            f";[normalized]adelay={delay_ms}:all=1,"
+            f"apad=pad_dur={max(0.0, tail_silence_seconds):.3f}[out]"
+        )
+    else:
+        filter_graph += ";[normalized]anull[out]"
     args.extend(
         [
             "-filter_complex",
@@ -150,8 +164,7 @@ def match_video_duration(
             "-i",
             source,
             "-filter_complex",
-            "[0:v]split=2[fwd][revsrc];[revsrc]reverse[rev];"
-            "[fwd][rev]concat=n=2:v=1:a=0[out]",
+            "[0:v]split=2[fwd][revsrc];[revsrc]reverse[rev];[fwd][rev]concat=n=2:v=1:a=0[out]",
             "-map",
             "[out]",
             "-an",
@@ -184,6 +197,51 @@ def match_video_duration(
             output,
         ]
     )
+
+
+def normalize_driving_video(
+    ffmpeg: str,
+    ffprobe: str,
+    source: Path,
+    target_audio: Path,
+    output: Path,
+    fps: int,
+    tolerance_ratio: float,
+) -> float:
+    """将真人驱动视频整体微调到导读音频长度；差异过大则拒绝掩盖录制错误。"""
+    source_duration = media_duration(ffprobe, source)
+    target_duration = media_duration(ffprobe, target_audio)
+    if source_duration <= 0 or target_duration <= 0:
+        raise ValueError("真人驱动视频或目标音频时长无效")
+    ratio_error = abs(source_duration - target_duration) / target_duration
+    if ratio_error > tolerance_ratio:
+        raise ValueError(
+            f"真人驱动视频 {source_duration:.2f}s 与导读音频 {target_duration:.2f}s "
+            f"相差 {ratio_error:.1%}，超过允许值 {tolerance_ratio:.1%}；请跟随导读重新录制"
+        )
+    speed = source_duration / target_duration
+    output.parent.mkdir(parents=True, exist_ok=True)
+    run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            source,
+            "-an",
+            "-vf",
+            f"setpts=PTS/{speed:.10f},fps={fps}",
+            "-t",
+            f"{target_duration:.6f}",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "15",
+            "-pix_fmt",
+            "yuv420p",
+            output,
+        ]
+    )
+    return ratio_error
 
 
 def mux_audio(ffmpeg: str, video: Path, audio: Path, output: Path) -> None:

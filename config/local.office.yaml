@@ -5,6 +5,7 @@ environments:
   orchestrator_prefix: "../.conda-envs/digital-human"
   dots_tts_prefix: "../.conda-envs/dots-tts"
   musetalk_prefix: "../.conda-envs/musetalk"
+  liveportrait_prefix: "../.conda-envs/liveportrait"
 
 executables:
   conda: "conda"
@@ -17,6 +18,7 @@ models:
 
 paths:
   musetalk_repo: "../external/MuseTalk"
+  liveportrait_repo: "../external/LivePortrait"
   jobs_root: "../jobs-office"
 
 runtime:

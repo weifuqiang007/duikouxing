@@ -24,9 +24,11 @@ class LocalConfig:
     orchestrator_env: Path
     dots_env: Path
     musetalk_env: Path
+    liveportrait_env: Path
     dots_quality_model: str
     dots_fast_model: str
     musetalk_repo: Path
+    liveportrait_repo: Path
     jobs_root: Path
     expected_gpu: str
     gpu_id: int
@@ -50,6 +52,7 @@ class JobConfig:
     consent_confirmed: bool
     local_only: bool
     source_video: Path
+    driving_video: Path | None
     reference_audio: Path | None
     reference_start_seconds: float
     reference_duration_seconds: float
@@ -58,6 +61,8 @@ class JobConfig:
     tts: dict[str, Any]
     video: dict[str, Any]
     lipsync: dict[str, Any]
+    performance_drive: dict[str, Any]
+    backend: str
     composite: dict[str, Any]
     mouth_roi: MouthROI
 
@@ -93,9 +98,11 @@ def load_local_config(path: Path) -> LocalConfig:
             orchestrator_env=_resolve(str(envs["orchestrator_prefix"]), base),
             dots_env=_resolve(str(envs["dots_tts_prefix"]), base),
             musetalk_env=_resolve(str(envs["musetalk_prefix"]), base),
+            liveportrait_env=_resolve(str(envs["liveportrait_prefix"]), base),
             dots_quality_model=str(_resolve(str(models["dots_quality"]), base)),
             dots_fast_model=str(_resolve(str(models["dots_fast"]), base)),
             musetalk_repo=_resolve(str(paths["musetalk_repo"]), base),
+            liveportrait_repo=_resolve(str(paths["liveportrait_repo"]), base),
             jobs_root=_resolve(str(paths["jobs_root"]), base),
             expected_gpu=str(runtime["expected_gpu"]),
             gpu_id=int(runtime.get("gpu_id", 0)),
@@ -120,7 +127,9 @@ def validate_local_config(config: LocalConfig) -> None:
         config.orchestrator_env,
         config.dots_env,
         config.musetalk_env,
+        config.liveportrait_env,
         config.musetalk_repo,
+        config.liveportrait_repo,
         config.jobs_root,
     )
     for path in local_paths:
@@ -133,9 +142,7 @@ def validate_local_config(config: LocalConfig) -> None:
         if model_path.is_absolute() and not model_path.resolve().is_relative_to(
             PROJECT_STORAGE_ROOT
         ):
-            raise ConfigurationError(
-                f"本地模型路径必须位于 {PROJECT_STORAGE_ROOT} 下: {model}"
-            )
+            raise ConfigurationError(f"本地模型路径必须位于 {PROJECT_STORAGE_ROOT} 下: {model}")
 
 
 def load_job_config(path: Path) -> JobConfig:
@@ -151,14 +158,14 @@ def load_job_config(path: Path) -> JobConfig:
             feather_pixels=int(roi_data["feather_pixels"]),
         )
         reference_value = data.get("reference_audio")
+        driving_value = data.get("driving_video")
         job = JobConfig(
             job_id=str(data["job_id"]),
             consent_confirmed=bool(data.get("consent_confirmed", False)),
             local_only=bool(data.get("local_only", True)),
             source_video=_resolve(str(data["source_video"]), base),
-            reference_audio=(
-                _resolve(str(reference_value), base) if reference_value else None
-            ),
+            driving_video=(_resolve(str(driving_value), base) if driving_value else None),
+            reference_audio=(_resolve(str(reference_value), base) if reference_value else None),
             reference_start_seconds=float(data.get("reference_start_seconds", 0.0)),
             reference_duration_seconds=float(data.get("reference_duration_seconds", 15.0)),
             reference_text=str(data["reference_text"]).strip(),
@@ -166,6 +173,8 @@ def load_job_config(path: Path) -> JobConfig:
             tts=dict(data["tts"]),
             video=dict(data["video"]),
             lipsync=dict(data["lipsync"]),
+            performance_drive=dict(data.get("performance_drive", {})),
+            backend=str(data.get("backend", "musetalk")),
             composite=dict(data.get("composite", {"mode": "dynamic_texture"})),
             mouth_roi=roi,
         )
@@ -184,11 +193,15 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError(f"源视频不存在: {job.source_video}")
     if job.reference_audio is not None and not job.reference_audio.is_file():
         raise ConfigurationError(f"参考音频不存在: {job.reference_audio}")
+    if job.driving_video is not None and not job.driving_video.is_file():
+        raise ConfigurationError(f"真人驱动视频不存在: {job.driving_video}")
+    if job.backend not in {"musetalk", "liveportrait"}:
+        raise ConfigurationError("backend 只能是 musetalk 或 liveportrait")
     if not job.reference_text:
         raise ConfigurationError("reference_text 不能为空")
     if not job.script:
         raise ConfigurationError("script 不能为空")
-    if not job.job_id or any(ch in job.job_id for ch in "\\/:*?\"<>|"):
+    if not job.job_id or any(ch in job.job_id for ch in '\\/:*?"<>|'):
         raise ConfigurationError("job_id 为空或包含 Windows 非法文件名字符")
     roi = job.mouth_roi
     for name, value in (
@@ -205,6 +218,16 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("嘴部 ROI 纵向超出画面")
     if roi.feather_pixels < 0:
         raise ConfigurationError("feather_pixels 不能为负数")
+    performance = job.performance_drive
+    region = str(performance.get("animation_region", "exp"))
+    if region not in {"exp", "lip"}:
+        raise ConfigurationError("performance_drive.animation_region 只能是 exp 或 lip")
+    multiplier = float(performance.get("driving_multiplier", 0.85))
+    if not 0.0 < multiplier <= 2.0:
+        raise ConfigurationError("performance_drive.driving_multiplier 必须在 (0, 2] 范围")
+    tolerance = float(performance.get("duration_tolerance_ratio", 0.12))
+    if not 0.0 <= tolerance <= 0.5:
+        raise ConfigurationError("performance_drive.duration_tolerance_ratio 必须在 [0, 0.5] 范围")
     composite = job.composite
     mode = str(composite.get("mode", "dynamic_texture"))
     if mode not in {"dynamic_texture", "fixed_roi"}:
