@@ -1,6 +1,6 @@
 profile: "home"
 
-# 路径均相对本文件所在 config/ 目录解析，随仓库位置自动适配（本机为 E:\duikouxing）。
+# 路径均相对本文件所在 config/ 目录解析，随仓库位置自动适配（本机为 G:\duikouxing）。
 environments:
   orchestrator_prefix: "../.conda-envs/digital-human"
   dots_tts_prefix: "../.conda-envs/dots-tts"

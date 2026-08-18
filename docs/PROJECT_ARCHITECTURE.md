@@ -1,7 +1,7 @@
 # 项目架构书：本地口型数字人视频生成系统
 
-版本：0.1（MVP 基线）  
-日期：2026-08-17
+版本：0.2（动作/纹理解耦合成）
+日期：2026-08-18
 
 ## 1. 项目背景
 
@@ -17,7 +17,7 @@
 - 声音应接近原人物音色和说话习惯。
 - 口型应与新声音同步。
 - 不重新生成背景、身体、手、衣服、广告牌、证书或身份证。
-- 除嘴唇、口腔、少量下颌和脸颊过渡区域外，尽量使用原始视频像素。
+- 背景、身体、手持物使用原始像素；下半脸使用 MuseTalk 的新音频动作，再回填原片毛孔、痘坑、胡茬等高频纹理。
 - 所有敏感素材在本地处理，不上传第三方服务。
 
 ## 2. MVP 范围
@@ -30,7 +30,8 @@
 - 长话术按标点分句，逐段生成后拼接和响度标准化。
 - 根据目标音频长度裁剪或乒乓循环源视频。
 - 使用 MuseTalk 1.5 生成口型视频。
-- 使用静态椭圆 ROI 将原始基底视频回贴，只保留嘴部附近的生成结果。
+- 使用动态纹理合成器：MuseTalk 负责嘴唇、脸颊和下颌低频动作，原片只提供高频皮肤细节。
+- 保留静态椭圆 ROI 作为回归测试的兼容模式，不作为默认产出链路。
 - 将目标声音封装进最终 MP4。
 - 记录输入哈希、配置、命令、阶段状态和输出路径。
 - 未确认人物授权时拒绝运行。
@@ -47,7 +48,7 @@
 
 ### 2.3 后续版本
 
-- MediaPipe/商用许可明确的人脸关键点模型实现动态嘴部 ROI。
+- 替换 Haar 人脸跟踪为商用许可明确的面部关键点/语义分割模型，生成精确的嘴唇、口腔和皮肤蒙版。
 - dots.tts.edit 局部语音纠错。
 - Qwen3-TTS 1.7B 备用声音引擎。
 - Remotion 字幕、Logo、信息卡、片头片尾和多段时间线。
@@ -62,7 +63,8 @@
 4. **短段生成**：TTS 每段建议 5～20 秒，降低显存和长文本漂移。
 5. **可重跑**：每个阶段有确定输入和输出，失败只重跑当前阶段。
 6. **可审计**：保存配置快照、SHA-256、模型名、命令和日志。
-7. **授权前置**：配置文件必须显式确认肖像和声音授权。
+7. **动作/纹理解耦**：不得把原片与新音频不一致的嘴唇、脸颊、下颌低频形变贴回；原片只参与高频纹理恢复。
+8. **授权前置**：配置文件必须显式确认肖像和声音授权。
 
 ## 4. 总体架构
 
@@ -77,11 +79,14 @@ flowchart LR
     B --> H["按音频时长裁剪/乒乓循环"]
     G --> I["MuseTalk 1.5 口型推理"]
     H --> I
-    I --> J["嘴部 ROI 局部合成"]
-    H --> J
-    G --> K["封装新音轨"]
-    J --> K
-    K --> L["验收与输出 MP4"]
+    I --> J["动态人脸跟踪"]
+    H --> K["原片高频皮肤纹理"]
+    I --> L["光流对齐 + 嘴唇排除 + 纹理回填"]
+    J --> L
+    K --> L
+    G --> M["封装新音轨"]
+    L --> M
+    M --> N["验收与输出 MP4"]
 ```
 
 ## 5. 为什么必须使用三个环境
@@ -97,9 +102,9 @@ flowchart LR
 
 | 环境 | 职责 | GPU |
 |---|---|---|
-| `E:\duikouxing\.conda-envs\digital-human` | 编排、FFmpeg、ROI 合成、日志 | Python 3.11.9 |
-| `E:\duikouxing\.conda-envs\dots-tts` | 声音克隆 | Python 3.11.9 |
-| `E:\duikouxing\.conda-envs\musetalk` | 口型生成 | Python 3.10.14 |
+| `G:\duikouxing\.conda-envs\digital-human` | 编排、FFmpeg、纹理合成、日志 | Python 3.11.9 |
+| `G:\duikouxing\.conda-envs\dots-tts` | 声音克隆 | Python 3.11.9 |
+| `G:\duikouxing\.conda-envs\musetalk` | 口型生成 | Python 3.10.14 |
 
 环境之间仅通过 WAV、MP4、YAML、JSON 文件和子进程退出码通信。
 
@@ -109,8 +114,8 @@ flowchart LR
 
 | 配置 | 机器 | 任务目录 | MuseTalk batch |
 |---|---|---|---:|
-| `config/local.office.yaml` | 公司 RTX 3060 12GB | `E:\duikouxing\jobs-office` | 2 |
-| `config/local.home.yaml` | 家庭 RTX 4070 12GB | `E:\duikouxing\jobs-home` | 4 |
+| `config/local.office.yaml` | 公司 RTX 3060 12GB | `G:\duikouxing\jobs-office` | 2 |
+| `config/local.home.yaml` | 家庭 RTX 4070 12GB | `G:\duikouxing\jobs-home` | 4 |
 
 通过 CLI 的 `--profile office|home` 或 `scripts/run_job.ps1 -Profile` 切换。任务 YAML 不保存硬件参数，因此同一个任务配置可在两台电脑之间复制；机器相关的批次、GPU 型号检查和输出根目录由 profile 管理。
 
@@ -118,12 +123,12 @@ flowchart LR
 
 ```text
 src/digital_human/
-├── cli.py                 # 命令行入口：doctor、preview-roi、run
+├── cli.py                 # 命令行入口：doctor、preview-roi、run、refine
 ├── config.py              # YAML 配置加载、路径解析和业务校验
 ├── pipeline.py            # 阶段编排、任务目录和清单写入
 ├── ffmpeg.py              # ffprobe、抽取声音、标准化、时长适配、封装
 ├── audio.py               # 中文分句、音频段拼接
-├── composite.py           # 静态嘴部 ROI 预览与逐帧局部合成
+├── composite.py           # 动态纹理回填、光流对齐与旧 ROI 兼容模式
 ├── manifest.py            # SHA-256、状态、配置快照
 └── adapters/
     ├── dots_tts.py        # 调用独立 dots.tts 环境
@@ -173,11 +178,13 @@ src/digital_human/
 
 ### 6.6 `composite.py`
 
-- MVP 使用人工确认的静态归一化椭圆 ROI。
-- ROI 内使用 MuseTalk 帧，ROI 外使用时长适配后的原始基底帧。
-- 羽化边缘避免“贴嘴”硬边。
-- 此步骤是保护证件、广告牌和背景的最后防线。
-- 如果人物头部移动导致嘴部离开 ROI，必须判定素材不符合 MVP，而不是扩大到整张脸。
+- 默认 `dynamic_texture`：整帧 MuseTalk 结果是动作基底，不再用固定椭圆把原片肌肉动作贴回。
+- OpenCV 人脸检测每 N 帧更新一次，EMA 平滑人脸框；检测失败时才使用 `mouth_roi` 推导安全人脸区。
+- 对原帧做高通分解，仅取毛孔、痘坑、胡茬等高频残差，不携带旧嘴型/下颌形变。
+- 光流将高频残差对齐到 MuseTalk 帧；嘴唇、牙齿、口腔排除区始终 100% 使用 MuseTalk。
+- 只在 MuseTalk 实际改变且位于下半脸皮肤的区域回填纹理；蒙版只影响纹理强度，不影响肌肉动作来源。
+- `fixed_roi` 仅供 A/B 回归对比，不作为正在说话素材的默认产出方式。
+- `refine` 命令只复用 `base_duration_matched.mp4`、`musetalk_result.mp4` 和 `target_normalized.wav`，用于快速 A/B 纹理参数，不重跑 TTS/MuseTalk。
 
 ## 7. 核心数据流
 
@@ -197,7 +204,7 @@ jobs/<job_id>/
 │   ├── base_duration_matched.mp4
 │   ├── musetalk.yaml
 │   ├── musetalk_result.mp4
-│   └── composite_silent.mp4
+│   └── composite_silent.mkv     # FFV1 无损中间文件
 ├── output/
 │   └── final.mp4
 ├── previews/
@@ -231,8 +238,12 @@ for segment in segments:
 target_audio = concat_and_normalize(segment_wavs)
 base_video = match_video_duration(source, duration(target_audio))
 generated = musetalk.lipsync(base_video, target_audio)
-protected = composite_only_mouth(base_video, generated, job.mouth_roi)
-final = mux_audio(protected, target_audio)
+face_track = track_face(generated, fallback=job.mouth_roi)
+detail = high_pass(base_video, sigma=job.composite.detail_sigma)
+aligned_detail = optical_flow_align(detail, base_video, generated, face_track)
+skin_mask = changed_lower_face(face_track) - mouth_lips_teeth_region(face_track)
+refined = generated + aligned_detail * skin_mask * job.composite.texture_strength
+final = mux_audio(refined, target_audio)
 write_manifest(final)
 ```
 
@@ -242,7 +253,8 @@ write_manifest(final)
 - TTS 某段失败：保留已生成段，修正文本后从该段继续。
 - MuseTalk OOM：将 batch size 从 4 降到 2，不自动改模型版本。
 - 目标音频明显过长：允许乒乓循环，但输出验收必须检查身体循环点。
-- ROI 漂移：要求换素材或进入动态 ROI 二期，不扩大生成区域掩盖问题。
+- 人脸跟踪失败：使用人工 `mouth_roi` 推导的安全人脸区；若人脸大幅移动且持续检测失败，素材验收失败。
+- 光流产生拉丝/闪烁：设置 `optical_flow=false` 回退到同坐标高频回填，不回退到固定 ROI 几何混合。
 - 数字、人名、公司名读错：修正文案或使用 dots.tts.edit 二期能力，不接受错误成片。
 
 ## 10. 非功能要求

@@ -58,6 +58,7 @@ class JobConfig:
     tts: dict[str, Any]
     video: dict[str, Any]
     lipsync: dict[str, Any]
+    composite: dict[str, Any]
     mouth_roi: MouthROI
 
 
@@ -165,6 +166,7 @@ def load_job_config(path: Path) -> JobConfig:
             tts=dict(data["tts"]),
             video=dict(data["video"]),
             lipsync=dict(data["lipsync"]),
+            composite=dict(data.get("composite", {"mode": "dynamic_texture"})),
             mouth_roi=roi,
         )
     except KeyError as exc:
@@ -203,3 +205,15 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("嘴部 ROI 纵向超出画面")
     if roi.feather_pixels < 0:
         raise ConfigurationError("feather_pixels 不能为负数")
+    composite = job.composite
+    mode = str(composite.get("mode", "dynamic_texture"))
+    if mode not in {"dynamic_texture", "fixed_roi"}:
+        raise ConfigurationError("composite.mode 只能是 dynamic_texture 或 fixed_roi")
+    if not 0.0 <= float(composite.get("texture_strength", 0.55)) <= 1.5:
+        raise ConfigurationError("composite.texture_strength 必须在 0～1.5 之间")
+    if float(composite.get("detail_sigma", 1.2)) <= 0:
+        raise ConfigurationError("composite.detail_sigma 必须大于 0")
+    if not 0.0 <= float(composite.get("temporal_ema", 0.8)) < 1.0:
+        raise ConfigurationError("composite.temporal_ema 必须在 [0, 1) 范围")
+    if int(composite.get("mask_feather_pixels", 6)) < 0:
+        raise ConfigurationError("composite.mask_feather_pixels 不能为负数")

@@ -9,7 +9,7 @@ from pathlib import Path
 from .adapters.dots_tts import DotsTTSAdapter
 from .adapters.musetalk import MuseTalkAdapter
 from .audio import split_script
-from .composite import composite_mouth_region
+from .composite import composite_video
 from .config import JobConfig, LocalConfig
 from .ffmpeg import (
     concat_and_normalize_audio,
@@ -119,10 +119,16 @@ class Pipeline:
                 log_file=self.log_dir / "musetalk.log",
             )
 
-        composite = self.work_dir / "composite_silent.mp4"
+        # FFV1 无损中间件，避免 mp4v 再次磨平刚恢复的皮肤高频细节。
+        composite = self.work_dir / "composite_silent.mkv"
         if self._should_run(composite):
-            composite_mouth_region(
-                base_video, musetalk_video, composite, self.job.mouth_roi, fps
+            composite_video(
+                base_video,
+                musetalk_video,
+                composite,
+                self.job.mouth_roi,
+                fps,
+                self.job.composite,
             )
 
         final = self.output_dir / "final.mp4"
@@ -173,6 +179,7 @@ class Pipeline:
             "tts": self.job.tts,
             "video": self.job.video,
             "lipsync": self.job.lipsync,
+            "composite": self.job.composite,
             "mouth_roi": _json_safe(asdict(self.job.mouth_roi)),
         }
 

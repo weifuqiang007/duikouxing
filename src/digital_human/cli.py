@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .annotate import select_mouth_roi
-from .composite import preview_roi
+from .composite import composite_video, preview_roi
 from .config import (
     ConfigurationError,
     MouthROI,
@@ -15,6 +15,7 @@ from .config import (
     load_local_config,
 )
 from .pipeline import Pipeline
+from .ffmpeg import mux_audio
 from .process import CommandError, conda_run, run_command
 
 
@@ -207,6 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     run.add_argument("--force", action="store_true")
+    refine = sub.add_parser(
+        "refine", help="复用已有 MuseTalk 结果，只重跑纹理合成和音轨封装"
+    )
+    refine.add_argument("--job", type=Path, required=True)
+    refine.add_argument("--config", type=Path)
+    refine.add_argument(
+        "--profile",
+        choices=["office", "home"],
+        default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
+    )
+    refine.add_argument("--output", type=Path)
     return parser
 
 
@@ -239,6 +251,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             local = load_local_config(_local_path(args))
             output = Pipeline(local, job, force=args.force).run()
+            print(output)
+            return 0
+        if args.command == "refine":
+            local = load_local_config(_local_path(args))
+            root = local.jobs_root / job.job_id
+            work = root / "work"
+            base = work / "base_duration_matched.mp4"
+            generated = work / "musetalk_result.mp4"
+            audio = work / "target_normalized.wav"
+            for required in (base, generated, audio):
+                if not required.is_file():
+                    raise RuntimeError(f"缺少已有阶段文件，无法 refine: {required}")
+            silent = work / "composite_refined.mkv"
+            composite_video(
+                base,
+                generated,
+                silent,
+                job.mouth_roi,
+                int(job.video.get("fps", 25)),
+                job.composite,
+            )
+            output = (
+                args.output.resolve()
+                if args.output
+                else root / "output" / "final-refined.mp4"
+            )
+            mux_audio(local.ffmpeg, silent, audio, output)
             print(output)
             return 0
     except (ConfigurationError, CommandError, RuntimeError, ValueError) as exc:

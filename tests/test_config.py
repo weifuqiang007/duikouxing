@@ -27,6 +27,7 @@ def _job(tmp_path: Path) -> JobConfig:
         tts={},
         video={},
         lipsync={},
+        composite={"mode": "dynamic_texture"},
         mouth_roi=MouthROI(0.5, 0.5, 0.2, 0.1, 10),
     )
 
@@ -40,6 +41,13 @@ def test_consent_is_required(tmp_path: Path) -> None:
 
 def test_valid_job(tmp_path: Path) -> None:
     validate_job(_job(tmp_path))
+
+
+def test_invalid_composite_mode_is_rejected(tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    invalid = JobConfig(**{**job.__dict__, "composite": {"mode": "unknown"}})
+    with pytest.raises(ConfigurationError, match="composite.mode"):
+        validate_job(invalid)
 
 
 def test_machine_profiles_are_separate() -> None:

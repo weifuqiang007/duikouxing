@@ -1,6 +1,7 @@
 external/
 models/
 samples/
+config/job.local.yaml
 config/job.local.yaml.back
 roi-preview.jpg
 .conda-envs/
