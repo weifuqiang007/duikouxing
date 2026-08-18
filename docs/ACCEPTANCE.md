@@ -1,5 +1,8 @@
 # MVP 验收标准
 
+> 本文档仅适用于 MuseTalk 本地回退链路。LatentSync 1.6 云端主线使用
+> [LATENTSYNC_CLOUD_ACCEPTANCE.md](LATENTSYNC_CLOUD_ACCEPTANCE.md)。
+
 ## 1. 测试素材
 
 至少准备三组已授权素材，每组 10～30 秒：

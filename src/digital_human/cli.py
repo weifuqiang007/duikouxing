@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .annotate import select_mouth_roi
+from .adapters.latentsync import LATENTSYNC_COMMIT
 from .composite import composite_video, preview_roi
 from .config import (
     ConfigurationError,
@@ -44,8 +45,8 @@ def _configure_project_local_storage() -> None:
 
 
 def _profile_path(profile: str) -> Path:
-    if profile not in {"office", "home"}:
-        raise ConfigurationError("profile 只能是 office 或 home")
+    if profile not in {"office", "home", "cloud"}:
+        raise ConfigurationError("profile 只能是 office、home 或 cloud")
     return PROJECT_ROOT / "config" / f"local.{profile}.yaml"
 
 
@@ -70,19 +71,38 @@ def _doctor(local_path: Path) -> int:
                 ],
             ),
         ),
-        (
-            "MuseTalk CUDA",
-            conda_run(
-                local.conda,
-                local.musetalk_env,
-                [
-                "python",
-                "-c",
-                "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
-                ],
-            ),
-        ),
     ]
+    if local.primary_lipsync_engine == "latentsync_1_6":
+        checks.append(
+            (
+                "LatentSync CUDA",
+                conda_run(
+                    local.conda,
+                    local.latentsync_env,
+                    [
+                        "python",
+                        "-c",
+                        "import torch; assert torch.cuda.is_available(); "
+                        "print(torch.__version__, torch.cuda.get_device_name(0))",
+                    ],
+                ),
+            )
+        )
+    else:
+        checks.append(
+            (
+                "MuseTalk CUDA",
+                conda_run(
+                    local.conda,
+                    local.musetalk_env,
+                    [
+                        "python",
+                        "-c",
+                        "import torch; assert torch.cuda.is_available(); print(torch.__version__)",
+                    ],
+                ),
+            )
+        )
     failed = False
     for name, command in checks:
         try:
@@ -106,22 +126,41 @@ def _doctor(local_path: Path) -> int:
     except Exception as exc:
         failed = True
         print(f"[FAIL] 无法读取 GPU 型号: {exc}")
-    required = [
-        local.musetalk_repo / "models" / "musetalkV15" / "unet.pth",
-        local.musetalk_repo / "models" / "musetalkV15" / "musetalk.json",
-        local.musetalk_repo / "models" / "syncnet" / "latentsync_syncnet.pt",
-        local.musetalk_repo / "models" / "dwpose" / "dw-ll_ucoco_384.pth",
-        local.musetalk_repo / "models" / "sd-vae" / "config.json",
-        local.musetalk_repo / "models" / "sd-vae" / "diffusion_pytorch_model.bin",
-        local.musetalk_repo / "models" / "whisper" / "config.json",
-        local.musetalk_repo / "models" / "whisper" / "pytorch_model.bin",
-        local.musetalk_repo / "models" / "whisper" / "preprocessor_config.json",
-        local.musetalk_repo / "models" / "face-parse-bisent" / "79999_iter.pth",
-        local.musetalk_repo
-        / "models"
-        / "face-parse-bisent"
-        / "resnet18-5c106cde.pth",
-    ]
+    if local.primary_lipsync_engine == "latentsync_1_6":
+        required = [
+            local.latentsync_checkpoint,
+            local.latentsync_repo / "checkpoints" / "whisper" / "tiny.pt",
+            local.latentsync_repo / "configs" / "unet" / "stage2_512.yaml",
+            local.latentsync_repo
+            / "checkpoints"
+            / "auxiliary"
+            / "models"
+            / "buffalo_l"
+            / "det_10g.onnx",
+            local.latentsync_repo
+            / "checkpoints"
+            / "auxiliary"
+            / "models"
+            / "buffalo_l"
+            / "2d106det.onnx",
+        ]
+    else:
+        required = [
+            local.musetalk_repo / "models" / "musetalkV15" / "unet.pth",
+            local.musetalk_repo / "models" / "musetalkV15" / "musetalk.json",
+            local.musetalk_repo / "models" / "syncnet" / "latentsync_syncnet.pt",
+            local.musetalk_repo / "models" / "dwpose" / "dw-ll_ucoco_384.pth",
+            local.musetalk_repo / "models" / "sd-vae" / "config.json",
+            local.musetalk_repo / "models" / "sd-vae" / "diffusion_pytorch_model.bin",
+            local.musetalk_repo / "models" / "whisper" / "config.json",
+            local.musetalk_repo / "models" / "whisper" / "pytorch_model.bin",
+            local.musetalk_repo / "models" / "whisper" / "preprocessor_config.json",
+            local.musetalk_repo / "models" / "face-parse-bisent" / "79999_iter.pth",
+            local.musetalk_repo
+            / "models"
+            / "face-parse-bisent"
+            / "resnet18-5c106cde.pth",
+        ]
     for path in required:
         if path.is_file():
             print(f"[OK] 权重: {path}")
@@ -141,21 +180,28 @@ def _doctor(local_path: Path) -> int:
                 print(f"[FAIL] {name} 本地目录不存在: {model_path}")
         else:
             print(f"[WARN] {name} 使用远程 ID，不能保证断网运行: {model_value}")
-    expected_commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+    if local.primary_lipsync_engine == "latentsync_1_6":
+        repo = local.latentsync_repo
+        expected_commit = LATENTSYNC_COMMIT
+        repo_name = "LatentSync"
+    else:
+        repo = local.musetalk_repo
+        expected_commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+        repo_name = "MuseTalk"
     try:
         actual_commit = run_command(
-            ["git", "-C", local.musetalk_repo, "rev-parse", "HEAD"]
+            ["git", "-C", repo, "rev-parse", "HEAD"]
         ).stdout.strip()
         if actual_commit == expected_commit:
-            print(f"[OK] MuseTalk commit: {actual_commit}")
+            print(f"[OK] {repo_name} commit: {actual_commit}")
         else:
             failed = True
             print(
-                f"[FAIL] MuseTalk commit 不匹配: {actual_commit}，预期 {expected_commit}"
+                f"[FAIL] {repo_name} commit 不匹配: {actual_commit}，预期 {expected_commit}"
             )
     except Exception as exc:
         failed = True
-        print(f"[FAIL] 无法检查 MuseTalk commit: {exc}")
+        print(f"[FAIL] 无法检查 {repo_name} commit: {exc}")
     return 1 if failed else 0
 
 
@@ -183,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--config", type=Path)
     doctor.add_argument(
         "--profile",
-        choices=["office", "home"],
+        choices=["office", "home", "cloud"],
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     preview = sub.add_parser("preview-roi", help="生成嘴部 ROI 首帧预览")
@@ -204,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", type=Path)
     run.add_argument(
         "--profile",
-        choices=["office", "home"],
+        choices=["office", "home", "cloud"],
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     run.add_argument("--force", action="store_true")
@@ -215,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     refine.add_argument("--config", type=Path)
     refine.add_argument(
         "--profile",
-        choices=["office", "home"],
+        choices=["office", "home", "cloud"],
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     refine.add_argument("--output", type=Path)

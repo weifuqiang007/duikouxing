@@ -50,10 +50,27 @@ def test_invalid_composite_mode_is_rejected(tmp_path: Path) -> None:
         validate_job(invalid)
 
 
+def test_invalid_latentsync_steps_are_rejected(tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    invalid = JobConfig(
+        **{
+            **job.__dict__,
+            "lipsync": {
+                "engine": "latentsync_1_6",
+                "inference_steps": 10,
+                "guidance_scale": 1.3,
+            },
+        }
+    )
+    with pytest.raises(ConfigurationError, match="inference_steps"):
+        validate_job(invalid)
+
+
 def test_machine_profiles_are_separate() -> None:
     root = Path(__file__).resolve().parents[1]
     office = load_local_config(root / "config" / "local.office.yaml")
     home = load_local_config(root / "config" / "local.home.yaml")
+    cloud = load_local_config(root / "config" / "local.cloud.yaml")
     assert office.profile == "office"
     assert office.expected_gpu == "RTX 3060"
     assert office.musetalk_batch_size == 2
@@ -61,3 +78,7 @@ def test_machine_profiles_are_separate() -> None:
     assert home.expected_gpu == "RTX 4070"
     assert home.musetalk_batch_size == 4
     assert office.jobs_root != home.jobs_root
+    assert cloud.profile == "cloud"
+    assert cloud.expected_gpu == "RTX 4090"
+    assert cloud.primary_lipsync_engine == "latentsync_1_6"
+    assert cloud.jobs_root not in {office.jobs_root, home.jobs_root}

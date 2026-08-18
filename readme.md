@@ -1,4 +1,35 @@
-# 本地口型数字人 Demo
+# 高画质口型数字人 Demo
+
+## 当前主线
+
+`codex/latentsync-1.6-cloud` 分支把高画质口型引擎升级为 LatentSync 1.6：
+
+- 云端 RTX 4090 24GB。
+- 512×512 人脸生成、16 帧时序窗口。
+- 默认 30 步、guidance 1.3。
+- 修复官方二次 H.264 编码，保留 CRF13 视频流。
+- MuseTalk 1.5 仅作为 office/home 快速预览和回归对照。
+
+云端方案的事实来源：
+
+- [LatentSync 云端架构书](docs/LATENTSYNC_CLOUD_ARCHITECTURE.md)
+- [RTX 4090 安装手册](docs/LATENTSYNC_CLOUD_INSTALLATION.md)
+- [高画质验收标准](docs/LATENTSYNC_CLOUD_ACCEPTANCE.md)
+- [开发清单](docs/LATENTSYNC_CLOUD_DEVELOPMENT_CHECKLIST.md)
+
+云端快速开始：
+
+```bash
+bash scripts/setup_cloud_4090.sh
+bash scripts/download_cloud_models.sh
+conda run -p .conda-envs/digital-human \
+  python -m digital_human.cli doctor --profile cloud
+bash scripts/run_job.sh config/job.cloud.yaml
+```
+
+---
+
+## MuseTalk 本地回退链路
 
 项目位置为本仓库所在目录（本机为 `G:\duikouxing`），环境、模型和缓存全部放在项目目录内，不写入 C 盘。客户提供单人、近似固定机位的视频，人物可能手持广告牌、证书或身份证；系统在本地克隆人物声音，以 MuseTalk 的完整下半脸作为新音频动作层，再从原片回填毛孔、痘坑和胡茬等高频皮肤细节。背景、身体、手持物和敏感信息保持原视频内容。
 

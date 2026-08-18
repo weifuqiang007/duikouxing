@@ -5,6 +5,7 @@ environments:
   orchestrator_prefix: "../.conda-envs/digital-human"
   dots_tts_prefix: "../.conda-envs/dots-tts"
   musetalk_prefix: "../.conda-envs/musetalk"
+  latentsync_prefix: "../.conda-envs/latentsync"
 
 executables:
   conda: "conda"
@@ -14,9 +15,11 @@ executables:
 models:
   dots_quality: "../models/dots.tts-soar"
   dots_fast: "../models/dots.tts-mf"
+  latentsync_1_6: "../external/LatentSync/checkpoints/latentsync_unet.pt"
 
 paths:
   musetalk_repo: "../external/MuseTalk"
+  latentsync_repo: "../external/LatentSync"
   jobs_root: "../jobs-office"
 
 runtime:
@@ -25,3 +28,4 @@ runtime:
   musetalk_batch_size: 2
   use_float16: true
   tts_profile: "quality"
+  primary_lipsync_engine: "musetalk_1_5"

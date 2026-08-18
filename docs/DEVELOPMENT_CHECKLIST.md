@@ -1,5 +1,8 @@
 # 开发清单
 
+> LatentSync 1.6 云端主线的任务状态请查看
+> [LATENTSYNC_CLOUD_DEVELOPMENT_CHECKLIST.md](LATENTSYNC_CLOUD_DEVELOPMENT_CHECKLIST.md)。
+
 ## 阶段 A：基础设施
 
 - [x] 建立项目架构书和验收标准。

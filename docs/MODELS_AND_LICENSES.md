@@ -1,5 +1,19 @@
 # 模型、权重、依赖与许可证清单
 
+## 0. LatentSync 1.6（云端高画质主引擎）
+
+- 代码仓库：`https://github.com/bytedance/LatentSync`
+- 固定提交：`a229c3948406bc2cf6eaf4873e662e70c6a04746`
+- 代码许可证：Apache-2.0（以固定提交的 LICENSE 为准）。
+- 权重：`ByteDance/LatentSync-1.6`
+- 权重页标识：OpenRAIL++；商用前必须归档并审查完整条款。
+- 官方权重总量：约 9.64GB。
+- UNet SHA-256：`0a478e89eb660f82da4c35dbdde8a5adfb27f99d1b4e50edd03729e1e98316d3`。
+- 本地位置：`external/LatentSync/checkpoints/`。
+- VAE：`stabilityai/sd-vae-ft-mse`，保存到项目 `.cache/huggingface/`。
+
+禁止将 LatentSync 1.5 的 256 权重或 `stage2.yaml` 配置当作 1.6/512 使用。
+
 ## 1. dots.tts
 
 | 项 | 值 |

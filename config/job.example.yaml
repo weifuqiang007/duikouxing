@@ -1,6 +1,6 @@
-job_id: "demo-001"
+job_id: "latentsync-demo-001"
 consent_confirmed: false
-local_only: true
+local_only: false  # cloud profile 在自建云服务器处理；本地模式改回 true
 
 # 相对路径基于 config/ 目录解析。
 source_video: "../samples/source.mp4"
@@ -24,19 +24,21 @@ tts:
 video:
   fps: 25
   duration_policy: "pingpong"  # cut 或 pingpong
+  final_crf: 12                # 高画质交付；建议 12～14
 
 lipsync:
-  # batch_size 和 use_float16 默认由 office/home 机器配置决定。
-  parsing_mode: "jaw"
-  extra_margin: 10
-  left_cheek_width: 90
-  right_cheek_width: 90
+  engine: "latentsync_1_6"
+  inference_steps: 30          # 官方支持 20～50，画质基线用 30
+  guidance_scale: 1.3         # 建议 1.2～1.5；过高可能闪烁/形变
+  seed: 1247
+  enable_deepcache: false        # 画质基线关闭；仅在 A/B 确认无差异后用于加速
 
 # 默认使用 MuseTalk 的完整下半脸动作，只从原视频回填毛孔/痘坑等高频细节。
 # fixed_roi 仅用于回归对比，会在人物原本开口说话时产生贴片感。
 composite:
-  mode: "dynamic_texture"       # dynamic_texture 或 fixed_roi
-  texture_strength: 0.55        # 高频纹理回填强度，建议 0.45～0.65
+  # LatentSync 首轮必须使用 native，不叠加 MuseTalk 时代的补丁。
+  mode: "native"                # native、dynamic_texture 或 fixed_roi
+  texture_strength: 0.0
   detail_sigma: 1.2             # 高低频分离尺度
   mask_feather_pixels: 6
   temporal_ema: 0.80            # 人脸框时序平滑，越大越稳定

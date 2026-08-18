@@ -1,6 +1,6 @@
-profile: "home"
+profile: "cloud"
 
-# 路径均相对本文件所在 config/ 目录解析，随仓库位置自动适配（本机为 G:\duikouxing）。
+# Ubuntu 22.04 + RTX 4090 24GB 云服务器。所有路径相对项目根目录。
 environments:
   orchestrator_prefix: "../.conda-envs/digital-human"
   dots_tts_prefix: "../.conda-envs/dots-tts"
@@ -20,12 +20,12 @@ models:
 paths:
   musetalk_repo: "../external/MuseTalk"
   latentsync_repo: "../external/LatentSync"
-  jobs_root: "../jobs-home"
+  jobs_root: "../jobs-cloud"
 
 runtime:
-  expected_gpu: "RTX 4070"
+  expected_gpu: "RTX 4090"
   gpu_id: 0
-  musetalk_batch_size: 4
+  musetalk_batch_size: 8
   use_float16: true
   tts_profile: "quality"
-  primary_lipsync_engine: "musetalk_1_5"
+  primary_lipsync_engine: "latentsync_1_6"

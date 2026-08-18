@@ -1,0 +1,11 @@
+diff --git a/latentsync/pipelines/lipsync_pipeline.py b/latentsync/pipelines/lipsync_pipeline.py
+index 693155e..97a30eb 100644
+--- a/latentsync/pipelines/lipsync_pipeline.py
++++ b/latentsync/pipelines/lipsync_pipeline.py
+@@ -473,5 +473,5 @@ class LipsyncPipeline(DiffusionPipeline):
+ 
+         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
+ 
+-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
++        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k {video_out_path}"
+         subprocess.run(command, shell=True)

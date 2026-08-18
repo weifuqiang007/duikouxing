@@ -186,8 +186,24 @@ def match_video_duration(
     )
 
 
-def mux_audio(ffmpeg: str, video: Path, audio: Path, output: Path) -> None:
+def mux_audio(
+    ffmpeg: str,
+    video: Path,
+    audio: Path,
+    output: Path,
+    *,
+    copy_video: bool = False,
+    crf: int = 18,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    video_args: list[str] = ["-c:v", "copy"] if copy_video else [
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+    ]
     run_command(
         [
             ffmpeg,
@@ -200,12 +216,7 @@ def mux_audio(ffmpeg: str, video: Path, audio: Path, output: Path) -> None:
             "0:v:0",
             "-map",
             "1:a:0",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
+            *video_args,
             "-c:a",
             "aac",
             "-b:a",

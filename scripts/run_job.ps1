@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("office", "home")]
+    [ValidateSet("office", "home", "cloud")]
     [string]$Profile,
 
     [Parameter(Mandatory = $true)]

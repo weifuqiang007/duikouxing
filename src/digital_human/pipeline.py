@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .adapters.dots_tts import DotsTTSAdapter
+from .adapters.latentsync import LATENTSYNC_COMMIT, LatentSyncAdapter
 from .adapters.musetalk import MuseTalkAdapter
 from .audio import split_script
 from .composite import composite_video
@@ -108,32 +109,54 @@ class Pipeline:
                 fps,
             )
 
-        musetalk_video = self.work_dir / "musetalk_result.mp4"
-        if self._should_run(musetalk_video):
-            MuseTalkAdapter(self.local).generate(
-                video=base_video,
-                audio=target_audio,
-                output=musetalk_video,
-                job=self.job,
-                work_dir=self.work_dir,
-                log_file=self.log_dir / "musetalk.log",
-            )
+        lipsync_engine = str(self.job.lipsync.get("engine", "musetalk_1_5"))
+        if lipsync_engine == "latentsync_1_6":
+            visual_result = self.work_dir / "latentsync_result.mp4"
+            if self._should_run(visual_result):
+                LatentSyncAdapter(self.local).generate(
+                    video=base_video,
+                    audio=target_audio,
+                    output=visual_result,
+                    job=self.job,
+                    work_dir=self.work_dir,
+                    log_file=self.log_dir / "latentsync.log",
+                )
+            copy_final_video = True
+        else:
+            musetalk_video = self.work_dir / "musetalk_result.mp4"
+            if self._should_run(musetalk_video):
+                MuseTalkAdapter(self.local).generate(
+                    video=base_video,
+                    audio=target_audio,
+                    output=musetalk_video,
+                    job=self.job,
+                    work_dir=self.work_dir,
+                    log_file=self.log_dir / "musetalk.log",
+                )
 
-        # FFV1 无损中间件，避免 mp4v 再次磨平刚恢复的皮肤高频细节。
-        composite = self.work_dir / "composite_silent.mkv"
-        if self._should_run(composite):
-            composite_video(
-                base_video,
-                musetalk_video,
-                composite,
-                self.job.mouth_roi,
-                fps,
-                self.job.composite,
-            )
+            # FFV1 无损中间件，避免 mp4v 再次磨平刚恢复的皮肤高频细节。
+            visual_result = self.work_dir / "composite_silent.mkv"
+            if self._should_run(visual_result):
+                composite_video(
+                    base_video,
+                    musetalk_video,
+                    visual_result,
+                    self.job.mouth_roi,
+                    fps,
+                    self.job.composite,
+                )
+            copy_final_video = False
 
         final = self.output_dir / "final.mp4"
         if self._should_run(final):
-            mux_audio(self.local.ffmpeg, composite, target_audio, final)
+            mux_audio(
+                self.local.ffmpeg,
+                visual_result,
+                target_audio,
+                final,
+                copy_video=copy_final_video,
+                crf=int(self.job.video.get("final_crf", 12)),
+            )
 
         manifest_payload = {
             "job_id": self.job.job_id,
@@ -145,7 +168,10 @@ class Pipeline:
             "tts_profile": self.job.tts.get("profile", "auto"),
             "machine_profile": self.local.profile,
             "expected_gpu": self.local.expected_gpu,
-            "musetalk_version": "1.5",
+            "lipsync_engine": lipsync_engine,
+            "latentsync_commit": (
+                LATENTSYNC_COMMIT if lipsync_engine == "latentsync_1_6" else None
+            ),
             "job_config": self._safe_job_summary(),
             "output": str(final),
             "status": "completed",

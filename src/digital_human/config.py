@@ -24,15 +24,19 @@ class LocalConfig:
     orchestrator_env: Path
     dots_env: Path
     musetalk_env: Path
+    latentsync_env: Path
     dots_quality_model: str
     dots_fast_model: str
     musetalk_repo: Path
+    latentsync_repo: Path
+    latentsync_checkpoint: Path
     jobs_root: Path
     expected_gpu: str
     gpu_id: int
     musetalk_batch_size: int
     use_float16: bool
     tts_profile: str
+    primary_lipsync_engine: str
 
 
 @dataclass(frozen=True)
@@ -93,15 +97,21 @@ def load_local_config(path: Path) -> LocalConfig:
             orchestrator_env=_resolve(str(envs["orchestrator_prefix"]), base),
             dots_env=_resolve(str(envs["dots_tts_prefix"]), base),
             musetalk_env=_resolve(str(envs["musetalk_prefix"]), base),
+            latentsync_env=_resolve(str(envs["latentsync_prefix"]), base),
             dots_quality_model=str(_resolve(str(models["dots_quality"]), base)),
             dots_fast_model=str(_resolve(str(models["dots_fast"]), base)),
             musetalk_repo=_resolve(str(paths["musetalk_repo"]), base),
+            latentsync_repo=_resolve(str(paths["latentsync_repo"]), base),
+            latentsync_checkpoint=_resolve(str(models["latentsync_1_6"]), base),
             jobs_root=_resolve(str(paths["jobs_root"]), base),
             expected_gpu=str(runtime["expected_gpu"]),
             gpu_id=int(runtime.get("gpu_id", 0)),
             musetalk_batch_size=int(runtime["musetalk_batch_size"]),
             use_float16=bool(runtime.get("use_float16", True)),
             tts_profile=str(runtime.get("tts_profile", "quality")),
+            primary_lipsync_engine=str(
+                runtime.get("primary_lipsync_engine", "musetalk_1_5")
+            ),
         )
         validate_local_config(config)
         return config
@@ -110,17 +120,24 @@ def load_local_config(path: Path) -> LocalConfig:
 
 
 def validate_local_config(config: LocalConfig) -> None:
-    if config.profile not in {"office", "home"}:
-        raise ConfigurationError("profile 只能是 office 或 home")
+    if config.profile not in {"office", "home", "cloud"}:
+        raise ConfigurationError("profile 只能是 office、home 或 cloud")
     if config.musetalk_batch_size < 1:
         raise ConfigurationError("musetalk_batch_size 必须大于 0")
     if config.tts_profile not in {"quality", "fast"}:
         raise ConfigurationError("tts_profile 只能是 quality 或 fast")
+    if config.primary_lipsync_engine not in {"musetalk_1_5", "latentsync_1_6"}:
+        raise ConfigurationError(
+            "primary_lipsync_engine 只能是 musetalk_1_5 或 latentsync_1_6"
+        )
     local_paths = (
         config.orchestrator_env,
         config.dots_env,
         config.musetalk_env,
+        config.latentsync_env,
         config.musetalk_repo,
+        config.latentsync_repo,
+        config.latentsync_checkpoint,
         config.jobs_root,
     )
     for path in local_paths:
@@ -178,8 +195,6 @@ def load_job_config(path: Path) -> JobConfig:
 def validate_job(job: JobConfig) -> None:
     if not job.consent_confirmed:
         raise ConfigurationError("未确认人物肖像和声音授权，任务拒绝运行")
-    if not job.local_only:
-        raise ConfigurationError("MVP 只允许 local_only=true")
     if not job.source_video.is_file():
         raise ConfigurationError(f"源视频不存在: {job.source_video}")
     if job.reference_audio is not None and not job.reference_audio.is_file():
@@ -207,8 +222,10 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("feather_pixels 不能为负数")
     composite = job.composite
     mode = str(composite.get("mode", "dynamic_texture"))
-    if mode not in {"dynamic_texture", "fixed_roi"}:
-        raise ConfigurationError("composite.mode 只能是 dynamic_texture 或 fixed_roi")
+    if mode not in {"native", "dynamic_texture", "fixed_roi"}:
+        raise ConfigurationError(
+            "composite.mode 只能是 native、dynamic_texture 或 fixed_roi"
+        )
     if not 0.0 <= float(composite.get("texture_strength", 0.55)) <= 1.5:
         raise ConfigurationError("composite.texture_strength 必须在 0～1.5 之间")
     if float(composite.get("detail_sigma", 1.2)) <= 0:
@@ -217,3 +234,15 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("composite.temporal_ema 必须在 [0, 1) 范围")
     if int(composite.get("mask_feather_pixels", 6)) < 0:
         raise ConfigurationError("composite.mask_feather_pixels 不能为负数")
+    engine = str(job.lipsync.get("engine", "musetalk_1_5"))
+    if engine not in {"musetalk_1_5", "latentsync_1_6"}:
+        raise ConfigurationError(
+            "lipsync.engine 只能是 musetalk_1_5 或 latentsync_1_6"
+        )
+    if engine == "latentsync_1_6":
+        steps = int(job.lipsync.get("inference_steps", 30))
+        guidance = float(job.lipsync.get("guidance_scale", 1.3))
+        if not 20 <= steps <= 50:
+            raise ConfigurationError("LatentSync inference_steps 必须在 20～50 之间")
+        if not 1.0 <= guidance <= 3.0:
+            raise ConfigurationError("LatentSync guidance_scale 必须在 1.0～3.0 之间")
