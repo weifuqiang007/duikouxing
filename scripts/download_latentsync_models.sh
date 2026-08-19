@@ -25,11 +25,12 @@ export TMPDIR="${PROJECT_ROOT}/.tmp"
 mkdir -p "${LATENTSYNC_ROOT}/checkpoints" "${HF_HOME}" "${TMPDIR}"
 
 # 完整官方权重约 9.64GB：UNet 5.07GB、SyncNet 1.61GB、Whisper 与人脸检测辅助权重。
-conda run -p "${LATENTSYNC_ENV}" hf download ByteDance/LatentSync-1.6 \
+# 注意：官方 requirements 固定 huggingface-hub==0.30.2，该版本只有 huggingface-cli 子命令。
+conda run -p "${LATENTSYNC_ENV}" huggingface-cli download ByteDance/LatentSync-1.6 \
   --local-dir "${LATENTSYNC_ROOT}/checkpoints"
 
 # 官方推理以 Hugging Face ID 加载 VAE；提前写入项目内缓存，避免任务运行时下载。
-conda run -p "${LATENTSYNC_ENV}" hf download stabilityai/sd-vae-ft-mse
+conda run -p "${LATENTSYNC_ENV}" huggingface-cli download stabilityai/sd-vae-ft-mse
 
 # InsightFace FaceAnalysis 默认会在首次推理时隐式下载 buffalo_l。
 # 在安装阶段显式下载官方 v0.7 model pack，保证任务阶段离线。

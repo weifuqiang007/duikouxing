@@ -19,9 +19,9 @@ bash "${PROJECT_ROOT}/scripts/download_latentsync_models.sh"
 }
 
 mkdir -p "${PROJECT_ROOT}/models"
-conda run -p "${DOTS_ENV}" hf download dots-studio/dots.tts-soar \
+conda run -p "${DOTS_ENV}" huggingface-cli download dots-studio/dots.tts-soar \
   --local-dir "${PROJECT_ROOT}/models/dots.tts-soar"
-conda run -p "${DOTS_ENV}" hf download dots-studio/dots.tts-mf \
+conda run -p "${DOTS_ENV}" huggingface-cli download dots-studio/dots.tts-mf \
   --local-dir "${PROJECT_ROOT}/models/dots.tts-mf"
 
 echo "All cloud pipeline models downloaded under ${PROJECT_ROOT}"
