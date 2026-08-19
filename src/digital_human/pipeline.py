@@ -21,6 +21,7 @@ from .ffmpeg import (
     normalize_video,
 )
 from .manifest import sha256_file, write_manifest
+from .synccheck import check_driving_sync
 
 
 class Pipeline:
@@ -28,6 +29,7 @@ class Pipeline:
         self.local = local
         self.job = job
         self.force = force
+        self.driving_sync: dict[str, object] | None = None
         self.root = local.jobs_root / job.job_id
         self.input_dir = self.root / "input"
         self.work_dir = self.root / "work"
@@ -167,6 +169,7 @@ class Pipeline:
                 else None
             ),
             "musetalk_version": "1.5" if self.job.backend == "musetalk" else None,
+            "driving_sync": self.driving_sync,
             "job_config": self._safe_job_summary(),
             "output": str(final),
             "status": "completed",
@@ -202,6 +205,7 @@ class Pipeline:
         driving_copy = self.input_dir / self.job.driving_video.name
         if self._should_run(driving_copy):
             shutil.copy2(self.job.driving_video, driving_copy)
+        self._check_driving_sync(driving_copy, target_audio)
         normalized_driving = self.work_dir / "driving_25fps.mp4"
         if self._should_run(normalized_driving):
             normalize_driving_video(
@@ -224,6 +228,34 @@ class Pipeline:
                 log_file=self.log_dir / "liveportrait.log",
             )
         return generated
+
+    def _check_driving_sync(self, driving_copy: Path, target_audio: Path) -> None:
+        """渲染前校验驱动录音是否真的跟随了导读；时长容差挡不住"自说自话"的录音。"""
+        threshold = float(self.job.performance_drive.get("min_sync_envelope", 0.3))
+        if threshold <= 0:
+            self.driving_sync = {"status": "disabled"}
+            return
+        report = check_driving_sync(
+            self.local.ffmpeg,
+            self.local.ffprobe,
+            driving_copy,
+            target_audio,
+            self.work_dir,
+        )
+        if report is None:
+            self.driving_sync = {
+                "status": "skipped",
+                "reason": "驱动视频无可比对的声音信号（无声对口型无法校验）",
+            }
+            return
+        self.driving_sync = {"status": "measured", **report.as_dict()}
+        if report.correlation < threshold:
+            raise RuntimeError(
+                f"真人驱动视频与导读音频的节奏相关度仅 {report.correlation:.2f}"
+                f"（要求 ≥ {threshold:.2f}，全局偏移 {report.offset_seconds:+.1f}s），"
+                "录音疑似没有实时跟随导读。请戴耳机边听 recording_guide 边跟读重录，"
+                "或在配置中将 min_sync_envelope 调低/置 0 关闭校验"
+            )
 
     def _job_fingerprint(self) -> str:
         payload = _json_safe(asdict(self.job))

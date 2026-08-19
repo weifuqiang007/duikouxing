@@ -14,11 +14,13 @@ def run_command(
     *,
     cwd: Path | None = None,
     log_file: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [str(item) for item in args]
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
+        env=env,
         text=True,
         encoding="utf-8",
         errors="replace",

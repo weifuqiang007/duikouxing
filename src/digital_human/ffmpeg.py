@@ -5,6 +5,10 @@ from pathlib import Path
 
 from .process import run_command
 
+# 本机 ffmpeg（gyan 7.0.2 构建）在多线程 libx264 编码时存在段错误竞态，
+# 所有 libx264 输出统一加 -threads 1 规避；720p 短片单线程编码速度足够。
+X264_SINGLE_THREAD = ("-threads", "1")
+
 
 def media_duration(ffprobe: str, path: Path) -> float:
     result = run_command(
@@ -36,6 +40,7 @@ def normalize_video(ffmpeg: str, source: Path, output: Path, fps: int) -> None:
             f"fps={fps}",
             "-c:v",
             "libx264",
+            *X264_SINGLE_THREAD,
             "-crf",
             "18",
             "-pix_fmt",
@@ -170,6 +175,7 @@ def match_video_duration(
             "-an",
             "-c:v",
             "libx264",
+            *X264_SINGLE_THREAD,
             "-crf",
             "18",
             "-pix_fmt",
@@ -190,6 +196,7 @@ def match_video_duration(
             "-an",
             "-c:v",
             "libx264",
+            *X264_SINGLE_THREAD,
             "-crf",
             "18",
             "-pix_fmt",
@@ -234,6 +241,7 @@ def normalize_driving_video(
             f"{target_duration:.6f}",
             "-c:v",
             "libx264",
+            *X264_SINGLE_THREAD,
             "-crf",
             "15",
             "-pix_fmt",
@@ -260,6 +268,7 @@ def mux_audio(ffmpeg: str, video: Path, audio: Path, output: Path) -> None:
             "1:a:0",
             "-c:v",
             "libx264",
+            *X264_SINGLE_THREAD,
             "-crf",
             "18",
             "-pix_fmt",

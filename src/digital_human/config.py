@@ -228,6 +228,11 @@ def validate_job(job: JobConfig) -> None:
     tolerance = float(performance.get("duration_tolerance_ratio", 0.12))
     if not 0.0 <= tolerance <= 0.5:
         raise ConfigurationError("performance_drive.duration_tolerance_ratio 必须在 [0, 0.5] 范围")
+    sync_envelope = float(performance.get("min_sync_envelope", 0.3))
+    if not 0.0 <= sync_envelope <= 1.0:
+        raise ConfigurationError(
+            "performance_drive.min_sync_envelope 必须在 [0, 1] 范围；0 表示关闭同步预检"
+        )
     composite = job.composite
     mode = str(composite.get("mode", "dynamic_texture"))
     if mode not in {"dynamic_texture", "fixed_roi"}:

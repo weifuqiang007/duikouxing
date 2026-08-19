@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -12,6 +13,26 @@ class LivePortraitAdapter:
 
     def __init__(self, config: LocalConfig) -> None:
         self.config = config
+
+    def _gpu_env(self) -> dict[str, str]:
+        """把环境内 pip 安装的 NVIDIA DLL 目录（nvidia-cudnn-cu12 等）和 torch
+        自带的 CUDA 库目录前置到 PATH。
+
+        onnxruntime 的 CUDA 后端主要靠 site-packages 里的 zz_cuda_dll_dirs.pth
+        启动钩子（os.add_dll_directory）找到 cuDNN 9，这里是对 torch 等经典
+        加载路径的兜底。
+        """
+        env = dict(os.environ)
+        site_packages = self.config.liveportrait_env / "Lib" / "site-packages"
+        candidates = [
+            site_packages / "nvidia" / "cudnn" / "bin",
+            site_packages / "nvidia" / "cublas" / "bin",
+            site_packages / "torch" / "lib",
+        ]
+        extra = [str(path) for path in candidates if path.is_dir()]
+        if extra:
+            env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+        return env
 
     def generate(
         self,
@@ -30,12 +51,18 @@ class LivePortraitAdapter:
         settings = job.performance_drive
         result_dir = work_dir / "liveportrait_results"
         result_dir.mkdir(parents=True, exist_ok=True)
+        # 经包装脚本启动：monkeypatch imageio 强制 x264 单线程编码，
+        # 规避本机多线程 libx264 的间歇性段错误（详见脚本内注释）。
+        runner = repo.parents[1] / "scripts" / "liveportrait_runner.py"
+        if not runner.is_file():
+            raise RuntimeError(f"缺少 LivePortrait 启动包装脚本: {runner}")
         command: list[str | Path] = conda_run(
             self.config.conda,
             self.config.liveportrait_env,
             [
                 "python",
-                "inference.py",
+                runner,
+                repo / "inference.py",
                 "--source",
                 source,
                 "--driving",
@@ -83,7 +110,7 @@ class LivePortraitAdapter:
         else:
             command.append("--no_flag_use_half_precision")
 
-        run_command(command, cwd=repo, log_file=log_file)
+        run_command(command, cwd=repo, log_file=log_file, env=self._gpu_env())
         produced = result_dir / f"{source.stem}--{driving.stem}.mp4"
         if not produced.is_file():
             candidates = sorted(

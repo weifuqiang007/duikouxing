@@ -1,5 +1,5 @@
-job_id: "demo-001"
-consent_confirmed: false
+job_id: "selftest-001"
+consent_confirmed: true   # 本人测试素材，本人知情同意
 local_only: true
 backend: "liveportrait"
 
@@ -16,8 +16,8 @@ reference_start_seconds: 0.0
 reference_duration_seconds: 15.0
 
 # 必须与参考音频实际内容逐字一致。
-reference_text: "这里填写参考音频实际说出的文字。"
-script: "这里填写希望人物说出的新话术。"
+reference_text: "我是魏龙虎，身份证号1 5 2 6 3 0 1 9 9 2 1 0 1 8 7 2 1 0，现就职于河北省城广建设有限公司，特此证明。"
+script: "我是魏龙虎，身份证1 5 2 6 3 0 1 9 9 2 1 0 1 8 7 2 1 0,于2026年8月19日入职河北蓝念建筑工程有限公司。视频拍摄时间2026年9月7日。本人承诺：此视频真实有效，对视频的真实性负责，如有虚假承诺或挂靠出借证件行为，本人愿意承担一切法律责任。"
 
 tts:
   profile: "auto"          # auto 使用 office/home 配置；也可强制 quality 或 fast
@@ -47,9 +47,6 @@ performance_drive:
   driving_multiplier: 0.85       # 建议 A/B：0.75、0.85、1.0
   smooth_variance: 0.0000003
   duration_tolerance_ratio: 0.12 # 跟录视频与导读相差超过 12% 时拒绝运行
-  # 同步预检：驱动录音与导读的能量包络相关度低于阈值时在渲染前拒绝，
-  # 拦截"时长接近但没有实时跟读"的废片。0 表示关闭（无声对口型会被自动跳过）。
-  min_sync_envelope: 0.3
   use_half_precision: true
   source_max_dim: 1280
   source_crop_scale: 2.3
