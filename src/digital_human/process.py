@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -14,11 +15,14 @@ def run_command(
     *,
     cwd: Path | None = None,
     log_file: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [str(item) for item in args]
+    merged_env = {**os.environ, **env} if env else None
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
+        env=merged_env,
         text=True,
         encoding="utf-8",
         errors="replace",

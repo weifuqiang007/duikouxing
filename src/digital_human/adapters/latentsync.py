@@ -95,6 +95,18 @@ class LatentSyncAdapter:
                 "LatentSync 高画质封装补丁未应用；请重跑 scripts/setup_cloud_4090.sh"
             )
 
+        # 口型幅度旋钮：audio_amp != 1.0 时透传 LATENTSYNC_AUDIO_AMP，
+        # 依赖 audio2feature 幅度补丁（scripts/setup_cloud_4090.sh 自动应用）。
+        audio_amp = float(job.lipsync.get("audio_amp", 1.0))
+        run_env: dict[str, str] | None = None
+        if audio_amp != 1.0:
+            audio2feature_path = repo / "latentsync" / "whisper" / "audio2feature.py"
+            if "LATENTSYNC_AUDIO_AMP" not in audio2feature_path.read_text(encoding="utf-8"):
+                raise RuntimeError(
+                    "lipsync.audio_amp 需要 audio2feature 幅度补丁；请重跑 scripts/setup_cloud_4090.sh"
+                )
+            run_env = {"LATENTSYNC_AUDIO_AMP": str(audio_amp)}
+
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
             output.unlink()
@@ -105,6 +117,6 @@ class LatentSyncAdapter:
             job=job,
             work_dir=work_dir,
         )
-        run_command(command, cwd=repo, log_file=log_file)
+        run_command(command, cwd=repo, log_file=log_file, env=run_env)
         if not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError(f"LatentSync 1.6 未生成预期文件: {output}")

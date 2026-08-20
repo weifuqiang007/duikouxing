@@ -1,0 +1,16 @@
+diff --git a/latentsync/whisper/audio2feature.py b/latentsync/whisper/audio2feature.py
+--- a/latentsync/whisper/audio2feature.py
++++ b/latentsync/whisper/audio2feature.py
+@@ -115,6 +115,11 @@
+             emb_end_idx = int((end_idx - start_idx) / 2)
+             embed_list.append(encoder_embeddings[:emb_end_idx])
+         concatenated_array = torch.from_numpy(np.concatenate(embed_list, axis=0))
+-        return concatenated_array
++        # 口型幅度实验：环境变量放大 whisper 音频特征，增强嘴部开合驱动。
++        # 默认 1.0 = 官方原行为；仅在显式设置 LATENTSYNC_AUDIO_AMP 时生效。
++        amplitude = float(os.environ.get("LATENTSYNC_AUDIO_AMP", "1.0"))
++        if amplitude != 1.0:
++            concatenated_array = concatenated_array * amplitude
++        return concatenated_array
+
+     def audio2feat(self, audio_path):

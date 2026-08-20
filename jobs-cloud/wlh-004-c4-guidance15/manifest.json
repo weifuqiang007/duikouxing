@@ -1,0 +1,10 @@
+{
+  "job_id": "wlh-004-c4-guidance15",
+  "experiment": "mouth-amplitude-ab",
+  "lipsync_engine": "latentsync_1_6",
+  "inference_steps": 30,
+  "guidance_scale": 1.5,
+  "latentsync_audio_amp": 1.0,
+  "seed": 1247,
+  "reused_intermediates_from": "wlh-004-c3"
+}

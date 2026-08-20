@@ -1,0 +1,13 @@
+{
+  "job_id": "wlh-004-it-v2v",
+  "experiment": "infinitetalk-v2v-dubbing",
+  "repo_commit": "fd631497254e065777f2b2d0642de3600d674e24",
+  "base_model": "Wan2.1-I2V-14B-480P (fp8 quant)",
+  "sample_steps": 40,
+  "text_cfg": 5.0,
+  "audio_cfg": 4.0,
+  "mode": "streaming",
+  "seed": 1247,
+  "input_duration_s": 14,
+  "reused_intermediates_from": "wlh-004-c3"
+}

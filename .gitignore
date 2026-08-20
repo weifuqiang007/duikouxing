@@ -21,3 +21,6 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .idea/
+.claude/settings.local.json
+tmp_compare/
+experiments/infinitetalk/results/

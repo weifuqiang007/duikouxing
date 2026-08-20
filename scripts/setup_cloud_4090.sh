@@ -61,6 +61,13 @@ if ! grep -q -- "-c:v copy" \
     "${PROJECT_ROOT}/patches/latentsync-1.6-quality-mux.patch"
 fi
 
+# 口型幅度旋钮：job yaml 的 lipsync.audio_amp 依赖本补丁（默认 1.0 = 官方原行为）。
+if ! grep -q "LATENTSYNC_AUDIO_AMP" \
+  "${LATENTSYNC_ROOT}/latentsync/whisper/audio2feature.py"; then
+  git -C "${LATENTSYNC_ROOT}" apply \
+    "${PROJECT_ROOT}/patches/latentsync-audio-amplitude.patch"
+fi
+
 if [[ ! -x "${LATENTSYNC_ENV}/bin/python" ]]; then
   conda create -y -p "${LATENTSYNC_ENV}" python=3.10.13 pip=24.3.1
 fi
