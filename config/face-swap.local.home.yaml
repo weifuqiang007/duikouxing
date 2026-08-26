@@ -1,0 +1,24 @@
+version: 1
+
+runtime:
+  root: 'F:\duikouxing-runtime\faceswap'
+  facefusion_repo: 'F:\duikouxing-runtime\faceswap\repos\facefusion'
+  facefusion_python: 'F:\duikouxing-runtime\faceswap\envs\facefusion-3.8.2\python.exe'
+  temp_dir: 'F:\duikouxing-runtime\faceswap\temp'
+  jobs_dir: 'F:\duikouxing-runtime\faceswap\jobs'
+  outputs_dir: 'F:\duikouxing-runtime\faceswap\outputs'
+  logs_dir: 'F:\duikouxing-runtime\faceswap\logs'
+
+engine:
+  name: facefusion
+  version: '3.8.2'
+  commit: '4b1dedb853e4838ca7f3cf70b572be241aee2497'
+  execution_providers: [cuda]
+  execution_thread_count: 4
+
+policy:
+  require_consent: true
+  label_ai_generated: true
+  commercial_model_allowlist: []
+  license_override_dir: 'F:\duikouxing-runtime\faceswap\licenses'
+  reject_c_drive_runtime: true

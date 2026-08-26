@@ -1,0 +1,52 @@
+version: 1
+job_id: 'fs-20260826-001'
+usage: research                 # research | commercial
+
+consent:
+  source_identity_confirmed: true
+  target_performer_confirmed: true
+  intended_use: '客户授权的宣传视频'
+
+input:
+  source_images:
+    - 'F:\duikouxing-runtime\faceswap\jobs\fs-20260826-001\input\front.jpg'
+    - 'F:\duikouxing-runtime\faceswap\jobs\fs-20260826-001\input\left30.jpg'
+    - 'F:\duikouxing-runtime\faceswap\jobs\fs-20260826-001\input\right30.jpg'
+  target_video: 'F:\duikouxing-runtime\faceswap\jobs\fs-20260826-001\input\target.mp4'
+
+output:
+  video: 'F:\duikouxing-runtime\faceswap\outputs\fs-20260826-001.mp4'
+  manifest: 'F:\duikouxing-runtime\faceswap\outputs\fs-20260826-001.manifest.json'
+
+profile:
+  name: ghost_balanced
+  face_swapper_model: ghost_2_256
+  pixel_boost: '512x512'
+  swapper_weight: 0.85
+  expression_factor: 80
+  expression_areas: [upper-face, lower-face]
+  mask_types: [box, occlusion, region]
+  mask_regions:
+    - skin
+    - left-eyebrow
+    - right-eyebrow
+    - left-eye
+    - right-eye
+    - nose
+    - mouth
+    - upper-lip
+    - lower-lip
+  mask_blur: 0.30
+  enhancer_enabled: true
+  enhancer_model: gfpgan_1.4
+  enhancer_blend: 25
+  enhancer_weight: 0.50
+  output_video_encoder: libx264
+  output_video_quality: 95
+  output_video_preset: slow
+
+quality:
+  min_face_detection_coverage: 0.99
+  min_mouth_sharpness_ratio: 0.75
+  min_mouth_motion_correlation: 0.90
+  require_manual_review: true
