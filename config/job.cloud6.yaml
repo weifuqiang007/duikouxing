@@ -2,7 +2,7 @@ job_id: "wlh-006-newscript-fix"
 consent_confirmed: true
 local_only: false
 
-source_video: "../samples/wlh_1080close.mp4"
+source_video: "../samples/wlh.mp4"
 
 reference_audio: ""
 reference_start_seconds: 0.0
