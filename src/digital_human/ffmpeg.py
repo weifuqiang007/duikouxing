@@ -23,12 +23,53 @@ def media_duration(ffprobe: str, path: Path) -> float:
     return float(payload["format"]["duration"])
 
 
-def normalize_video(ffmpeg: str, source: Path, output: Path, fps: int) -> None:
+def media_fps(ffprobe: str, path: Path) -> float:
+    result = run_command(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "json",
+            path,
+        ]
+    )
+    payload = json.loads(result.stdout)
+    rate = payload["streams"][0]["r_frame_rate"]
+    num, _, den = rate.partition("/")
+    return float(num) / float(den or 1)
+
+
+def normalize_video(
+    ffmpeg: str,
+    ffprobe: str,
+    source: Path,
+    output: Path,
+    fps: int,
+    *,
+    crf: int = 18,
+    passthrough: bool = False,
+    start_seconds: float = 0.0,
+) -> None:
+    """统一帧率；start_seconds>0 时跳过源片开头的不稳定段（如举证件的调整期）。"""
     output.parent.mkdir(parents=True, exist_ok=True)
+    seek = ["-ss", f"{start_seconds:.3f}"] if start_seconds > 0 else []
+    if passthrough:
+        source_fps = media_fps(ffprobe, source)
+        if abs(source_fps - fps) < 0.02:
+            run_command(
+                [ffmpeg, "-y", *seek, "-i", source, "-an", "-c:v", "copy", output]
+            )
+            return
     run_command(
         [
             ffmpeg,
             "-y",
+            *seek,
             "-i",
             source,
             "-an",
@@ -37,7 +78,7 @@ def normalize_video(ffmpeg: str, source: Path, output: Path, fps: int) -> None:
             "-c:v",
             "libx264",
             "-crf",
-            "18",
+            str(crf),
             "-pix_fmt",
             "yuv420p",
             output,
@@ -105,6 +146,28 @@ def concat_and_normalize_audio(ffmpeg: str, inputs: list[Path], output: Path) ->
     run_command(args)
 
 
+def pingpong_filter_graph(segments: int, target_duration: float) -> str:
+    """构建 fwd/rev 交替拼接后按时长裁切的 filter_complex（纯函数便于测试）。
+
+    segments 为总段数，偶数段倒放，保证末段为正放（循环点回到片头）。
+    """
+    labels = [f"s{i}" for i in range(segments)]
+    parts = [f"[0:v]split={segments}{''.join('[' + label + ']' for label in labels)}"]
+    merged = []
+    for index, label in enumerate(labels):
+        if index % 2 == 1:
+            rev = f"r{index}"
+            parts.append(f"[{label}]reverse[{rev}]")
+            merged.append(f"[{rev}]")
+        else:
+            merged.append(f"[{label}]")
+    parts.append(
+        f"{''.join(merged)}concat=n={segments}:v=1:a=0[cyc];"
+        f"[cyc]trim=duration={target_duration:.6f}[out]"
+    )
+    return ";".join(parts)
+
+
 def match_video_duration(
     ffmpeg: str,
     ffprobe: str,
@@ -113,7 +176,10 @@ def match_video_duration(
     output: Path,
     policy: str,
     fps: int,
+    *,
+    crf: int = 18,
 ) -> None:
+    """对齐视频与目标音频时长；pingpong 单遍生成（只编码一次，避免多代画质损失）。"""
     video_duration = media_duration(ffprobe, source)
     target_duration = media_duration(ffprobe, audio)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +196,7 @@ def match_video_duration(
                 "-c:v",
                 "libx264",
                 "-crf",
-                "18",
+                str(crf),
                 "-pix_fmt",
                 "yuv420p",
                 output,
@@ -142,7 +208,10 @@ def match_video_duration(
             f"目标音频 {target_duration:.2f}s 长于视频 {video_duration:.2f}s，"
             "duration_policy 必须为 pingpong"
         )
-    cycle = output.with_name("base_pingpong_cycle.mp4")
+    # 段数向上取整且保持奇数（正放结尾），一次 filter 图内完成拼接+裁切+编码。
+    segments = max(2, int(target_duration / video_duration) + 1)
+    if segments % 2 == 0:
+        segments += 1
     run_command(
         [
             ffmpeg,
@@ -150,35 +219,14 @@ def match_video_duration(
             "-i",
             source,
             "-filter_complex",
-            "[0:v]split=2[fwd][revsrc];[revsrc]reverse[rev];"
-            "[fwd][rev]concat=n=2:v=1:a=0[out]",
+            pingpong_filter_graph(segments, target_duration),
             "-map",
             "[out]",
             "-an",
             "-c:v",
             "libx264",
             "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            cycle,
-        ]
-    )
-    run_command(
-        [
-            ffmpeg,
-            "-y",
-            "-stream_loop",
-            "-1",
-            "-i",
-            cycle,
-            "-t",
-            f"{target_duration:.6f}",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
+            str(crf),
             "-pix_fmt",
             "yuv420p",
             output,
