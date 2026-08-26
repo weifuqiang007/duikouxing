@@ -21,8 +21,9 @@ from .ffmpeg import (
     normalize_video,
 )
 from .manifest import sha256_file, write_manifest
+from .motion_stabilize import stabilize_face
 from .process import CommandError, run_command
-from .stabilize import DEFAULT_FACE_BOX, stabilize_face_tone
+from .stabilize import DEFAULT_FACE_BOX
 
 
 class Pipeline:
@@ -150,22 +151,30 @@ class Pipeline:
                     work_dir=self.work_dir,
                     log_file=self.log_dir / "heygem.log",
                 )
-            # 人脸部色调时域稳定：抑制逐帧重绘的高频亮度/色度闪变（可配 0 关闭）。
+            # 人脸稳定：色调 EMA(亮度/色度闪变) + 光流几何(亚像素高频抖动)。
+            # face_tone_ema=0 或 face_motion_smooth_frames=0/1 分别关闭对应项。
             tone_ema = float(self.job.composite.get("face_tone_ema", 0.9))
-            if 0.0 < tone_ema < 1.0:
-                stabilized = self.work_dir / "heygem_tone_stabilized.mp4"
+            motion_frames = int(
+                self.job.composite.get("face_motion_smooth_frames", 15)
+            )
+            if 0.0 < tone_ema < 1.0 or motion_frames > 1:
+                stabilized = self.work_dir / "heygem_stabilized.mp4"
                 if self._should_run(stabilized):
-                    stabilize_face_tone(
+                    stabilize_face(
                         heygem_video,
                         stabilized,
                         fps=fps,
                         ffmpeg=self.local.ffmpeg,
-                        ema=tone_ema,
                         face_box=tuple(
                             float(value)
                             for value in self.job.composite.get(
                                 "face_box", DEFAULT_FACE_BOX
                             )
+                        ),
+                        tone_ema=tone_ema,
+                        motion_smooth_frames=motion_frames,
+                        motion_max_shift=float(
+                            self.job.composite.get("face_motion_max_shift", 3.0)
                         ),
                     )
                 visual_result = stabilized

@@ -14,6 +14,7 @@ Y/Cr/Cb 均值做时间 EMA 平滑，把每帧相对平滑轨迹的偏移回写�
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 from typing import Sequence
 
@@ -71,6 +72,52 @@ def feathered_mask(
     return mask[:, :, None]
 
 
+def open_encoder(
+    ffmpeg: str,
+    width: int,
+    height: int,
+    fps: int,
+    output: Path,
+) -> tuple[subprocess.Popen, list[bytes]]:
+    """打开 rawvideo -> libx264 管道编码器;返回 (进程, stderr 收集列表)。
+
+    细色度量化(chroma-qp-offset)使亚整数级的色调偏移不被 4:2:0 量化打散。
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+        "-r", str(fps), "-i", "-",
+        "-an", "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p",
+        "-x264-params", "chroma-qp-offset=-9",
+        str(output),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stderr_chunks: list[bytes] = []
+    threading.Thread(
+        target=lambda: stderr_chunks.extend(
+            iter(lambda: process.stderr.read(4096) if process.stderr else b"", b"")  # type: ignore[union-attr]
+        ),
+        daemon=True,
+    ).start()
+    return process, stderr_chunks
+
+
+def finish_encoder(process: subprocess.Popen, stderr_chunks: list[bytes]) -> None:
+    """关闭管道并等待编码器退出,非零退出码抛错。"""
+    assert process.stdin is not None
+    process.stdin.close()
+    returncode = process.wait(timeout=600)
+    if returncode != 0:
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")[-2000:]
+        raise StabilizeError(f"ffmpeg 编码失败（退出码 {returncode}）:\n{stderr}")
+
+
 def stabilize_face_tone(
     video: Path,
     output: Path,
@@ -115,33 +162,7 @@ def stabilize_face_tone(
     mask = feathered_mask(height, width, face_box, feather)
 
     # 第二遍：回写并经 ffmpeg 管道编码。
-    output.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-        "-r", str(fps), "-i", "-",
-        "-an", "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p",
-        "-x264-params", "chroma-qp-offset=-9",
-        str(output),
-    ]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    # 后台排空 stderr，防止管道写满导致 ffmpeg 阻塞不退出。
-    import threading
-
-    stderr_chunks: list[bytes] = []
-
-    def _drain() -> None:
-        assert process.stderr is not None
-        for chunk in iter(lambda: process.stderr.read(4096), b""):  # type: ignore[union-attr]
-            stderr_chunks.append(chunk)
-
-    drain = threading.Thread(target=_drain, daemon=True)
-    drain.start()
+    process, stderr_chunks = open_encoder(ffmpeg, width, height, fps, output)
     cap = cv2.VideoCapture(str(video))
     try:
         index = 0
@@ -161,11 +182,6 @@ def stabilize_face_tone(
             index += 1
     finally:
         cap.release()
-        assert process.stdin is not None
-        process.stdin.close()
-        returncode = process.wait(timeout=600)
-    if returncode != 0:
-        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")[-2000:]
-        raise StabilizeError(f"ffmpeg 编码失败（退出码 {returncode}）:\n{stderr}")
+    finish_encoder(process, stderr_chunks)
     if index != len(stats):
         raise StabilizeError(f"两遍读取帧数不一致: {index} != {len(stats)}")

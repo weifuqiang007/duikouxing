@@ -1,4 +1,4 @@
-job_id: "wlh-010-heygem-trimmed"
+job_id: "wlh-011-heygem-motion"
 consent_confirmed: true
 local_only: true
 
@@ -39,6 +39,9 @@ composite:
   mode: "native"
   # 人脸部色调时域稳定(EMA):抑制 HeyGem 逐帧重绘的亮度/色度闪变;0 为关闭
   face_tone_ema: 0.9
+  # 光流几何稳定:特征点轨迹居中滑动平均,压掉鼻/上唇的亚像素高频抖动;0/1 为关闭
+  face_motion_smooth_frames: 15
+  face_motion_max_shift: 3.0
 
 # 阶段 C 启用 restore_protected_regions 后再填写多边形保护区。
 protected_regions: []

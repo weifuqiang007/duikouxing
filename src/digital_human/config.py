@@ -298,6 +298,14 @@ def validate_job(job: JobConfig) -> None:
     tone_ema = float(composite.get("face_tone_ema", 0.9))
     if not 0.0 <= tone_ema < 1.0:
         raise ConfigurationError("composite.face_tone_ema 必须在 [0,1) 范围（0 表示关闭）")
+    motion_frames = int(composite.get("face_motion_smooth_frames", 15))
+    if not 0 <= motion_frames <= 121:
+        raise ConfigurationError(
+            "composite.face_motion_smooth_frames 必须在 0～121 帧（0/1 表示关闭）"
+        )
+    max_shift = float(composite.get("face_motion_max_shift", 3.0))
+    if not 0.0 < max_shift <= 20.0:
+        raise ConfigurationError("composite.face_motion_max_shift 必须在 (0,20] 像素")
     if engine == "latentsync_1_6":
         steps = int(job.lipsync.get("inference_steps", 30))
         guidance = float(job.lipsync.get("guidance_scale", 1.3))
