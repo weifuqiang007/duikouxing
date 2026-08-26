@@ -139,3 +139,16 @@ python -m pytest tests/test_face_swap_paths.py tests/test_face_swap_license_gate
 | `headless-run: error: --processors: invalid choice` | 没有从仓库根目录运行 | `run_faceswap.ps1` 已自动处理 |
 | 模型下载很慢 | 公司网络限速 | 换家里网络或手机热点 |
 | `face not detected` | 照片太模糊或多脸 | 换一张清晰正脸照 |
+
+## 公司网络补充：代理设置
+
+如果家里或公司网络直连 GitHub/HuggingFace 很慢，加 `-Proxy` 参数：
+
+```powershell
+.\scripts\run_faceswap.ps1 `
+  -SourceImage G:\duikouxing\samples\11.png `
+  -TargetVideo G:\duikouxing\samples\wlh.mp4 `
+  -Proxy http://127.0.0.1:7890
+```
+
+代理地址看你用的工具（Clash 默认 7890，V2Ray 可能不同）。
