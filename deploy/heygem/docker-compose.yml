@@ -1,0 +1,29 @@
+name: heygem-local
+
+# HeyGem/Duix.Avatar Lite：只启动视频生成服务。
+# 音频仍由本仓库 dots.tts 生成，不部署 fish-speech / fun-asr 容器。
+# 端口只绑 127.0.0.1；卷映射相对本文件（../../runtime = 仓库根/runtime）。
+services:
+  heygem-gen-video:
+    image: guiji2025/duix.avatar
+    container_name: heygem-gen-video
+    restart: unless-stopped
+    runtime: nvidia
+    privileged: true
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,graphics,utility,video,display"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+    shm_size: "8gb"
+    ports:
+      - "127.0.0.1:8383:8383"
+    volumes:
+      - ../../runtime/heygem/data/face2face:/code/data
+    command: python /code/app_local.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
