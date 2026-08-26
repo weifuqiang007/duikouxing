@@ -4,6 +4,7 @@
 .DESCRIPTION
     设置 F 盘环境变量，从仓库根目录调用 FaceFusion headless-run。
     用法: .\scripts\run_faceswap.ps1 -SourceImage 11.png -TargetVideo wlh.mp4
+    公司网络: 加 -Proxy http://127.0.0.1:7890
 .PARAMETER SourceImage
     来源人脸照片路径。
 .PARAMETER TargetVideo
@@ -12,7 +13,8 @@
     输出视频路径（默认 F:\duikouxing-runtime\faceswap\outputs\<job_id>.mp4）。
 .PARAMETER JobId
     任务 ID（默认 fs-<时间戳>）。
-#>
+.PARAMETER Proxy
+    HTTP 代理地址（公司网络需要，如 http://127.0.0.1:7890）。#
 
 [CmdletBinding()]
 param(
@@ -22,10 +24,18 @@ param(
     [string]$TargetVideo,
     [string]$OutputVideo,
     [string]$JobId = ("fs-" + (Get-Date -Format 'yyyyMMdd-HHmmss')),
-    [string]$RuntimeRoot = 'F:\duikouxing-runtime\faceswap'
+    [string]$RuntimeRoot = 'F:\duikouxing-runtime\faceswap',
+    [string]$Proxy
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── 代理（公司网络需要，家里不用传） ──
+if ($Proxy) {
+    $env:HTTP_PROXY  = $Proxy
+    $env:HTTPS_PROXY = $Proxy
+    Write-Host "[INFO] 使用代理: $Proxy"
+}
 
 # ── 环境变量 ──
 $env:PIP_CACHE_DIR       = "$RuntimeRoot\cache\pip"
