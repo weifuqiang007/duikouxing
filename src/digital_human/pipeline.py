@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .adapters.dots_tts import DotsTTSAdapter
+from .adapters.heygem import HeyGemAdapter
 from .adapters.latentsync import LATENTSYNC_COMMIT, LatentSyncAdapter
 from .adapters.musetalk import MuseTalkAdapter
 from .audio import split_script
@@ -20,6 +21,8 @@ from .ffmpeg import (
     normalize_video,
 )
 from .manifest import sha256_file, write_manifest
+from .process import CommandError, run_command
+from .stabilize import DEFAULT_FACE_BOX, stabilize_face_tone
 
 
 class Pipeline:
@@ -63,10 +66,23 @@ class Pipeline:
                 self.job.reference_duration_seconds,
             )
 
+        lipsync_engine = str(self.job.lipsync.get("engine", "musetalk_1_5"))
+        # HeyGem 逐帧重绘会放大基准视频的多代编码噪声：基准链路尽量少编码
+        # （同帧率直接流拷贝）且用更低的 CRF。
+        base_crf = 15 if lipsync_engine == "heygem_local" else 18
         normalized_video = self.work_dir / "source_25fps.mp4"
         fps = int(self.job.video.get("fps", 25))
         if self._should_run(normalized_video):
-            normalize_video(self.local.ffmpeg, source_copy, normalized_video, fps)
+            normalize_video(
+                self.local.ffmpeg,
+                self.local.ffprobe,
+                source_copy,
+                normalized_video,
+                fps,
+                crf=base_crf,
+                passthrough=lipsync_engine == "heygem_local",
+                start_seconds=float(self.job.video.get("source_start_seconds", 0.0)),
+            )
 
         segments = split_script(
             self.job.script, int(self.job.tts.get("max_chars_per_segment", 60))
@@ -107,9 +123,9 @@ class Pipeline:
                 base_video,
                 str(self.job.video.get("duration_policy", "pingpong")),
                 fps,
+                crf=base_crf,
             )
 
-        lipsync_engine = str(self.job.lipsync.get("engine", "musetalk_1_5"))
         if lipsync_engine == "latentsync_1_6":
             visual_result = self.work_dir / "latentsync_result.mp4"
             if self._should_run(visual_result):
@@ -122,30 +138,46 @@ class Pipeline:
                     log_file=self.log_dir / "latentsync.log",
                 )
             copy_final_video = True
-        else:
-            musetalk_video = self.work_dir / "musetalk_result.mp4"
-            if self._should_run(musetalk_video):
-                MuseTalkAdapter(self.local).generate(
+        elif lipsync_engine == "heygem_local":
+            # HeyGem 整脸生成即最终画面：不回退到 dynamic_texture/fixed_roi 的嘴部贴片。
+            heygem_video = self.work_dir / "heygem_result.mp4"
+            if self._should_run(heygem_video):
+                HeyGemAdapter(self.local).generate(
                     video=base_video,
                     audio=target_audio,
-                    output=musetalk_video,
+                    output=heygem_video,
                     job=self.job,
                     work_dir=self.work_dir,
-                    log_file=self.log_dir / "musetalk.log",
+                    log_file=self.log_dir / "heygem.log",
                 )
-
-            # FFV1 无损中间件，避免 mp4v 再次磨平刚恢复的皮肤高频细节。
-            visual_result = self.work_dir / "composite_silent.mkv"
-            if self._should_run(visual_result):
-                composite_video(
-                    base_video,
-                    musetalk_video,
-                    visual_result,
-                    self.job.mouth_roi,
-                    fps,
-                    self.job.composite,
-                )
-            copy_final_video = False
+            # 人脸部色调时域稳定：抑制逐帧重绘的高频亮度/色度闪变（可配 0 关闭）。
+            tone_ema = float(self.job.composite.get("face_tone_ema", 0.9))
+            if 0.0 < tone_ema < 1.0:
+                stabilized = self.work_dir / "heygem_tone_stabilized.mp4"
+                if self._should_run(stabilized):
+                    stabilize_face_tone(
+                        heygem_video,
+                        stabilized,
+                        fps=fps,
+                        ffmpeg=self.local.ffmpeg,
+                        ema=tone_ema,
+                        face_box=tuple(
+                            float(value)
+                            for value in self.job.composite.get(
+                                "face_box", DEFAULT_FACE_BOX
+                            )
+                        ),
+                    )
+                visual_result = stabilized
+            else:
+                visual_result = heygem_video
+            copy_final_video = True
+        elif lipsync_engine == "musetalk_1_5":
+            visual_result, copy_final_video = self._run_musetalk(
+                base_video, target_audio, fps
+            )
+        else:
+            raise RuntimeError(f"不支持的口型引擎: {lipsync_engine}")
 
         final = self.output_dir / "final.mp4"
         if self._should_run(final):
@@ -172,12 +204,63 @@ class Pipeline:
             "latentsync_commit": (
                 LATENTSYNC_COMMIT if lipsync_engine == "latentsync_1_6" else None
             ),
+            "protected_regions": [
+                str(region.get("name")) for region in self.job.protected_regions
+            ],
+            "heygem_image_id": (
+                self._heygem_image_id()
+                if lipsync_engine == "heygem_local"
+                else None
+            ),
             "job_config": self._safe_job_summary(),
             "output": str(final),
             "status": "completed",
         }
         write_manifest(manifest_path, manifest_payload)
         return final
+
+    def _run_musetalk(self, base_video: Path, target_audio: Path, fps: int) -> tuple[Path, bool]:
+        """MuseTalk 生成 + 嘴部纹理回填合成，返回（无声合成结果, 是否流拷贝）。"""
+        musetalk_video = self.work_dir / "musetalk_result.mp4"
+        if self._should_run(musetalk_video):
+            MuseTalkAdapter(self.local).generate(
+                video=base_video,
+                audio=target_audio,
+                output=musetalk_video,
+                job=self.job,
+                work_dir=self.work_dir,
+                log_file=self.log_dir / "musetalk.log",
+            )
+
+        # FFV1 无损中间件，避免 mp4v 再次磨平刚恢复的皮肤高频细节。
+        visual_result = self.work_dir / "composite_silent.mkv"
+        if self._should_run(visual_result):
+            composite_video(
+                base_video,
+                musetalk_video,
+                visual_result,
+                self.job.mouth_roi,
+                fps,
+                self.job.composite,
+            )
+        return visual_result, False
+
+    def _heygem_image_id(self) -> str | None:
+        """记录当前 HeyGem 镜像 ID，便于结果与镜像版本对账；不可用时返回 None。"""
+        try:
+            result = run_command(
+                [
+                    "docker",
+                    "images",
+                    "guiji2025/duix.avatar",
+                    "--format",
+                    "{{.ID}}",
+                ]
+            )
+            image_id = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
+            return image_id
+        except (CommandError, IndexError, OSError):
+            return None
 
     def _job_fingerprint(self) -> str:
         payload = _json_safe(asdict(self.job))

@@ -1,0 +1,52 @@
+job_id: "wlh-010-heygem-trimmed"
+consent_confirmed: true
+local_only: true
+
+source_video: "../samples/wlh.mp4"
+
+reference_audio: ""
+reference_start_seconds: 0.0
+reference_duration_seconds: 14.0
+
+reference_text: "我是魏龙虎，身份证 1 5 2 6 3 0 1 9 9 2 1 0 1 8 7 2 1 0，入职于河北省建建筑工程有限公司，专业证书"
+
+script: "我是魏龙虎，身份证 1 5 2、 6 3 0、 1 9 9 2、 1 0 1 8、 7 2 1 0，于 2026年 8月 19日入职河北蓝念建筑工程有限公司。视频拍摄时间 2026年 9月 7日。本人承诺：此视频真实有效，对视频的真实性负责，如有虚假承诺或挂靠出借证件行为，本人愿意承担一切法律责任。"
+
+tts:
+  profile: "auto"
+  language: "ZH"
+  max_chars_per_segment: 60
+  guidance_scale: 1.2
+  seed: 42
+
+video:
+  # 用源视频原生 30fps：25fps 重采样会让 HeyGem 逐帧重绘放大出可见抖动
+  #（实测 excess 0.90 → 1.22，见 docs/HEYGEM_LOCAL_DEPLOYMENT.md §6.2）。
+  fps: 30
+  # 跳过源片开头"调整姿势/举证件"的不稳定段：该段在正放与倒放中都会放大
+  # 逐帧重绘抖动（用户实测 0-3s 与 23-26s 两个窗口）。
+  source_start_seconds: 3.0
+  duration_policy: "pingpong"
+  final_crf: 12
+
+lipsync:
+  engine: "heygem_local"
+  chaofen: 0
+  watermark_switch: 0
+  pn: 1
+
+composite:
+  mode: "native"
+  # 人脸部色调时域稳定(EMA):抑制 HeyGem 逐帧重绘的亮度/色度闪变;0 为关闭
+  face_tone_ema: 0.9
+
+# 阶段 C 启用 restore_protected_regions 后再填写多边形保护区。
+protected_regions: []
+
+# heygem_local 分支不使用嘴部 ROI，字段保留以兼容配置结构校验。
+mouth_roi:
+  center_x: 0.50
+  center_y: 0.40
+  width: 0.16
+  height: 0.11
+  feather_pixels: 18

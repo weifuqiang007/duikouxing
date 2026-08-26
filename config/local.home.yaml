@@ -14,6 +14,7 @@ executables:
 
 models:
   dots_quality: "../models/dots.tts-soar"
+  # 快速档不在本机落地（省 4.8G）；本机默认 quality 档，如需 fast 再下载。
   dots_fast: "../models/dots.tts-mf"
   latentsync_1_6: "../external/LatentSync/checkpoints/latentsync_unet.pt"
 
@@ -28,4 +29,15 @@ runtime:
   musetalk_batch_size: 4
   use_float16: true
   tts_profile: "quality"
-  primary_lipsync_engine: "musetalk_1_5"
+  primary_lipsync_engine: "heygem_local"
+
+# HeyGem 本地 Docker 服务（guiji2025/duix.avatar）。API 语义实测见
+# docs/HEYGEM_LOCAL_DEPLOYMENT.md §6.1：提交用 HTTP URL，结果落在 temp/<code>-r.mp4。
+heygem:
+  base_url: "http://127.0.0.1:8383/easy"
+  shared_root: "../runtime/heygem/data/face2face"
+  timeout_seconds: 7200
+  poll_interval_seconds: 2.0
+  file_server_port: 8123
+  container_host: "host.docker.internal"
+  cleanup_stage: false

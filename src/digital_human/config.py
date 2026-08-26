@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -37,6 +38,13 @@ class LocalConfig:
     use_float16: bool
     tts_profile: str
     primary_lipsync_engine: str
+    heygem_base_url: str
+    heygem_shared_root: Path
+    heygem_timeout_seconds: int
+    heygem_poll_interval_seconds: float
+    heygem_file_server_port: int
+    heygem_container_host: str
+    heygem_cleanup_stage: bool
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,7 @@ class JobConfig:
     lipsync: dict[str, Any]
     composite: dict[str, Any]
     mouth_roi: MouthROI
+    protected_regions: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -89,6 +98,7 @@ def load_local_config(path: Path) -> LocalConfig:
         paths = data["paths"]
         runtime = data["runtime"]
         base = path.parent
+        heygem = data.get("heygem") or {}
         config = LocalConfig(
             profile=str(data["profile"]),
             conda=str(executables["conda"]),
@@ -112,6 +122,22 @@ def load_local_config(path: Path) -> LocalConfig:
             primary_lipsync_engine=str(
                 runtime.get("primary_lipsync_engine", "musetalk_1_5")
             ),
+            heygem_base_url=str(
+                heygem.get("base_url", "http://127.0.0.1:8383/easy")
+            ),
+            heygem_shared_root=_resolve(
+                str(heygem.get("shared_root", "../runtime/heygem/data/face2face")),
+                base,
+            ),
+            heygem_timeout_seconds=int(heygem.get("timeout_seconds", 7200)),
+            heygem_poll_interval_seconds=float(
+                heygem.get("poll_interval_seconds", 2.0)
+            ),
+            heygem_file_server_port=int(heygem.get("file_server_port", 8123)),
+            heygem_container_host=str(
+                heygem.get("container_host", "host.docker.internal")
+            ),
+            heygem_cleanup_stage=bool(heygem.get("cleanup_stage", False)),
         )
         validate_local_config(config)
         return config
@@ -126,10 +152,27 @@ def validate_local_config(config: LocalConfig) -> None:
         raise ConfigurationError("musetalk_batch_size 必须大于 0")
     if config.tts_profile not in {"quality", "fast"}:
         raise ConfigurationError("tts_profile 只能是 quality 或 fast")
-    if config.primary_lipsync_engine not in {"musetalk_1_5", "latentsync_1_6"}:
+    if config.primary_lipsync_engine not in {
+        "musetalk_1_5",
+        "latentsync_1_6",
+        "heygem_local",
+    }:
         raise ConfigurationError(
-            "primary_lipsync_engine 只能是 musetalk_1_5 或 latentsync_1_6"
+            "primary_lipsync_engine 只能是 musetalk_1_5、latentsync_1_6 或 heygem_local"
         )
+    parsed = urlparse(config.heygem_base_url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise ConfigurationError(
+            "heygem.base_url 只允许 http://127.0.0.1 或 http://localhost（不得暴露局域网）"
+        )
+    if config.heygem_timeout_seconds < 60:
+        raise ConfigurationError("heygem.timeout_seconds 不能小于 60 秒")
+    if not 1.0 <= config.heygem_poll_interval_seconds <= 60.0:
+        raise ConfigurationError("heygem.poll_interval_seconds 必须在 1～60 秒之间")
+    if not 1 <= config.heygem_file_server_port <= 65535:
+        raise ConfigurationError("heygem.file_server_port 必须在 1～65535 之间")
+    if not config.heygem_container_host.strip():
+        raise ConfigurationError("heygem.container_host 不能为空")
     local_paths = (
         config.orchestrator_env,
         config.dots_env,
@@ -139,6 +182,7 @@ def validate_local_config(config: LocalConfig) -> None:
         config.latentsync_repo,
         config.latentsync_checkpoint,
         config.jobs_root,
+        config.heygem_shared_root,
     )
     for path in local_paths:
         if not path.is_relative_to(PROJECT_STORAGE_ROOT):
@@ -185,6 +229,7 @@ def load_job_config(path: Path) -> JobConfig:
             lipsync=dict(data["lipsync"]),
             composite=dict(data.get("composite", {"mode": "dynamic_texture"})),
             mouth_roi=roi,
+            protected_regions=list(data.get("protected_regions", [])),
         )
     except KeyError as exc:
         raise ConfigurationError(f"任务配置缺少字段: {exc}") from exc
@@ -222,10 +267,26 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("feather_pixels 不能为负数")
     composite = job.composite
     mode = str(composite.get("mode", "dynamic_texture"))
-    if mode not in {"native", "dynamic_texture", "fixed_roi"}:
+    if mode not in {"native", "dynamic_texture", "fixed_roi", "restore_protected_regions"}:
         raise ConfigurationError(
-            "composite.mode 只能是 native、dynamic_texture 或 fixed_roi"
+            "composite.mode 只能是 native、dynamic_texture、fixed_roi 或 "
+            "restore_protected_regions"
         )
+    engine = str(job.lipsync.get("engine", "musetalk_1_5"))
+    if engine not in {"musetalk_1_5", "latentsync_1_6", "heygem_local"}:
+        raise ConfigurationError(
+            "lipsync.engine 只能是 musetalk_1_5、latentsync_1_6 或 heygem_local"
+        )
+    if mode == "restore_protected_regions":
+        if engine != "heygem_local":
+            raise ConfigurationError(
+                "restore_protected_regions 只能与 lipsync.engine=heygem_local 搭配"
+            )
+        if not job.protected_regions:
+            raise ConfigurationError(
+                "composite.mode=restore_protected_regions 需要至少一个 protected_regions"
+            )
+    _validate_protected_regions(job.protected_regions)
     if not 0.0 <= float(composite.get("texture_strength", 0.55)) <= 1.5:
         raise ConfigurationError("composite.texture_strength 必须在 0～1.5 之间")
     if float(composite.get("detail_sigma", 1.2)) <= 0:
@@ -234,11 +295,9 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("composite.temporal_ema 必须在 [0, 1) 范围")
     if int(composite.get("mask_feather_pixels", 6)) < 0:
         raise ConfigurationError("composite.mask_feather_pixels 不能为负数")
-    engine = str(job.lipsync.get("engine", "musetalk_1_5"))
-    if engine not in {"musetalk_1_5", "latentsync_1_6"}:
-        raise ConfigurationError(
-            "lipsync.engine 只能是 musetalk_1_5 或 latentsync_1_6"
-        )
+    tone_ema = float(composite.get("face_tone_ema", 0.9))
+    if not 0.0 <= tone_ema < 1.0:
+        raise ConfigurationError("composite.face_tone_ema 必须在 [0,1) 范围（0 表示关闭）")
     if engine == "latentsync_1_6":
         steps = int(job.lipsync.get("inference_steps", 30))
         guidance = float(job.lipsync.get("guidance_scale", 1.3))
@@ -246,3 +305,37 @@ def validate_job(job: JobConfig) -> None:
             raise ConfigurationError("LatentSync inference_steps 必须在 20～50 之间")
         if not 1.0 <= guidance <= 3.0:
             raise ConfigurationError("LatentSync guidance_scale 必须在 1.0～3.0 之间")
+
+
+def _validate_protected_regions(regions: list[dict[str, Any]]) -> None:
+    """固定多边形保护区校验：名称唯一、坐标归一化、面积非零。"""
+    names = [str(region.get("name", "")) for region in regions]
+    if any(not name for name in names):
+        raise ConfigurationError("protected_regions 名称不能为空")
+    if len(set(names)) != len(names):
+        raise ConfigurationError("protected_regions 名称必须唯一")
+    for region in regions:
+        name = str(region.get("name"))
+        if str(region.get("type", "polygon")) != "polygon":
+            raise ConfigurationError(f"保护区 {name} 首版只支持 polygon 类型")
+        points = region.get("points") or []
+        if len(points) < 3:
+            raise ConfigurationError(f"保护区 {name} 至少需要三个点")
+        xs: list[float] = []
+        ys: list[float] = []
+        for point in points:
+            x, y = float(point[0]), float(point[1])
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                raise ConfigurationError(f"保护区 {name} 坐标必须在 [0, 1] 范围")
+            xs.append(x)
+            ys.append(y)
+        area = abs(
+            sum(
+                xs[i] * ys[(i + 1) % len(xs)] - xs[(i + 1) % len(xs)] * ys[i]
+                for i in range(len(xs))
+            )
+        ) / 2
+        if area <= 1e-9:
+            raise ConfigurationError(f"保护区 {name} 面积必须大于零")
+        if int(region.get("margin_pixels", 0)) < 0:
+            raise ConfigurationError(f"保护区 {name} margin_pixels 不能为负数")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 from .annotate import select_mouth_roi
@@ -72,7 +74,34 @@ def _doctor(local_path: Path) -> int:
             ),
         ),
     ]
-    if local.primary_lipsync_engine == "latentsync_1_6":
+    if local.primary_lipsync_engine == "heygem_local":
+        checks.extend(
+            [
+                ("Docker daemon", ["docker", "info", "--format", "{{.ServerVersion}}"]),
+                (
+                    "HeyGem 容器",
+                    [
+                        "docker",
+                        "inspect",
+                        "-f",
+                        "{{.State.Status}} restarts={{.RestartCount}}",
+                        "heygem-gen-video",
+                    ],
+                ),
+                (
+                    "HeyGem 容器 GPU",
+                    [
+                        "docker",
+                        "exec",
+                        "heygem-gen-video",
+                        "nvidia-smi",
+                        "--query-gpu=name",
+                        "--format=csv,noheader",
+                    ],
+                ),
+            ]
+        )
+    elif local.primary_lipsync_engine == "latentsync_1_6":
         checks.append(
             (
                 "LatentSync CUDA",
@@ -126,7 +155,14 @@ def _doctor(local_path: Path) -> int:
     except Exception as exc:
         failed = True
         print(f"[FAIL] 无法读取 GPU 型号: {exc}")
-    if local.primary_lipsync_engine == "latentsync_1_6":
+    if local.primary_lipsync_engine == "heygem_local":
+        required = []
+        if local.heygem_shared_root.is_dir():
+            print(f"[OK] HeyGem 共享目录: {local.heygem_shared_root}")
+        else:
+            failed = True
+            print(f"[FAIL] HeyGem 共享目录不存在: {local.heygem_shared_root}")
+    elif local.primary_lipsync_engine == "latentsync_1_6":
         required = [
             local.latentsync_checkpoint,
             local.latentsync_repo / "checkpoints" / "whisper" / "tiny.pt",
@@ -175,12 +211,19 @@ def _doctor(local_path: Path) -> int:
         if model_path.is_absolute():
             if model_path.is_dir():
                 print(f"[OK] {name}: {model_path}")
+            elif name == "dots.tts MF":
+                # 快速档可选：quality 档在位时缺失只提示，不阻断。
+                print(f"[WARN] {name} 未本地化（quality 档可用时不影响）: {model_path}")
             else:
                 failed = True
                 print(f"[FAIL] {name} 本地目录不存在: {model_path}")
         else:
             print(f"[WARN] {name} 使用远程 ID，不能保证断网运行: {model_value}")
-    if local.primary_lipsync_engine == "latentsync_1_6":
+    if local.primary_lipsync_engine == "heygem_local":
+        repo = None
+        expected_commit = ""
+        repo_name = "HeyGem"
+    elif local.primary_lipsync_engine == "latentsync_1_6":
         repo = local.latentsync_repo
         expected_commit = LATENTSYNC_COMMIT
         repo_name = "LatentSync"
@@ -188,20 +231,51 @@ def _doctor(local_path: Path) -> int:
         repo = local.musetalk_repo
         expected_commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
         repo_name = "MuseTalk"
-    try:
-        actual_commit = run_command(
-            ["git", "-C", repo, "rev-parse", "HEAD"]
-        ).stdout.strip()
-        if actual_commit == expected_commit:
-            print(f"[OK] {repo_name} commit: {actual_commit}")
-        else:
+    if repo is None:
+        # HeyGem 的版本由 Docker 镜像 ID 表达，在流水线 manifest 中记录。
+        try:
+            image_id = run_command(
+                ["docker", "images", "guiji2025/duix.avatar", "--format", "{{.ID}}"]
+            ).stdout.strip()
+            if image_id:
+                print(f"[OK] HeyGem 镜像: {image_id.splitlines()[0]}")
+            else:
+                failed = True
+                print("[FAIL] 缺少镜像 guiji2025/duix.avatar")
+        except Exception as exc:
             failed = True
-            print(
-                f"[FAIL] {repo_name} commit 不匹配: {actual_commit}，预期 {expected_commit}"
-            )
-    except Exception as exc:
-        failed = True
-        print(f"[FAIL] 无法检查 {repo_name} commit: {exc}")
+            print(f"[FAIL] 无法查询 HeyGem 镜像: {exc}")
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(
+                f"{local.heygem_base_url.rstrip('/')}/query?code=doctor-probe",
+                timeout=5,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict) and "code" in payload:
+                print(f"[OK] HeyGem API: {local.heygem_base_url} 返回 JSON")
+            else:
+                failed = True
+                print(f"[FAIL] HeyGem API 返回异常: {payload!r}")
+        except Exception as exc:
+            failed = True
+            print(f"[FAIL] HeyGem API 不可用: {exc}")
+    else:
+        try:
+            actual_commit = run_command(
+                ["git", "-C", repo, "rev-parse", "HEAD"]
+            ).stdout.strip()
+            if actual_commit == expected_commit:
+                print(f"[OK] {repo_name} commit: {actual_commit}")
+            else:
+                failed = True
+                print(
+                    f"[FAIL] {repo_name} commit 不匹配: {actual_commit}，"
+                    f"预期 {expected_commit}"
+                )
+        except Exception as exc:
+            failed = True
+            print(f"[FAIL] 无法检查 {repo_name} commit: {exc}")
     return 1 if failed else 0
 
 
