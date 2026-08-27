@@ -25,6 +25,7 @@ def media_duration(ffprobe: str, path: Path) -> float:
 
 def normalize_video(ffmpeg: str, source: Path, output: Path, fps: int) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    # 任意视频转成"无音频、统一帧率、H.264 高质量、最大兼容性"的标准格式。
     run_command(
         [
             ffmpeg,
@@ -142,6 +143,7 @@ def match_video_duration(
             f"目标音频 {target_duration:.2f}s 长于视频 {video_duration:.2f}s，"
             "duration_policy 必须为 pingpong"
         )
+    # 生成一个"正播+倒播"的循环单元
     cycle = output.with_name("base_pingpong_cycle.mp4")
     run_command(
         [

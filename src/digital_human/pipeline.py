@@ -35,9 +35,13 @@ class Pipeline:
         for directory in (self.input_dir, self.work_dir, self.output_dir, self.log_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+    #流水线有多个步骤（如提取音频 → 生成视频 → 合成），每一步有对应的输出文件。当流水线中断后重新运行时，已完成且输出正常的步骤会被跳过，只从未完成的地方继续——相当于一个简易的断点续传机制。
     def _should_run(self, output: Path) -> bool:
         return self.force or not output.is_file() or output.stat().st_size == 0
 
+    # 这一段功能需要解耦。最好生成一个接口，未来万一要换stt呢？
+    # 生成音频理论上可以做成多线程，那就不建议返回值是none。
+    # 在前期跑demo期间无所谓的。
     def run(self) -> Path:
         fingerprint = self._job_fingerprint()
         manifest_path = self.root / "manifest.json"
@@ -64,6 +68,7 @@ class Pipeline:
             )
 
         normalized_video = self.work_dir / "source_25fps.mp4"
+        # 获取视频的fps。应该是获取真实视频的fps，而不是写在配置文件或者是参数中的
         fps = int(self.job.video.get("fps", 25))
         if self._should_run(normalized_video):
             normalize_video(self.local.ffmpeg, source_copy, normalized_video, fps)
@@ -97,8 +102,10 @@ class Pipeline:
         if self._should_run(target_audio):
             concat_and_normalize_audio(self.local.ffmpeg, segment_paths, target_audio)
 
+        # 这是在干什么？
         base_video = self.work_dir / "base_duration_matched.mp4"
         if self._should_run(base_video):
+            # 把前面预处理好的视频（normalized_video）拉伸/裁剪到和 TTS 音频（target_audio）一样长，输出 base_duration_matched.mp4。
             match_video_duration(
                 self.local.ffmpeg,
                 self.local.ffprobe,
@@ -109,6 +116,7 @@ class Pipeline:
                 fps,
             )
 
+        # 这一块也需要解耦。写接口或者切片或者代理模式。不然未来新增新的模型进来不好维护。
         lipsync_engine = str(self.job.lipsync.get("engine", "musetalk_1_5"))
         if lipsync_engine == "latentsync_1_6":
             visual_result = self.work_dir / "latentsync_result.mp4"
@@ -210,11 +218,16 @@ class Pipeline:
         }
 
 
+# 这是一个递归的json序列化安全转换器。用于确保任意嵌套的python对象能被json。dump成功序列化。
 def _json_safe(value: object) -> object:
+    # path对象 -》 字符串路径。因为json.dump 不能序列化 pathlib。path
     if isinstance(value, Path):
         return str(value)
+    # 2. 字典 → 递归处理每个键和值
+    # 键也用 str() 包裹，防止非字符串键（如枚举）报错
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
+    # 3 列表/元组 → 递归处理每个元素
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     json.dumps(value)

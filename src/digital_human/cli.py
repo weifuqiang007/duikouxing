@@ -23,6 +23,7 @@ from .process import CommandError, conda_run, run_command
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+# 加载环境，创建目录
 def _configure_project_local_storage() -> None:
     cache_root = PROJECT_ROOT / ".cache"
     temp_root = PROJECT_ROOT / ".tmp"

@@ -7,6 +7,7 @@ _MAJOR_BOUNDARY = re.compile(r"(?<=[。！？；!?;])|\n+")
 _MINOR_BOUNDARY = re.compile(r"(?<=[，、,:：])")
 
 
+# 这是一个中文语音文本分句器，把一段长文本切成不超过 max_chars（默认 60 字）的短句。
 def split_script(text: str, max_chars: int = 60) -> list[str]:
     """Split Chinese speech text without dropping any non-whitespace character."""
     if max_chars < 10:

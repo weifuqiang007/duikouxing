@@ -316,3 +316,65 @@ python facefusion.py headless-run \
       可额外加 `--processors face_swapper face_enhancer` 提升画质
 - [ ] **长视频/高分辨率测试**：当前仅测试 720p 13s 素材，需验证 1080p 长视频稳定性
 - [ ] **多人场景测试**：验证 `--face-selector-order` 对多人的筛选效果
+
+
+可以，但**不能靠当前这套 FaceFusion `face_swapper` 直接做到**。
+
+你现在文档里的方案是 `region` 遮罩，覆盖的是 `upper-face lower-face mouth`，也就是额头、下半脸、嘴巴这类“脸部区域”，见 [facefusion换脸工程总结.md](G:/duikouxing/docs/facefusion换脸工程总结.md:161)。另一份实现设计里 `mask_regions` 也只列了 skin、眉毛、眼睛、鼻子、嘴唇等，没有 hair，见 [FACE_SWAP_HIGH_FIDELITY_IMPLEMENTATION.md](G:/duikouxing/docs/FACE_SWAP_HIGH_FIDELITY_IMPLEMENTATION.md:410)。
+
+所以结论是：
+
+**FaceFusion 默认是“换脸”，不是“换头/换发型”。**  
+它会尽量保留目标视频原本的头发、头型、身体和背景。把 padding 调大最多只能改善发际线、额头边缘、耳朵附近的融合，不能真正把源用户的头发带过去。
+
+如果你想要“源用户的头发也过去”，有三条路线：
+
+1. **最稳：拍摄/选择发型接近的目标视频**  
+   让目标演员或素材本身的发型接近源用户，然后 FaceFusion 只换脸。这是商业交付里最稳定、成本最低的路线。
+
+2. **中等：FaceFusion 后再做头发 inpainting / ComfyUI 修发型**  
+   先用 FaceFusion 得到脸，再用发型区域 mask 做生成式重绘。适合图片、短视频、正脸镜头；视频会有闪烁风险，需要逐帧/关键帧一致性处理。
+
+3. **重型：改成“整头替换/生成式 V2V”链路**  
+   比如用 DreamID-V、Wan/ComfyUI、InstantID/IP-Adapter 类方案，让模型按参考人生成头发+脸。它更可能带上发型，但代价是画面可控性下降，可能影响衣服、背景、身份稳定性。
+
+我的建议：当前 FaceFusion 方案继续作为量产基线；下一步先做一个 **10 秒 A/B 测试**：  
+A 组只微调发际线融合，B 组 FaceFusion 后加头发 inpainting。看你是否接受发型一致性和视频闪烁，再决定要不要上整头生成链路。
+
+
+明白，你的目标是：**尽量保留待替换 PNG 里这个人的头发、头型，让结果更像这个人**。
+
+用 FaceFusion 这条链路，答案是：**只能有限做到，不能真正完整带发型**。
+
+FaceFusion 的 `region mask` 可选区域里没有 `hair`，官方/当前参数只支持 `skin、眉毛、眼睛、鼻子、嘴、嘴唇、眼镜` 这些脸部区域，所以它本质上不会把 PNG 的头发语义迁移到视频里。你现在看到“脸像了、头发没变”，正是这个模型边界。
+
+当前最现实的调法是把脸部替换范围尽量推到发际线附近：
+
+```bash
+python facefusion.py headless-run \
+  --source-paths <待替换照片.png> \
+  --target-path <目标视频.mp4> \
+  --output-path <输出.mp4> \
+  --processors face_swapper \
+  --face-mask-types box region \
+  --face-mask-regions skin left-eyebrow right-eyebrow left-eye right-eye nose mouth upper-lip lower-lip \
+  --face-mask-padding 35 20 20 20 \
+  --face-mask-blur 0.45
+```
+
+这里的核心是：
+
+`--face-mask-padding 35 20 20 20`  
+把上方 padding 加大，尽量覆盖额头、发际线边缘，让“头型感觉”更接近源图一点。
+
+但注意，**这不是换头发**。调太大可能会把目标原视频的头发边缘、额头上方背景、刘海区域弄脏，出现糊边或脸皮扩散。建议做三组小样：
+
+```text
+A: padding 20 20 20 20, blur 0.5
+B: padding 35 20 20 20, blur 0.45
+C: padding 50 25 25 25, blur 0.55
+```
+
+我的判断：  
+如果只是想“更像被替换的人”，可以先试 B。  
+如果必须明显保留 PNG 的发型、头型，那就要走 FaceFusion 后处理：对头发区域做单独 mask，再用 ComfyUI / inpainting / V2V 修发型。FaceFusion 单独做不到稳定换发。
