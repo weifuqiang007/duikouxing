@@ -504,3 +504,34 @@ ffmpeg -i 输入.mp4 -vf "zscale=t=linear:npl=500,format=gbrp,tonemap=clip,zscal
 **要点**：① HLG 输入的 `npl` 用 400~500（不是网上常见教程的 100，那会把画面压暗压灰）；② 室内场景用 `tonemap=clip`（只裁高光、不动色彩），比 hable 的电影级压缩自然得多；③ 转完用亮度/对比度/饱和度三项指标验收（正常参考：~175/54/37，坏版本是 148/22/15）。成品 `jobs-home/fs-p1-128-0001/output/swap_p1_final.mp4`。
 
 **新坑 7：FaceFusion 启动时可能僵死在 GitHub 连通性探测。** 症状：日志停在 `processing step 1 of 1`、python 内存仅 ~68MB（模型未加载）、GPU 0%、无 ffmpeg 进程。根因是 `ping_static_url` 起的 curl 僵死。**修复：加 `--download-providers huggingface`**（hf-mirror 在其 URL 列表内），模型已全量本地化后此参数还能加速启动。建议所有本地跑批命令固定带上。
+
+## 8.10 故障速查表：症状 → 原因 → 解决（本次会话经验汇总）
+
+> 遇到问题先查这张表，再跳转到对应小节看细节。按"症状"列搜索即可。
+
+| # | 症状（你看到的） | 根因 | 解决 |
+|---|----------------|------|------|
+| 1 | 输出视频**全黑**、只有 ~4MB、处理速度异常快（50+fps 假速度） | 输入是 iPhone HDR 视频（HEVC 10-bit / BT.2020 / HLG），FaceFusion 只认 8-bit SDR：抽帧全黑→检不到脸→空转 | 先做 HDR→SDR 预处理（配方见 #2），再喂 FaceFusion。判断：`ffprobe -show_entries stream=codec_name,pix_fmt,color_transfer`，出现 `yuv420p10le` + `arib-std-b67` 即中招 |
+| 2 | HDR 转码后画面**偏暗、发灰、蜡笔/彩铅感** | 通用教程配方 `hable + npl=100` 对室内人物场景压缩过猛（实测对比度 22、饱和度 15） | 用 8.9 节配方（clip + npl=500 + eq 微调）。**HLG 的 npl 用 400~500，不是 100**；室内场景用 clip（只裁高光不动色彩），别用 hable |
+| 3 | FaceFusion **启动后僵死**：日志停在 `processing step 1 of 1`、GPU 0%、python 内存仅 ~68MB（模型没加载）、无 ffmpeg 进程 | 探测 GitHub 下载源的 curl 子进程僵死 | 命令加 **`--download-providers huggingface`**（模型已本地化后必加，还能加速启动）；已僵死的要结束进程后重跑 |
+| 4 | 日志报 `validating hash for xxx failed` 后中止 | 对应模型文件缺失（FaceFusion 会预检一些没显式用到的模型：默认 occluder xseg_1、NSFW 三件套等） | 从 hf-mirror 预下载缺失模型到 `models\facefusion\`。规律：**首次跑新配置，先备齐它的模型清单** |
+| 5 | 用 `sha256sum` 校验 .hash 永远对不上，误判文件损坏 | FaceFusion 的 .hash 是 **CRC32 前 8 位十六进制**（zlib.crc32），不是 SHA256 | 按 CRC32 算法校验（一行 python：读文件字节算 crc32，格式化 08x，与 .hash 内容比对） |
+| 6 | 环境"好了但很脆"，系统 Python 一动换脸环境就坏 | pip 把系统 Python 用户目录里的包当依赖混进来了（完整路径见 8.3 坑2） | 所有 pip/python 调用带 **`PYTHONNOUSERSITE=1`** |
+| 7 | GitHub 下载连不上/被重置/龟速 | 国内直连 GitHub releases 不稳定 | 下载一律走 `https://hf-mirror.com/facefusion/<collection>/resolve/main/<file>`（~3MB/s） |
+| 8 | Windows 上报 `Error 126: cudnn64_9.dll missing` | onnxruntime-gpu 需要 cuDNN 9，Windows 不自带；Python 3.8+ 也不搜 PATH 里的 DLL | 简单路线：改装 onnxruntime-directml + `--execution-providers directml`（本机现状）。要 CUDA：按 8.1 的说明复制 NVIDIA DLL 后重装 onnxruntime-gpu |
+| 9 | 换的脸**边缘有明显分界线** | 主因是**锐度落差**（512/256 渲染的脸比压缩视频清晰太多），遮罩只是次要因素；gfpgan 提锐度会加重 | pixel-boost 降到 128/256 + blur 0.5~0.6 + 去掉 box 遮罩。根治只能整头生成（LivePortrait 方案A），详见 8.5 |
+| 10 | 输入视频带 `rotation=-90` 元数据，输出方向乱 | FaceFusion 对旋转元数据处理不可靠 | 转码预处理时 ffmpeg 自动烘焙旋转（8.9 配方顺带解决），不必单独处理 |
+| 11 | 怀疑"根本没换脸" | 需要客观验证，肉眼逐帧看不现实 | ffmpeg 同时刻抽帧对比输入输出：整帧差 >100 = 全黑/坏了；背景 ~2 + 人脸区 5~7 = 正常换脸（差异热图法，见 8.8） |
+| 12 | 全片亮度/对比度逐帧恒定，怀疑画面卡死 | 也可能就是**静态场景**（如举证件 26 秒不动），属正常 | 先看内容再下结论，配合 #11 的抽帧对比确认 |
+
+**色彩验收三项指标**（转码/成品通用，OpenCV YCrCb/HSV 统计）：正常室内人物视频参考值 = 亮度 150~180 / 对比度 45~60 / 饱和度 30~45；"灰雾/彩铅画"特征 = 对比度 <25 且饱和度 <20。
+
+**本地跑批标准命令骨架**（在 8.5 的 #5 命令上加两处硬化）：
+
+```bash
+# 1) HDR/旋转输入先预处理（普通 SDR 输入可跳过）
+ffmpeg -i 输入.mp4 -vf "zscale=t=linear:npl=500,format=gbrp,tonemap=clip,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,eq=gamma=1.06:saturation=1.05" -c:v libx264 -crf 16 -preset medium -c:a copy 预处理.mp4
+# 2) 换脸命令务必带：
+#    PYTHONNOUSERSITE=1          （坑6）
+#    --download-providers huggingface  （坑3）
+```
