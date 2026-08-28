@@ -6,7 +6,9 @@ import re
 import sys
 from pathlib import Path
 
-from .annotate import select_mouth_roi
+from .annotate import select_mouth_roi, select_polygon_points
+from .config import load_id_card_config
+from .id_card import preview_id_card, replace_id_card_in_video
 from .adapters.latentsync import LATENTSYNC_COMMIT
 from .composite import composite_video, preview_roi
 from .config import (
@@ -223,6 +225,39 @@ def _write_back_mouth_roi(path: Path, roi: MouthROI) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+import re
+from pathlib import Path
+
+def _write_back_id_card_corners(path: Path, corners: list) -> None:
+    text = path.read_text(encoding="utf-8")
+    lines = []
+    for x, y in corners:
+        lines.append(f"      - [{x:.4f}, {y:.4f}]")
+    # Replace between 'corners:' and the next non-item line
+    pattern = r"(corners:\n)(  - \[.*?\]\n)+(  \S)"
+    if not re.search(pattern, text):
+        raise ConfigurationError(f"id_card_replacement.corners not found: {path}")
+    block = "corners:\n" + "\n".join(lines) + "\n"
+    text = re.sub(pattern, r"\g<1>" + block.rstrip() + "\n\3", text)
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_back_protect_polygon(path: Path, name: str, points: list) -> None:
+    text = path.read_text(encoding="utf-8")
+    pt_lines = f"    - name: {name}\n      points:\n"
+    for x, y in points:
+        pt_lines += f"        - [{x:.4f}, {y:.4f}]\n"
+    # Check if polygon with this name already exists
+    pat = rf"(    - name: {re.escape(name)}\n      points:\n)(        - \[.*?\]\n)+"
+    if re.search(pat, text):
+        text = re.sub(pat, pt_lines, text, count=1)
+    else:
+        insert_at = "  color_match:"
+        if insert_at in text:
+            text = text.replace(insert_at, pt_lines + insert_at)
+        else:
+            text = text.rstrip() + "\n" + pt_lines
+    path.write_text(text, encoding="utf-8")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地口型数字人流水线")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -266,6 +301,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("DIGITAL_HUMAN_PROFILE", "office"),
     )
     refine.add_argument("--output", type=Path)
+    ann_id = sub.add_parser("annotate-id-card", help="标注证件四角并写回配置")
+    ann_id.add_argument("--job", type=Path, required=True)
+    ann_id.add_argument("--at-seconds", type=float, default=0.0)
+    ann_id.add_argument("--output", type=Path, default=Path("id-card-preview.jpg"))
+
+    ann_prot = sub.add_parser("annotate-id-card-protect", help="标注手指遮挡保护区")
+    ann_prot.add_argument("--job", type=Path, required=True)
+    ann_prot.add_argument("--at-seconds", type=float, default=0.0)
+    ann_prot.add_argument("--name", required=True, help="保护区名称")
+    ann_prot.add_argument("--output", type=Path, default=Path("id-card-protect-preview.jpg"))
+
+    rep_id = sub.add_parser("replace-id-card", help="执行证件区域替换")
+    rep_id.add_argument("--job", type=Path, required=True)
     return parser
 
 
@@ -325,6 +373,42 @@ def main(argv: list[str] | None = None) -> int:
                 else root / "output" / "final-refined.mp4"
             )
             mux_audio(local.ffmpeg, silent, audio, output)
+            print(output)
+            return 0
+        if args.command == "annotate-id-card":
+            job = load_job_config(args.job.resolve())
+            points = select_polygon_points(
+                job.source_video, args.at_seconds,
+                title="ID Card Corners (TL, TR, BR, BL)",
+                expected_points=4,
+            )
+            if points is None:
+                print("cancelled")
+                return 1
+            _write_back_id_card_corners(args.job.resolve(), points)
+            id_cfg = load_id_card_config(args.job.resolve())
+            if id_cfg:
+                preview_id_card(job.source_video, id_cfg, args.output.resolve())
+            print(f"corners saved: {len(points)} points -> {args.job}")
+            return 0
+        if args.command == "annotate-id-card-protect":
+            job = load_job_config(args.job.resolve())
+            points = select_polygon_points(
+                job.source_video, args.at_seconds,
+                title=f"Protect polygon: {args.name}",
+            )
+            if points is None or len(points) < 3:
+                print("cancelled")
+                return 1
+            _write_back_protect_polygon(args.job.resolve(), args.name, points)
+            print(f"protect '{args.name}' saved: {len(points)} points")
+            return 0
+        if args.command == "replace-id-card":
+            id_cfg = load_id_card_config(args.job.resolve())
+            if id_cfg is None:
+                print("ERROR: id_card_replacement not enabled", file=sys.stderr)
+                return 2
+            output = replace_id_card_in_video(id_cfg)
             print(output)
             return 0
     except (ConfigurationError, CommandError, RuntimeError, ValueError) as exc:

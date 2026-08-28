@@ -48,6 +48,26 @@ class MouthROI:
     feather_pixels: int
 
 
+
+
+@dataclass(frozen=True)
+class PolygonRegion:
+    """A named polygon region in normalized coordinates [0, 1]."""
+    name: str
+    points: list[tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class IdCardConfig:
+    """Configuration for ID card / document region replacement."""
+    source_image: Path
+    input_video: Path
+    output_video: Path
+    corners: list[tuple[float, float]]
+    protect_polygons: list[PolygonRegion]
+    feather_pixels: int = 2
+    color_match: dict[str, Any] | None = None
+    auto_detect_fingers: bool = True
 @dataclass(frozen=True)
 class JobConfig:
     job_id: str
@@ -246,3 +266,133 @@ def validate_job(job: JobConfig) -> None:
             raise ConfigurationError("LatentSync inference_steps 必须在 20～50 之间")
         if not 1.0 <= guidance <= 3.0:
             raise ConfigurationError("LatentSync guidance_scale 必须在 1.0～3.0 之间")
+
+
+
+def load_id_card_config(path: Path) -> IdCardConfig | None:
+    """Load id_card_replacement section from job yaml.
+
+    Returns None if section is missing or enabled=false.
+    """
+    data = _read_yaml(path)
+    section = data.get("id_card_replacement")
+    if not section or not section.get("enabled", False):
+        return None
+    base = path.parent
+    try:
+        cm = section.get("color_match")
+        if cm is None:
+            cm = {"mode": "lab_local"}
+        corners_raw = section["corners"]
+        if not isinstance(corners_raw, list) or len(corners_raw) != 4:
+            raise ConfigurationError(
+                f"id_card_replacement.corners must have exactly 4 points"
+            )
+        corners = [(float(p[0]), float(p[1])) for p in corners_raw]
+        polys_raw = section.get("protect_polygons", [])
+        polys = []
+        for p in polys_raw:
+            polys.append(PolygonRegion(
+                name=str(p["name"]),
+                points=[(float(pt[0]), float(pt[1])) for pt in p["points"]],
+            ))
+        config = IdCardConfig(
+            source_image=_resolve(str(section["source_image"]), base),
+            input_video=_resolve(str(section["input_video"]), base),
+            output_video=_resolve(str(section["output_video"]), base),
+            corners=corners,
+            protect_polygons=polys,
+            feather_pixels=int(section.get("feather_pixels", 2)),
+            color_match=cm,
+            auto_detect_fingers=bool(section.get("auto_detect_fingers", True)),
+        )
+    except KeyError as exc:
+        raise ConfigurationError(
+            f"id_card_replacement missing field: {exc}"
+        ) from exc
+    validate_id_card_config(config)
+    return config
+
+
+def validate_id_card_config(config: IdCardConfig) -> None:
+    if not config.source_image.is_file():
+        raise ConfigurationError(
+            f"id_card_replacement.source_image does not exist: {config.source_image}"
+        )
+    if not config.input_video.is_file():
+        raise ConfigurationError(
+            f"id_card_replacement.input_video does not exist: {config.input_video}"
+        )
+    if not config.output_video.parent.exists():
+        try:
+            config.output_video.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"id_card_replacement.output_video parent cannot be created: {exc}"
+            ) from exc
+    # Corners: exactly 4, each in [0,1], non-degenerate.
+    if len(config.corners) != 4:
+        raise ConfigurationError(
+            f"id_card_replacement.corners must have exactly 4 points, got {len(config.corners)}"
+        )
+    for i, (x, y) in enumerate(config.corners):
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ConfigurationError(
+                f"id_card_replacement.corners[{i}] = ({x}, {y}) out of [0, 1] range"
+            )
+    # Shoelace area check.
+    n = len(config.corners)
+    area = 0.0
+    for i in range(n):
+        x1, y1 = config.corners[i]
+        x2, y2 = config.corners[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    area /= 2.0
+    if abs(area) < 1e-6:
+        raise ConfigurationError(
+            "id_card_replacement.corners form a degenerate quadrilateral"
+        )
+    # Protect polygons: unique names, each >= 3 points in [0,1].
+    names_seen: set[str] = set()
+    for poly in config.protect_polygons:
+        if poly.name in names_seen:
+            raise ConfigurationError(
+                f"duplicate protect_polygon name: {poly.name}"
+            )
+        names_seen.add(poly.name)
+        if len(poly.points) < 3:
+            raise ConfigurationError(
+                f"protect_polygon '{poly.name}' must have at least 3 points, got {len(poly.points)}"
+            )
+        for j, (x, y) in enumerate(poly.points):
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                raise ConfigurationError(
+                    f"protect_polygon '{poly.name}' point {j} = ({x}, {y}) out of [0, 1] range"
+                )
+    # feather_pixels in [0, 8].
+    if not 0 <= config.feather_pixels <= 8:
+        raise ConfigurationError(
+            f"id_card_replacement.feather_pixels must be in [0, 8], got {config.feather_pixels}"
+        )
+    # Color match params.
+    cm = config.color_match or {}
+    exposure_clip = int(cm.get("exposure_clip", 25))
+    chroma_clip = int(cm.get("chroma_clip", 10))
+    if not 0 <= exposure_clip <= 60:
+        raise ConfigurationError(
+            f"color_match.exposure_clip must be in [0, 60], got {exposure_clip}"
+        )
+    if not 0 <= chroma_clip <= 40:
+        raise ConfigurationError(
+            f"color_match.chroma_clip must be in [0, 40], got {chroma_clip}"
+        )
+    # Tracking mode: v1 only supports fixed.
+    tracking = cm.get("tracking", {"mode": "fixed"})
+    if isinstance(tracking, dict):
+        mode = tracking.get("mode", "fixed")
+    else:
+        mode = "fixed"
+    if mode != "fixed":
+        raise ConfigurationError(
+            f"id_card_replacement tracking.mode must be 'fixed' in v1, got '{mode}'"
+        )

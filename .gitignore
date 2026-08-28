@@ -24,3 +24,8 @@ __pycache__/
 .claude/settings.local.json
 tmp_compare/
 experiments/infinitetalk/results/
+facefusion/
+experiments/hybrid-composite/
+tests/id_card_demo_outputs/
+_*.py
+jobs-cloud/
