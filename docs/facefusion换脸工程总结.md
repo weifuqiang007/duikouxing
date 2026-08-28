@@ -491,3 +491,16 @@ ffmpeg -i 输入.mp4 -vf "zscale=t=linear:npl=100,format=gbrp,tonemap=hable:desa
 | fs-p1-128-0001（SDR 版） | 色调映射后 | 43.3MB | 6.45fps | ✅ 差异热图确认脸区换脸 |
 
 素材：`zhenglian.png`（正脸）+ `celian.png`（侧脸）多源，配置同 #5（inswapper_128@128 + occlusion/region + blur 0.6）。
+
+## 8.9 修正：8.8 的 HDR 转换配方会产生"彩铅画"（已迭代）
+
+8.8 里的 `tonemap=hable:desat=0` 配方虽然能出画，但**偏暗、发灰、蜡笔感**（实测整帧对比度仅 22、饱和度仅 15）——hable 的高光压缩对室内人物场景过重。经同帧多配方对比（hable/mobius/reinhard/clip/colorspace × npl 参数扫描 + 图像模型目检），**最终配方**：
+
+```bash
+ffmpeg -i 输入.mp4 -vf "zscale=t=linear:npl=500,format=gbrp,tonemap=clip,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,eq=gamma=1.06:saturation=1.05" \
+  -c:v libx264 -crf 16 -preset medium -c:a copy 预处理.mp4
+```
+
+**要点**：① HLG 输入的 `npl` 用 400~500（不是网上常见教程的 100，那会把画面压暗压灰）；② 室内场景用 `tonemap=clip`（只裁高光、不动色彩），比 hable 的电影级压缩自然得多；③ 转完用亮度/对比度/饱和度三项指标验收（正常参考：~175/54/37，坏版本是 148/22/15）。成品 `jobs-home/fs-p1-128-0001/output/swap_p1_final.mp4`。
+
+**新坑 7：FaceFusion 启动时可能僵死在 GitHub 连通性探测。** 症状：日志停在 `processing step 1 of 1`、python 内存仅 ~68MB（模型未加载）、GPU 0%、无 ffmpeg 进程。根因是 `ping_static_url` 起的 curl 僵死。**修复：加 `--download-providers huggingface`**（hf-mirror 在其 URL 列表内），模型已全量本地化后此参数还能加速启动。建议所有本地跑批命令固定带上。
