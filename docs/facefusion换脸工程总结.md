@@ -2,7 +2,7 @@
 
 > 日期：2026-08-27
 > 服务器：`ssh -p 37911 root@219.147.100.42`
-> 费率：**2 元/小时**
+> 费率：**32 元/小时**
 
 ---
 
@@ -378,3 +378,96 @@ C: padding 50 25 25 25, blur 0.55
 我的判断：  
 如果只是想“更像被替换的人”，可以先试 B。  
 如果必须明显保留 PNG 的发型、头型，那就要走 FaceFusion 后处理：对头发区域做单独 mask，再用 ComfyUI / inpainting / V2V 修发型。FaceFusion 单独做不到稳定换发。
+---
+
+# 八、本地复现实验（2026-08-28，家里电脑）
+
+> 机器：Windows 11 · RTX 4070 Ti 12GB · E 盘 1.2TB 可用
+> 分支：`codex/dreamidv-faceswap`（已合并 `codex/faceswap-facefusion-local` 的本地化基础设施）
+> 素材：同服务器（`samples/11.png` + `samples/wlh.mp4`，720×1280 / 30fps / 409 帧 / 13.6s）
+
+## 8.1 本地环境与服务器差异
+
+| 项 | 服务器（4090） | 本地（4070 Ti） |
+|----|--------------|----------------|
+| 推理后端 | onnxruntime-gpu (CUDA) | **onnxruntime-directml (DirectML)** |
+| 相对速度 | 48fps（v2 配置） | 15.5fps（v2 配置），约 1/3 |
+| FaceFusion | 3.8.2（commit `4b1dedb`） | 同 |
+
+**为什么用 DirectML**：onnxruntime-gpu 在 Windows 缺 `cudnn64_9.dll`（Error 126），手工把 NVIDIA pip 包 DLL 布置到 onnxruntime 目录的几种做法均被本机安全沙箱拦截，遂改用官方 installer 的 directml 路线（`python install.py directml`），零依赖折腾。日后要补 CUDA：把 `.conda-envs\facefusion\Lib\site-packages\nvidia\*\bin\*.dll` 复制进 `...\onnxruntime\capi\` 后重跑 `install.py cuda@12`。
+
+## 8.2 工程内目录布局（全部在 E:\duikouxing 内）
+
+```
+external\facefusion\        # 3.8.2 源码（.assets\models 经 junction 指向 ↓）
+models\facefusion\          # 全部 ONNX 权重（junction 双向验证通过）
+.conda-envs\facefusion\     # Python 3.12 环境
+jobs-home\fs-*\{input,output,logs,work}\   # 每任务归档
+samples\                    # 素材（含新增三视图）
+```
+
+## 8.3 本地新踩的坑（服务器没有的）
+
+1. **GitHub releases 直连被重置** → 模型一律走 `https://hf-mirror.com/facefusion/<collection>/resolve/main/<file>`（FaceFusion 内置回退源，实测 ~3MB/s）
+2. **pip 混入系统 Python 用户目录**：本机 `%APPDATA%\Python\Python312\site-packages` 里有大量包，必须 `PYTHONNOUSERSITE=1`，否则环境不自包含
+3. **`.hash` 校验是 CRC32**（`zlib.crc32` 取 8 位十六进制），不是 SHA256——用 `sha256sum` 对不上是正常的，别误判文件损坏（本次差点误删完好的 gfpgan）
+4. **默认 occluder 是 xseg_1**：即使只用 region 遮罩也会预检下载，服务器清单里没有它，需补（xseg_2 不顶替）
+5. **NSFW 内容检查默认启用**：首次运行会下 nsfw_1/2/3 三个模型（共 ~460MB），走 GitHub 会超时，提前从镜像下好
+
+## 8.4 五次跑版记录
+
+| # | 任务目录 | 换脸模型@boost | 遮罩 | 特殊 | 速度(fps) | 边缘分界线 |
+|---|---------|---------------|------|------|-----------|-----------|
+| 1 | fs-local-0001 | ghost_2_256@512 | box+occlusion+region，blur 0.30 | 表情恢复80 | 4.71 | **明显** ❌ |
+| 2 | fs-v2-0001 | inswapper_128@128 | region，blur 0.5，padding 20 | 复现服务器v2 | 15.47 | 无抱怨 ✅ |
+| 3 | fs-fix-0001 | ghost_2_256@512 | occlusion+region，blur 0.50 | +gfpgan_1.4 | 4.11 | 仍明显 ❌ |
+| 4 | fs-256-0001 | ghost_2_256@256 | occlusion+region，blur 0.60 | 正+侧脸多源 | 6.00 | 轻微 |
+| 5 | fs-128-0001 | inswapper_128@128 | occlusion+region，blur 0.60 | 正+侧脸多源 | 5.90 | **初步判优** ✅ |
+
+输出统一在 `jobs-home\<任务>\output\`。
+
+## 8.5 边缘分界线归因（本次核心结论）
+
+**主因：锐度落差，不是遮罩。** 证据链：
+
+- #2（128 渲染）没被抱怨过硬边；#1/#3（512 渲染）都有明显分界线——唯一稳定差异是换入脸的清晰度
+- 512/256 渲染的脸比压缩视频的皮肤清晰一大截，人眼把这种"清晰度台阶"看成一条分割线
+- 遮罩（box/region/occlusion）只决定这条线画在哪，决定不了"看不出线"；blur 只能弱化
+- **gfpgan 是提锐度的，对此问题无效甚至加重**（#3 实测），不要再往这个方向调
+
+**推论**：换脸管线的合成边界无法根除，只能靠"软度匹配"（低 boost）弱化，代价是身份相似度下降。**彻底解决 = 整头生成**（LivePortrait 再演 + 回贴，即换头业务线方案A），没有贴脸边界。
+
+**#5 复现命令**（当前最优）：
+
+```bash
+cd external/facefusion
+PYTHONNOUSERSITE=1 ../../.conda-envs/facefusion/python.exe facefusion.py headless-run \
+  --source-paths <正脸.png> <侧脸.png> \
+  --target-path <目标.mp4> \
+  --output-path <输出.mp4> \
+  --processors face_swapper expression_restorer \
+  --face-selector-mode one \
+  --face-swapper-model inswapper_128 --face-swapper-weight 0.85 \
+  --expression-restorer-model live_portrait --expression-restorer-factor 80 \
+  --face-mask-types occlusion region \
+  --face-mask-blur 0.6 \
+  --execution-providers directml \
+  --output-video-encoder libx264 --output-video-quality 95 --output-video-preset slow
+```
+
+## 8.6 三视图素材的使用结论
+
+| 文件 | 结论 |
+|------|------|
+| `samples/zehnglian.png` 正脸 | ✅ 多源换脸源之一（正对镜头帧自动选用） |
+| `samples/celian.png` 侧脸 | ✅ 多源换脸源之一（转头帧自动选用，身份更稳） |
+| `samples/hounaoshao.png` 后脑勺 | ❌ 换脸用不上（无脸可检测）；留作 LivePortrait 换头线的头型/发型参考 |
+
+注意：AI 生成的三视图形象与真人照片（11.png）不要混在同一次任务里当源脸。
+
+## 8.7 待验证 / 待办
+
+- [ ] **#5 vs #4 的优劣需扩样本确认**（当前只有 1 条视频，光照/分辨率/角度单一）
+- [ ] gfpgan_1.4.onnx 已就位（用户手动下载，CRC32 校验通过）——画质增强用途保留，但对边缘问题无效
+- [ ] 多人场景、1080p、长视频稳定性（沿用服务器待办）
+- [ ] 换脸管线天花板已探明，**下一步评估 LivePortrait 再演+回贴（方案A）**，从根上消灭贴脸边界
