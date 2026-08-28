@@ -471,3 +471,23 @@ PYTHONNOUSERSITE=1 ../../.conda-envs/facefusion/python.exe facefusion.py headles
 - [ ] gfpgan_1.4.onnx 已就位（用户手动下载，CRC32 校验通过）——画质增强用途保留，但对边缘问题无效
 - [ ] 多人场景、1080p、长视频稳定性（沿用服务器待办）
 - [ ] 换脸管线天花板已探明，**下一步评估 LivePortrait 再演+回贴（方案A）**，从根上消灭贴脸边界
+
+## 8.8 扩样本实测：person1（1080×1920 竖屏，26.6s，798 帧）
+
+**新坑 6：iPhone HDR 视频直接产出全黑输出。** 输入为 HEVC 10-bit / BT.2020 / HLG（arib-std-b67），FaceFusion 抽帧管线只认 8-bit SDR：黑帧 → 检不到脸 → 56fps 假速度 → 输出 3.9MB 全黑视频（正常应为 43MB）。旋转元数据（rotation=-90）是伴生问题但非根因（烘焙后仍黑）。
+
+**修复：喂给 FaceFusion 前先做 HDR→SDR 色调映射**：
+
+```bash
+ffmpeg -i 输入.mp4 -vf "zscale=t=linear:npl=100,format=gbrp,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p" \
+  -c:v libx264 -crf 16 -preset medium -c:a copy 预处理.mp4
+```
+
+**验证方法**（客观判定换脸是否真的发生）：ffmpeg 同时刻抽帧对比输入输出——黑屏版整帧差 181（全黑 vs 实际内容）；成功版整帧差 2.6、人脸区 6.2+、背景 2.5（编码噪声），变化精确集中在脸区。
+
+| 任务 | 输入 | 输出 | 速度 | 结果 |
+|------|------|------|------|------|
+| fs-p1-128-0001（第一次） | 原始 HDR | 3.9MB 全黑 | 56fps(假) | ❌ |
+| fs-p1-128-0001（SDR 版） | 色调映射后 | 43.3MB | 6.45fps | ✅ 差异热图确认脸区换脸 |
+
+素材：`zhenglian.png`（正脸）+ `celian.png`（侧脸）多源，配置同 #5（inswapper_128@128 + occlusion/region + blur 0.6）。
