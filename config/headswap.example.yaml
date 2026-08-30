@@ -1,0 +1,76 @@
+# 整头替换任务配置模板（src/headswap/cli.py）
+# 相对路径基于本文件所在 config/ 目录解析；绝对路径原样使用。
+job_id: "headswap-demo-001"
+consent_confirmed: false   # 必须确认肖像/声音授权后才能改为 true
+
+source_video: "../samples/a.mp4"        # 视频 A：被替换人物的原始视频（保留原声）
+source_portrait: "../samples/b_front.png"  # 照片 B 正脸肖像（LivePortrait source）
+side_portraits:                          # 仅归档记录，v1 不参与推理
+  - "../samples/b_left.png"
+
+liveportrait:
+  animation_region: "all"     # all：头部姿态+表情+嘴部全迁移（整头替换推荐）；exp：仅表情
+  driving_multiplier: 1.0     # 动作强度，建议 A/B：0.75 / 0.85 / 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+segmentation:
+  roi_ratio: 2.6        # 主脸周围解析裁剪倍率；越大头发覆盖越全
+  mask_dilate_px: 8     # 头部 mask 外扩
+  mask_erode_px: 2      # 头部 mask 内缩
+  temporal_ema: 0.0     # 必须为 0：全画布二值 EMA 会造成前缘漏出（docs §17.6）
+  max_fail_ratio: 0.05  # 检测失败帧占比上限
+
+plate:
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+composite:
+  silent_name: "composite_silent"   # work/<silent_name>.mp4；多轮对照时改名互不覆盖
+  debug_dir_name: "composite_debug" # previews/<debug_dir_name>
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  transform_mode: "eyes"   # eyes：纯眼部刚体（推荐）；five_point：旧版对照
+  filter_mode: "offline"   # offline：Hampel+居中零相位（推荐）；online：旧版因果滤波
+  hampel_window: 7         # offline 尖峰剔除窗口
+  filter_window: 11        # offline 居中平滑窗口
+  transform_window: 9      # 仅 online：中位数窗口
+  rotation_smooth: 0.8     # 仅 online
+  translation_smooth: 0.8  # 仅 online
+  alpha_mode: "inner"      # inner：内部距离羽化，support 外严格 0（推荐）；blur：旧版对照
+  alpha_feather_px: 6      # 过渡带宽度 4~8px
+  alpha_erode_px: 4        # 仅 blur 对照
+  fill_mode: "wall_residual"  # wall_residual：墙面种子+ΔE门限+MAD（推荐，§22.3）；
+                             # residual：v2 差集平面拟合对照；plate：旧版整块底板对照
+  ring_width_px: 30        # 采样环宽
+  wall_delta_e: 10.0       # 墙面样本 ΔE 门限（§20.3.4，8~12 起步，不要放宽到样本够用为止）
+  fill_outer_feather_px: 0 # Round E 首版 0：residual 内 100% 替换，不做外沿融合
+  neck_keep_ratio: 0.05    # A 脖子保护线 = 下颌 + ratio×脸高（collar 启用时被 collar_bottom 覆盖）
+  plate_expand_px: 10      # 仅 plate 对照
+  mask_union: "motion_safe"  # motion_safe：当前∪运动补偿上一帧（推荐）；current：仅当前
+  safe_margin_px: 8        # 旧头清理区外扩
+  neck_cut_y_ratio: 1.35   # 下颌软切割位置（相对 A 人脸框高度的倍数）
+  # start_frame: 0         # 帧范围调试（§22.5.5）
+  # max_frames: 0          # 0 = 到结尾
+
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+  final_name: "final"              # output/<final_name>.mp4
+  side_by_side_name: "side_by_side"  # previews/<side_by_side_name>.mp4

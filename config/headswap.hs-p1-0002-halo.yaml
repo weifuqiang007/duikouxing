@@ -1,0 +1,63 @@
+# 第二轮整改任务（docs §17）：同一 job 目录下分三轮对比，产物分别拷贝保存
+job_id: "hs-p1-0002"
+consent_confirmed: true   # 本人自测素材（new20260828/person1），本人知情同意
+
+source_video: "C:/Users/魏富强/Desktop/视频/new20260828/person1/shipin.mp4"
+source_portrait: "C:/Users/魏富强/Desktop/视频/new20260828/person1/zhenglian.png"
+side_portraits:
+  - "C:/Users/魏富强/Desktop/视频/new20260828/person1/celian.png"
+
+liveportrait:
+  animation_region: "all"
+  driving_multiplier: 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+plate:            # v2 差集补洞不再使用整块底板，保留字段仅为 plate 对照模式
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+
+# —— Round B（v2-halo）：预乘 alpha + 内距羽化 + 差集补洞；变换仍用旧版 5 点在线滤波 ——
+segmentation:
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 2
+  temporal_ema: 0.6      # 沿用第一版 mask（本轮不动分割）
+  max_fail_ratio: 0.05
+
+composite:
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  transform_mode: "five_point"   # 旧版对照
+  filter_mode: "online"          # 旧版对照（中位数9+EMA0.8）
+  transform_window: 9
+  rotation_smooth: 0.8
+  translation_smooth: 0.8
+  alpha_mode: "inner"            # ★ 新：内距羽化
+  alpha_feather_px: 6
+  alpha_erode_px: 4
+  fill_mode: "residual"          # ★ 新：差集补洞
+  ring_width_px: 30
+  mask_union: "current"          # 旧版对照：仅当前帧 mask 膨胀
+  safe_margin_px: 10
+  neck_cut_y_ratio: 1.35

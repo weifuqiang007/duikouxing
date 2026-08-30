@@ -1,0 +1,77 @@
+# 第三轮 Round E（§22.5）：只修补洞底图（墙面种子 + ΔE 门限 + MAD + residual 100% 替换）
+# 禁改项全部保持 v2：B alpha（feather 6、无内缩）、运动滤波、LivePortrait、色彩强度、音频。
+# 输入产物复用 hs-p1-0002（prepare/reenact/segment EMA=0），隔离变量。
+# 实跑命令行备份：jobs-home/hs-p1-0003/logs/composite_v3_fill.log
+job_id: "hs-p1-0003"
+consent_confirmed: true   # 本人自测素材（new20260828/person1），本人知情同意
+
+source_video: "C:/Users/魏富强/Desktop/视频/new20260828/person1/shipin.mp4"
+source_portrait: "C:/Users/魏富强/Desktop/视频/new20260828/person1/zhenglian.png"
+side_portraits:
+  - "C:/Users/魏富强/Desktop/视频/new20260828/person1/celian.png"
+
+liveportrait:            # 与 0002 完全一致（产物直接复用，不重跑）
+  animation_region: "all"
+  driving_multiplier: 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+plate:                   # v3 不使用整块底板，字段仅为 plate 对照模式保留
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+color:                   # Round E 禁改色彩参数
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+  final_name: "final-v3-fill"            # output/final-v3-fill.mp4（§22.8）
+  side_by_side_name: "side_by_side_v3_fill"
+
+segmentation:            # 与 0002 终版一致（EMA=0），masks 复用不重跑
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 0
+  temporal_ema: 0.0
+  max_fail_ratio: 0.05
+
+composite:
+  silent_name: "composite_silent-v3-fill"   # 产物互不覆盖（§22.8）
+  debug_dir_name: "debug-v3-fill"
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  transform_mode: "eyes"       # 与 v2 相同
+  filter_mode: "offline"
+  hampel_window: 7
+  filter_window: 11
+  scale_mode: "const"
+  angle_window: 21
+  alpha_mode: "inner"          # Round E 不动 B alpha
+  alpha_feather_px: 6          # 保持 v2 的 6（§22.5.2 禁改）
+  b_mask_erode_px: 0           # Round E 禁止内缩
+  neck_collar_enabled: false   # Round E 禁止 collar
+  fill_mode: "wall_residual"   # ★ Round E 唯一新路径（§22.3）
+  ring_width_px: 30
+  wall_delta_e: 10.0
+  fill_outer_feather_px: 0     # Round E 首版关闭外沿融合（§22.3.2）
+  neck_keep_ratio: 0.05        # A 脖子保护线 = 下颌 + 0.05×脸高（§22.5.3）
+  mask_union: "motion_safe"
+  safe_margin_px: 8
+  neck_cut_y_ratio: 1.35
+  # start_frame / max_frames：调试用，正式全片运行前注释掉
+  # start_frame: 0
+  # max_frames: 1

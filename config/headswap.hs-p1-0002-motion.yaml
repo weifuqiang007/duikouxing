@@ -1,0 +1,61 @@
+# 第二轮整改任务（docs §17）：同一 job 目录下分三轮对比，产物分别拷贝保存
+job_id: "hs-p1-0002"
+consent_confirmed: true   # 本人自测素材（new20260828/person1），本人知情同意
+
+source_video: "C:/Users/魏富强/Desktop/视频/new20260828/person1/shipin.mp4"
+source_portrait: "C:/Users/魏富强/Desktop/视频/new20260828/person1/zhenglian.png"
+side_portraits:
+  - "C:/Users/魏富强/Desktop/视频/new20260828/person1/celian.png"
+
+liveportrait:
+  animation_region: "all"
+  driving_multiplier: 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+plate:            # v2 差集补洞不再使用整块底板，保留字段仅为 plate 对照模式
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+
+# —— Round C（v2-motion）：在 B 基础上换纯眼部刚体变换 + 离线 Hampel/居中平滑 ——
+segmentation:
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 2
+  temporal_ema: 0.6
+  max_fail_ratio: 0.05
+
+composite:
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  transform_mode: "eyes"         # ★ 新：嘴角退出
+  filter_mode: "offline"         # ★ 新：零相位
+  hampel_window: 7
+  filter_window: 11
+  alpha_mode: "inner"
+  alpha_feather_px: 6
+  fill_mode: "residual"
+  ring_width_px: 30
+  mask_union: "current"
+  safe_margin_px: 10
+  neck_cut_y_ratio: 1.35

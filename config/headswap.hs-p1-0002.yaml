@@ -1,0 +1,63 @@
+# 第二轮整改任务（docs §17）：同一 job 目录下分三轮对比，产物分别拷贝保存
+job_id: "hs-p1-0002"
+consent_confirmed: true   # 本人自测素材（new20260828/person1），本人知情同意
+
+source_video: "C:/Users/魏富强/Desktop/视频/new20260828/person1/shipin.mp4"
+source_portrait: "C:/Users/魏富强/Desktop/视频/new20260828/person1/zhenglian.png"
+side_portraits:
+  - "C:/Users/魏富强/Desktop/视频/new20260828/person1/celian.png"
+
+liveportrait:
+  animation_region: "all"
+  driving_multiplier: 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+plate:            # v2 差集补洞不再使用整块底板，保留字段仅为 plate 对照模式
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+
+# —— Round D（最终 v2）：segment 关闭二值 EMA + 旧头运动补偿安全并集 ——
+segmentation:
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 0
+  temporal_ema: 0.0      # ★ 新：关闭全画布二值 EMA（前缘漏出根因）
+  max_fail_ratio: 0.05
+
+composite:
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  transform_mode: "eyes"
+  filter_mode: "offline"
+  hampel_window: 7
+  filter_window: 11
+  scale_mode: "const"     # 固定机位：scale 取全程中位数，杜绝"呼吸"
+  angle_window: 21        # roll 信号 <1°，强平滑只留慢趋势
+  alpha_mode: "inner"
+  alpha_feather_px: 6
+  fill_mode: "residual"
+  ring_width_px: 30
+  mask_union: "motion_safe"      # ★ 新：当前 ∪ 运动补偿上一帧
+  safe_margin_px: 8
+  neck_cut_y_ratio: 1.35
