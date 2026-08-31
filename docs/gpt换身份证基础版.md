@@ -479,6 +479,38 @@ D:\ffmpeg\bin\ffprobe.exe -v error -show_entries stream=index,codec_type,codec_n
 2. 不要在无 GUI 的远程 shell 里运行标记 demo。
 3. 可以先只运行替换脚本，前提是已有 `selected_source_quad.json` 和 `selected_target_quad.json`。
 
+### 8. 遮挡场景必须人工确认
+
+如果视频里的身份证被手指、证书纸张、衣服边缘等遮挡，不要直接使用自动检测结果。  
+这类场景下，自动算法可能只识别到身份证露出来的一半，导致最终视频只替换一部分，或者贴图覆盖到手指/证书上。
+
+此时应使用 `--manual-only` 模式，让最终 JSON 只保存人工标记区域，自动区域只作为参考。
+
+源身份证图片人工确认：
+
+```powershell
+G:\duikouxing\.conda-envs\digital-human\python.exe G:\duikouxing\tests\id_card_source_mark_demo.py --image C:\Users\zq456\Desktop\测试数据\new20260828\person1\1.jpg --output-dir G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm --manual-only
+```
+
+视频首帧人工确认：
+
+```powershell
+G:\duikouxing\.conda-envs\digital-human\python.exe G:\duikouxing\tests\id_card_target_frame_mark_demo.py --video C:\Users\zq456\Desktop\测试数据\new20260828\person1\swap_p1_final.mp4 --output-dir G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm --clean-card G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm\clean_id_card.jpg --manual-only
+```
+
+替换视频：
+
+```powershell
+G:\duikouxing\.conda-envs\digital-human\python.exe G:\duikouxing\tests\id_card_replace_demo.py --source-json G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm\selected_source_quad.json --target-json G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm\selected_target_quad.json --output G:\duikouxing\tests\id_card_demo_outputs\person1_manual_confirm\person1_idcard_replace_manual_v3.mp4
+```
+
+人工标记注意点：
+
+1. 源身份证图片：框完整身份证外轮廓，不要把桌面背景框进去。
+2. 视频首帧：框视频里待替换身份证的完整平面区域。
+3. 如果身份证下沿被遮挡，要按身份证真实平面估计四角，而不是只框露出来的一半。
+4. 当前基础版仍没有手指/证书遮挡 mask，因此人工框只能解决“替换区域不完整”的问题，不能彻底解决遮挡自然性。
+
 ## 四、运行脚本
 
 ### 1. 运行源身份证图片标记
