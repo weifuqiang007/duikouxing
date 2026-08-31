@@ -1,0 +1,94 @@
+# 第七轮 M2（§30.9）：raw skin bridge 全片几何版。
+# K1 运动（eyes_nose/5/7/const）+ skin bridge（gap14 + no-cap + head 底带 20px）。
+# 产物：output/final-v7-skin-bridge.mp4（不得覆盖 final/v6）。
+job_id: "hs-p1-0004"
+consent_confirmed: true   # 本人自测素材（new20260828/person1），本人知情同意
+
+source_video: "C:/Users/魏富强/Desktop/视频/new20260828/person1/shipin.mp4"
+source_portrait: "C:/Users/魏富强/Desktop/视频/new20260828/person1/zhenglian.png"
+side_portraits:
+  - "C:/Users/魏富强/Desktop/视频/new20260828/person1/celian.png"
+
+liveportrait:            # 复用（不重跑）
+  animation_region: "all"
+  driving_multiplier: 1.0
+  smooth_variance: 0.0000003
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+
+plate:
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+
+video:
+  output_crf: 14
+  keep_original_audio: true
+  final_name: "final-v7-skin-bridge"
+  side_by_side_name: "side_by_side_v7_skin_bridge"
+
+segmentation:            # 需重跑一次以生成 raw_skins/raw_necks（已生成）
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 0
+  temporal_ema: 0.0
+  max_fail_ratio: 0.05
+  output_neck_masks: true
+  output_raw_skins: true
+
+composite:
+  silent_name: "composite_silent-v7-skin-bridge"
+  debug_dir_name: "debug-v7-skin-bridge"
+  # —— 运动：K1（与 v6-motion 一致）——
+  transform_mode: "eyes_nose"
+  filter_mode: "offline"
+  hampel_window: 5
+  filter_window: 5
+  scale_mode: "const"
+  angle_window: 7
+  # —— 几何：v6 全量 + 第七轮 skin bridge ——
+  scale_bias: 1.0
+  x_offset_px: 0
+  y_offset_px: 0
+  b_mask_erode_px: 1
+  fill_mode: "wall_residual"
+  ring_width_px: 30
+  wall_delta_e: 10.0
+  fill_outer_feather_px: 0
+  mask_union: "motion_safe"
+  safe_margin_px: 8
+  a_neck_preserve_enabled: true
+  a_neck_upward_px: 3
+  neck_collar_enabled: false
+  neck_color_strength: 0.0
+  alpha_mode: "region_aware"
+  head_side_feather_px: 4
+  jaw_feather_px: 8
+  jaw_start_ratio: 0.68
+  jaw_full_ratio: 0.82
+  jaw_color_strength: 0.0
+  jaw_underlay_enabled: true
+  jaw_underlay_px: 10
+  neck_taper_height_px: 16
+  neck_taper_side_px: 2
+  junction_bridge_max_gap_px: 6
+  # —— 第七轮核心（§30.5/30.6）——
+  skin_bridge_enabled: true       # 提供 raw_skins/raw_necks 给 worker
+  skin_bridge_max_gap_px: 14
+  skin_bridge_no_cap: true        # gap 超限列仍保留 span 内 raw skin（不变量字面）
+  jaw_underlay_band_px: 20        # head 底带 raw skin 铺垫（audit 第 1 部分语义）
+  wall_max_texture: 10.0           # M4：实测白墙能量 3.2，阈值 3 倍余量；窗帘(30+)会被显式拒绝
+  jaw_gradient_strength: 0.0      # M3 才启用

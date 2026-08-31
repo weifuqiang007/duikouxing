@@ -132,7 +132,11 @@ def filter_components(head_mask: np.ndarray, box) -> np.ndarray:
 
 def filter_neck_near_primary_face(neck_mask: np.ndarray, box) -> np.ndarray:
     """只保留主脸正下方窄窗内的 neck（§22.7.1 原样），不允许把肩膀、
-    衣服或远处皮肤并入。"""
+    衣服或远处皮肤并入。
+
+    ⚠️ v4 起 deprecated 于默认路径：B neck collar 已被 §24 人工复审否决，
+    本函数仅供历史复现。A 侧脖子保护改用 filter_a_neck_near_primary_face。
+    """
     h, w = neck_mask.shape[:2]
     bx0, by0, bx1, by1 = [float(v) for v in box]
     bw, bh = bx1 - bx0, by1 - by0
@@ -145,6 +149,51 @@ def filter_neck_near_primary_face(neck_mask: np.ndarray, box) -> np.ndarray:
     allowed = np.zeros_like(neck_mask, dtype=np.uint8)
     allowed[y0:y1, x0:x1] = 255
     return cv2.bitwise_and(neck_mask, allowed)
+
+
+def filter_a_neck_near_primary_face(neck_roi: np.ndarray, box_in_roi) -> np.ndarray:
+    """A 视频的 neck mask：class 14 真实轮廓，非水平线（§24.8.2 原样）。
+
+    窗口比 B collar 的 0.20bh 更深（保留到衣领附近），只用于排除远处误检；
+    最终顶部/左右轮廓由 class 14 本身决定。保留位于脸正下方、与中心轴
+    最近的主要连通域。
+    """
+    h, w = neck_roi.shape[:2]
+    bx0, by0, bx1, by1 = [float(v) for v in box_in_roi]
+    bw, bh = bx1 - bx0, by1 - by0
+
+    x0 = max(0, int(bx0 - 0.25 * bw))
+    x1 = min(w, int(bx1 + 0.25 * bw))
+    y0 = max(0, int(by1 - 0.08 * bh))
+    y1 = min(h, int(by1 + 0.45 * bh))
+
+    allowed = np.zeros_like(neck_roi, dtype=np.uint8)
+    allowed[y0:y1, x0:x1] = 255
+    candidate = cv2.bitwise_and(neck_roi, allowed)
+
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (candidate > 0).astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return candidate
+
+    face_cx = (bx0 + bx1) * 0.5
+    best = None
+    best_score = -1e18
+    for i in range(1, count):
+        x, y, cw, ch, area = stats[i]
+        cx, cy = centroids[i]
+        if area < 50 or cy < by1 - 0.10 * bh:
+            continue
+        score = float(area) - 4.0 * abs(float(cx) - face_cx)
+        if score > best_score:
+            best_score = score
+            best = i
+
+    out = np.zeros_like(candidate)
+    if best is not None:
+        out[labels == best] = 255
+    return out
 
 
 class HeadSegmenter:
@@ -164,7 +213,24 @@ class HeadSegmenter:
         self._prev_mask = None
 
     def segment(self, frame: np.ndarray, box):
-        """返回 (头部 mask uint8 0/255, 头外皮肤参考 mask uint8 0/255)。"""
+        """旧 API：返回 (head, skins)。v4 起委托 segment_parts，行为逐位一致。"""
+        head, skins, _neck = self.segment_parts(frame, box)
+        return head, skins
+
+    def segment_parts(self, frame: np.ndarray, box, return_raw_skin: bool = False):
+        """返回 (head, skins, neck[, raw_skin, raw_neck])——A 侧 ROI 解析（§24.8.2/§30.5）。
+
+        head/skins 与 v3 segment() 逐位一致（同操作同顺序）；neck 为独立
+        class 14 轮廓 mask（不减 head_pad、不按水平线裁、不含 cloth），
+        专供第四轮 A 脖子保护使用。
+
+        return_raw_skin=True 时额外返回（第七轮 §30.5）：
+        - raw_skin：class 1（face skin）∪ class 14（neck），**不减 head_pad、
+          不做连通域过滤、不含 cloth/背景**——下颌下/上颈处被 head_pad 或
+          组件过滤吞掉的人体像素在此保留，供 skin bridge 与独立验收使用；
+        - raw_neck：class 14 原始轮廓（无组件过滤），供 audit ROI 独立取
+          neck 顶部（不读取 repair 侧的 neck_visible）。
+        """
         h, w = frame.shape[:2]
         x0, y0, size = square_roi(frame.shape, box, self.roi_ratio)
         roi = frame[y0 : y0 + size, x0 : x0 + size]
@@ -197,7 +263,30 @@ class HeadSegmenter:
             mask = (blended >= 127).astype(np.uint8) * 255
         self._prev_mask = mask.copy()
         skins = self._build_skins(labels, x0, y0, size, head_roi, h, w)
-        return mask, skins
+
+        # A neck：class 14 真实轮廓（§24.8.2），close 后直接贴回全画布。
+        # 不减 head_pad、不水平裁切、无 EMA——时序安全在 composite 侧
+        # 用 motion_safe_neck_union 处理（§24.9）。
+        neck_roi = (labels == NECK_CLASS).astype(np.uint8) * 255
+        neck_roi = filter_a_neck_near_primary_face(
+            neck_roi, box - np.array([x0, y0, x0, y0], dtype=np.float32)
+        )
+        neck_roi = cv2.morphologyEx(
+            neck_roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        )
+        neck = np.zeros((h, w), dtype=np.uint8)
+        neck[y0 : y0 + size, x0 : x0 + size] = neck_roi
+
+        if not return_raw_skin:
+            return mask, skins, neck
+
+        raw_skin_roi = np.isin(labels, (1, NECK_CLASS)).astype(np.uint8) * 255
+        raw_skin = np.zeros((h, w), dtype=np.uint8)
+        raw_skin[y0 : y0 + size, x0 : x0 + size] = raw_skin_roi
+        raw_neck_roi = (labels == NECK_CLASS).astype(np.uint8) * 255
+        raw_neck = np.zeros((h, w), dtype=np.uint8)
+        raw_neck[y0 : y0 + size, x0 : x0 + size] = raw_neck_roi
+        return mask, skins, neck, raw_skin, raw_neck
 
     def segment_full(self, frame: np.ndarray, box):
         """全画布解析（不做方形 ROI 裁剪）。
@@ -281,6 +370,9 @@ def main(argv=None) -> int:
     ap.add_argument("--temporal-ema", type=float, default=0.6)
     ap.add_argument("--det-size", type=int, default=640)
     ap.add_argument("--max-fail-ratio", type=float, default=0.05)
+    ap.add_argument("--output-raw-skins", action="store_true",
+                    help="额外输出 raw_skins/（class1∪14 不减 head_pad）与 raw_necks/（class14 无组件过滤），"
+                         "供第七轮 skin bridge 与独立验收使用（§30.5/§30.6）")
     args = ap.parse_args(argv)
 
     if not args.video.is_file():
@@ -289,8 +381,15 @@ def main(argv=None) -> int:
 
     masks_dir = args.output_dir / "masks"
     skins_dir = args.output_dir / "skins"
+    necks_dir = args.output_dir / "necks"
+    raw_skins_dir = args.output_dir / "raw_skins"
+    raw_necks_dir = args.output_dir / "raw_necks"
     masks_dir.mkdir(parents=True, exist_ok=True)
     skins_dir.mkdir(parents=True, exist_ok=True)
+    necks_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_raw_skins:
+        raw_skins_dir.mkdir(parents=True, exist_ok=True)
+        raw_necks_dir.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -313,6 +412,8 @@ def main(argv=None) -> int:
     frames_meta = []
     index = 0
     fails = 0
+    neck_fails = 0
+    neck_px_total = 0
     prev_result = None
     while True:
         ok, frame = cap.read()
@@ -324,11 +425,22 @@ def main(argv=None) -> int:
             if prev_result is None:
                 print("ERROR: 首帧即检测不到人脸，无法继续", file=sys.stderr)
                 return 3
-            mask, skins, box, kps = prev_result
+            mask, skins, neck, box, kps = prev_result
+            neck_fails += 1
+            if args.output_raw_skins:
+                raw_skin, raw_neck = prev_raw
         else:
             box, kps = tracked
-            mask, skins = segmenter.segment(frame, box)
-            prev_result = (mask, skins, box, kps)
+            # 检测失败帧 head/skins/neck 三者一起沿用上一帧（§24.8.2 关键限制）
+            if args.output_raw_skins:
+                mask, skins, neck, raw_skin, raw_neck = segmenter.segment_parts(
+                    frame, box, return_raw_skin=True
+                )
+                prev_raw = (raw_skin, raw_neck)
+            else:
+                mask, skins, neck = segmenter.segment_parts(frame, box)
+            prev_result = (mask, skins, neck, box, kps)
+        neck_px_total += int((neck > 0).sum())
         frames_meta.append(
             {
                 "i": index,
@@ -339,6 +451,10 @@ def main(argv=None) -> int:
         )
         cv2.imwrite(str(masks_dir / f"mask_{index:06d}.png"), mask)
         cv2.imwrite(str(skins_dir / f"skin_{index:06d}.png"), skins)
+        cv2.imwrite(str(necks_dir / f"neck_{index:06d}.png"), neck)
+        if args.output_raw_skins:
+            cv2.imwrite(str(raw_skins_dir / f"raw_skin_{index:06d}.png"), raw_skin)
+            cv2.imwrite(str(raw_necks_dir / f"raw_neck_{index:06d}.png"), raw_neck)
         if index % 100 == 0:
             print(f"segmented frame {index}", flush=True)
         index += 1
@@ -361,6 +477,10 @@ def main(argv=None) -> int:
         "width": width,
         "height": height,
         "fail_frames": fails,
+        "neck_masks": True,
+        "raw_skin_masks": bool(args.output_raw_skins),
+        "neck_fail_frames": neck_fails,
+        "neck_px_mean": int(neck_px_total / max(index, 1)),
         "params": {
             "roi_ratio": args.roi_ratio,
             "dilate_px": args.dilate_px,

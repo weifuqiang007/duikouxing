@@ -65,6 +65,91 @@ def rigid_from_eyes(kps_src: np.ndarray, kps_dst: np.ndarray):
     return s, angle, tx, ty
 
 
+def rigid_from_eyes_nose(kps_src: np.ndarray, kps_dst: np.ndarray, nose_weight: float = 0.3):
+    """眼睛+鼻尖刚体参数（§28.7 快速方案）：只用 kps[:3]，嘴角完全不进。
+
+    双眼仍决定 scale/roll（两点方向最稳）；平移由"眼中点 0.7 + 鼻尖 0.3"的
+    加权中心对齐解出——鼻尖随 yaw 有少量横移，不能让单鼻点决定全部平移。
+    """
+    src = np.asarray(kps_src[:3], dtype=np.float64)
+    dst = np.asarray(kps_dst[:3], dtype=np.float64)
+    if not (np.isfinite(src).all() and np.isfinite(dst).all()):
+        return None
+    base = rigid_from_eyes(src, dst)
+    if base is None:
+        return None
+    s, angle = base[0], base[1]
+    w = float(np.clip(nose_weight, 0.0, 1.0))
+    cb = (1.0 - w) * ((src[0] + src[1]) * 0.5) + w * src[2]
+    ca = (1.0 - w) * ((dst[0] + dst[1]) * 0.5) + w * dst[2]
+    c, sn = s * math.cos(angle), s * math.sin(angle)
+    tx = ca[0] - (c * cb[0] - sn * cb[1])
+    ty = ca[1] - (sn * cb[0] + c * cb[1])
+    return s, angle, tx, ty
+
+
+def weighted_similarity(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    weights: np.ndarray,
+    irls_iters: int = 3,
+    mad_reject: float = 2.5,
+) -> tuple[float, float, float, float] | None:
+    """加权 4 自由度相似变换（§28.8 正式方案）：加权 Procrustes + MAD 降权。
+
+    只解 scale/roll/tx/ty，禁止 full affine（shear 会让脸型随帧扭曲）。
+    单点残差 > mad_reject×MAD 的锚点在本帧降权（×0.1）；返回 None 表示
+    无法求解（有效点不足由调用方负责回退 eyes_nose）。
+    """
+    src = np.asarray(src_pts, dtype=np.float64)
+    dst = np.asarray(dst_pts, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64).copy()
+    if src.shape != dst.shape or src.shape[0] < 3 or w.shape[0] != src.shape[0]:
+        return None
+    if not (np.isfinite(src).all() and np.isfinite(dst).all() and (w > 0).any()):
+        return None
+    w = np.clip(w, 0.0, None)
+    w = w / w.sum()
+
+    def solve(wv: np.ndarray):
+        cb = (wv[:, None] * src).sum(axis=0)
+        ca = (wv[:, None] * dst).sum(axis=0)
+        xs, ys = src - cb, dst - ca
+        # 加权相似变换闭式解（Umeyama 无反射版）
+        cov = float((wv * (xs[:, 0] * ys[:, 0] + xs[:, 1] * ys[:, 1])).sum())
+        var = float((wv * (xs[:, 0] ** 2 + xs[:, 1] ** 2)).sum())
+        kxy = float((wv * (xs[:, 0] * ys[:, 1] - xs[:, 1] * ys[:, 0])).sum())
+        if var < 1e-9:
+            return None
+        s = math.hypot(cov, kxy) / var
+        angle = math.atan2(kxy, cov)
+        c, sn = s * math.cos(angle), s * math.sin(angle)
+        tx = ca[0] - (c * cb[0] - sn * cb[1])
+        ty = ca[1] - (sn * cb[0] + c * cb[1])
+        return s, angle, tx, ty
+
+    wv = w.copy()
+    sol = solve(wv)
+    if sol is None:
+        return None
+    for _ in range(max(0, int(irls_iters))):
+        s, angle, tx, ty = sol
+        c, sn = s * math.cos(angle), s * math.sin(angle)
+        R = np.array([[c, -sn], [sn, c]])
+        resid = np.linalg.norm(dst - (src @ R.T + np.array([tx, ty])), axis=1)
+        med = np.median(resid[wv > 0])
+        mad = 1.4826 * np.median(np.abs(resid[wv > 0] - med)) + 1e-9
+        new_w = np.where(resid > mad_reject * mad, wv * 0.1, w)
+        if np.allclose(new_w, wv, atol=1e-12) or new_w.sum() <= 0:
+            break
+        wv = new_w / new_w.sum()
+        nxt = solve(wv)
+        if nxt is None:
+            break
+        sol = nxt
+    return sol
+
+
 def similarity(src_kps: np.ndarray, dst_kps: np.ndarray) -> np.ndarray | None:
     """旧版全 5 点 LMEDS 相似变换（仅作 A/B 对照保留）。"""
     src = np.asarray(src_kps, dtype=np.float32)
@@ -151,6 +236,12 @@ def offline_filter(
         win = smooth_window
         if j == 0 and scale_mode == "const":
             col = np.full_like(col, float(np.median(col)))
+            win = 1
+        if j == 0 and scale_mode == "smooth_clamped":
+            # §28.10 K2：smooth 21 + clamp 到中位数±1%（前后摆存在但防"呼吸"）
+            col = centered_smooth(col, window=21)
+            med = float(np.median(col))
+            col = np.clip(col, med * 0.99, med * 1.01)
             win = 1
         if j == 1 and angle_window > win:
             win = angle_window
@@ -474,6 +565,7 @@ def fit_wall_fill(
     wall_delta_e: float = 10.0,
     outer_feather_px: int = 0,
     min_samples: int = 300,
+    max_texture: float = 0.0,
 ) -> tuple[np.ndarray, dict, WallModelState]:
     """墙面种子 + ΔE 门限 + MAD 平面拟合的差集补洞（§20.3 + §22.3 修正版）。
 
@@ -487,7 +579,10 @@ def fit_wall_fill(
     5. 指标：fill_wall_delta_e_*（vs 墙面中位色）+ fill_boundary_delta_e_*
        （residual 外沿 vs 附近可信墙面样本，§22.3.3）；
     6. outer_feather_px>0 时按 §22.3.2 的距离衰减权重做外侧真融合；
-       Round E 固定为 0（只做 100% 替换）。
+       Round E 固定为 0（只做 100% 替换）；
+    7. max_texture>0 时计算样本区纹理能量（§30.8）：超阈**显式报错拒绝**——
+       平面模型只适用于纯色/缓变背景，窗帘/书架等复杂纹理必须改用
+       clean_plate/temporal_plate/视频修复，不允许静默生成平色补丁。
 
     返回 (clean_base, stats, state)；state 供下一帧 previous_state 链式复用。
     """
@@ -519,6 +614,24 @@ def fit_wall_fill(
     )
     stats["wall_seed_px"] = int(seed.sum())
     ring_valid_px = int(ring.sum())
+
+    if max_texture > 0 and samples is not None and int(samples.sum()) >= min_samples:
+        energy = wall_texture_energy(frame, samples)
+        stats["wall_texture_energy"] = round(energy, 3)
+        if energy > max_texture:
+            raise ValueError(
+                f"背景纹理能量 {energy:.1f} 超过 smooth_plane 上限 {max_texture}："
+                "平面墙模型拒绝复杂背景（窗帘/纹理墙），请改用 clean_plate/"
+                "temporal_plate/视频修复（§30.8），不得静默生成平色补丁"
+            )
+    elif max_texture > 0 and seed is not None and int(seed.sum()) >= 200:
+        energy = wall_texture_energy(frame, seed)
+        stats["wall_texture_energy"] = round(energy, 3)
+        if energy > max_texture:
+            raise ValueError(
+                f"背景纹理能量 {energy:.1f} 超过 smooth_plane 上限 {max_texture}："
+                "平面墙模型拒绝复杂背景（§30.8）"
+            )
 
     state: WallModelState | None = None
     sample_ys = sample_xs = None
@@ -721,10 +834,9 @@ def build_warped_head_layers(
 ) -> dict:
     """Round G 专用：head 与 neck collar 分层 warp（§22.7.2）。
 
-    - collar 的纵向 ramp 在 A 画布施加（§22 Q2-2 裁准），不会被
-      inner_feather_alpha 的 support 二值化截断；
-    - head 内距羽化用 epsilon support（§22.4），保留软尾部；
-    - B neck 缺失时 collar_src 为空，自动退化为纯 head（§20.6.5 回退）。
+    ⚠️ v4 起 deprecated 于默认路径：B neck collar 被 §24 人工复审否决
+    （矩形贴片/瘦脖接粗脖/随头独立移动）。仅供历史复现，v4 主路径
+    neck_collar_enabled 必须为 false，且与 a_neck_preserve_enabled 互斥。
     """
     head_trim = trim_hard_matte(head_mask_b, head_erode_px)
     head_src = head_trim.astype(np.float32) / 255.0
@@ -763,6 +875,687 @@ def build_warped_head_layers(
         "collar_bottom_y": collar_bottom_y,
         "transition_width": transition_width,
     }
+
+
+# ---------------------------------------------------------------- 第四轮（docs §24）
+
+def check_neck_mode(a_neck_preserve_enabled: bool, neck_collar_enabled: bool) -> None:
+    """§24.11：A 脖子保护与 B neck collar 互斥——两者同开会重新制造
+    独立运动的 neck 前景层。"""
+    if a_neck_preserve_enabled and neck_collar_enabled:
+        raise ValueError("a_neck_preserve_enabled 与 B neck_collar_enabled 不能同时开启")
+
+
+def extend_mask_upward(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """neck mask 只向上延展（§24.9 原样）：逐 dy 上移取并集，不改左右宽度。"""
+    src = (mask > 0).astype(np.uint8) * 255
+    out = src.copy()
+    for dy in range(1, max(0, int(pixels)) + 1):
+        shifted = np.zeros_like(src)
+        shifted[:-dy] = src[dy:]  # 将原 neck 支撑向上移动 dy
+        out = cv2.max(out, shifted)
+    return out
+
+
+def motion_safe_neck_union(
+    current_neck: np.ndarray,
+    previous_neck: np.ndarray | None,
+    prev_kps: np.ndarray | None,
+    cur_kps: np.ndarray | None,
+    upward_px: int = 3,
+) -> np.ndarray:
+    """A neck 时序安全保护（§24.9 原样）：当前帧 ∪ 运动补偿上一帧（双眼刚体
+    变换），close 后只向上延展 upward_px。不做二值 EMA（前缘漏保护根因同
+    §17.6.1）。宁可轻微多保护，不可被墙面补洞吃掉。"""
+    safe = (current_neck > 0).astype(np.uint8) * 255
+
+    if previous_neck is not None and prev_kps is not None and cur_kps is not None:
+        params = rigid_from_eyes(prev_kps, cur_kps)
+        if params is not None:
+            m = rebuild(*params)
+            warped_prev = cv2.warpAffine(
+                (previous_neck > 0).astype(np.uint8) * 255,
+                m,
+                (safe.shape[1], safe.shape[0]),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            safe = cv2.max(safe, warped_prev)
+
+    safe = cv2.morphologyEx(
+        safe,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    return extend_mask_upward(safe, upward_px)
+
+
+def region_aware_head_alpha(
+    warped_alpha: np.ndarray,
+    a_face_box: np.ndarray,
+    side_feather_px: float = 4.0,
+    jaw_feather_px: float = 8.0,
+    jaw_start_ratio: float = 0.68,
+    jaw_full_ratio: float = 0.82,
+    support_eps: float = 0.01,
+) -> tuple[np.ndarray, dict]:
+    """头发/脸侧与下颌使用不同羽化宽度的区域化 alpha（§24.12 原样）。
+
+    feather_map = side*(1-t) + jaw*t，t 为脸框内行位置的 smoothstep——
+    避免 jaw 区起点出现水平参数断层。边界仍由 B 真实 head mask 决定，
+    不生成矩形、不向 mask 外增加 B RGB。
+    """
+    wa = np.clip(warped_alpha.astype(np.float32), 0.0, 1.0)
+    support = (wa > support_eps).astype(np.uint8)
+    dist = cv2.distanceTransform(support, cv2.DIST_L2, 3)
+
+    _, by0, _, by1 = [float(v) for v in a_face_box]
+    bh = by1 - by0
+    y_start = by0 + jaw_start_ratio * bh
+    y_full = by0 + jaw_full_ratio * bh
+
+    yy = np.arange(wa.shape[0], dtype=np.float32)[:, None]
+    t = np.clip((yy - y_start) / max(y_full - y_start, 1.0), 0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t)
+
+    feather_map = side_feather_px * (1.0 - t) + jaw_feather_px * t
+    alpha = np.clip(dist / np.maximum(feather_map, 1e-6), 0.0, 1.0)
+    alpha = np.minimum(alpha, wa)
+    alpha[wa <= support_eps] = 0.0
+
+    return alpha, {
+        "jaw_start_y": float(y_start),
+        "jaw_full_y": float(y_full),
+        "side_feather_px": float(side_feather_px),
+        "jaw_feather_px": float(jaw_feather_px),
+    }
+
+
+def jaw_neck_gap_px(alpha_head: np.ndarray, a_neck_safe: np.ndarray, min_head_bottom_y: float | None = None):
+    """B 下颌与 A neck 正面缝合区的纵向间隙（§24.19：mean<1px，max<=2px）。
+
+    只统计：neck 中部 60% 列（正面咽喉区）且头底边降到下巴区
+    （last_true >= min_head_bottom_y，建议 by1-0.05bh）。脖子两侧列的
+    "间隙"是原片天然背景（下巴侧下方本来就是墙），不是接缝空隙。"""
+    neck_cols = a_neck_safe.any(axis=0)
+    if not neck_cols.any():
+        return None, None
+    xs = np.nonzero(neck_cols)[0]
+    neck_cx = 0.5 * (xs[0] + xs[-1])
+    half_w = 0.30 * (xs[-1] - xs[0])  # 中部 60%
+    neck_top = np.argmax(a_neck_safe, axis=0).astype(np.float32)  # 每列 neck 顶边
+    head_rows = alpha_head > 0.05
+    h = alpha_head.shape[0]
+    last_true = (h - 1 - np.argmax(head_rows[::-1], axis=0)).astype(np.float32)
+    cols = neck_cols & head_rows.any(axis=0)
+    cols &= np.abs(np.arange(len(cols)) - neck_cx) <= half_w
+    if min_head_bottom_y is not None:
+        cols &= last_true >= float(min_head_bottom_y)
+    if not cols.any():
+        return None, None
+    g = neck_top[cols] - last_true[cols]
+    g = g[g > 0]
+    if len(g) == 0:
+        return 0.0, 0.0
+    return float(g.mean()), float(g.max())
+
+
+def extend_neck_rgb_upward(frame_a: np.ndarray, neck_mask: np.ndarray, pixels: int = 3):
+    """§24.14 兜底 5：A neck 顶部纹理逐列向上延展（原 A 像素，非 B neck）。
+    仅当 jaw/neck 间隙 1~3px 且 §24.14 顺序前四步无效时使用，最多 3~4px。"""
+    out = frame_a.copy()
+    h, w = neck_mask.shape
+    ys, xs = np.nonzero(neck_mask > 0)
+    if len(xs) == 0:
+        return out
+    for x in np.unique(xs):
+        col_y = ys[xs == x]
+        top = int(col_y.min())
+        src_y = min(h - 1, top + 1)
+        y0 = max(0, top - pixels)
+        out[y0:top, x] = frame_a[src_y, x]
+    return out
+
+
+# ---------------------------------------------------------------- 第五轮（docs §26）
+
+def directional_dilate_down(mask: np.ndarray, down_px: int, side_px: int = 2) -> np.ndarray:
+    """只把 mask 向下扩展（§26.7 原样）；横向最多 side_px。
+
+    禁止向上扩、禁止矩形整带：越向下允许非常缓慢地向左右展开（rx 随 dy 线性
+    增长到 side_px），形成斜边而不是直柱。用于 B 下颌向下的解剖包络——
+    只约束"哪里允许保留 A neck 顶部"，不得拿它扩张 B RGB。
+    """
+    src = (mask > 0).astype(np.uint8)
+    out = src.copy()
+    down_px = max(0, int(down_px))
+    for dy in range(1, down_px + 1):
+        shifted = np.zeros_like(src)
+        shifted[dy:] = src[:-dy]
+        rx = int(round(side_px * dy / max(down_px, 1)))
+        if rx > 0:
+            shifted = cv2.dilate(
+                shifted,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rx + 1, 3)),
+            )
+        out = cv2.max(out, shifted)
+    return out > 0
+
+
+def _jaw_zone_mask(shape, face_box: np.ndarray, top_ratio: float = 0.70, bottom_ratio: float = 0.30) -> np.ndarray:
+    """下颌区行带（§26.7/26.8）：by0+0.70bh ~ by1+0.30bh。"""
+    h = shape[0]
+    bx0, by0, bx1, by1 = [float(v) for v in face_box]
+    bh = by1 - by0
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    return (yy >= by0 + top_ratio * bh) & (yy <= by1 + bottom_ratio * bh)
+
+
+def build_jaw_neck_junction(
+    alpha_head: np.ndarray,
+    a_neck_safe: np.ndarray,
+    old_head_safe: np.ndarray,
+    face_box: np.ndarray,
+    jaw_underlay_px: int = 10,
+    neck_taper_height_px: int = 16,
+    side_px: int = 2,
+) -> dict:
+    """下颌—脖子接合区构造（§26.8）：neck 顶部按 B 下颌包络塑形 + jaw underlay。
+
+    层级（§26.6）：B 头前景 / A 原视频 jaw-neck junction underlay（接缝 8~12px）/
+    A 原脖子·衣服·身体·背景 / 只清理前三层都不需要的旧头残差。
+
+    四个不变量（§26.8）：
+    1. jaw_underlay 只来自 A 原帧空间（本函数只出 mask，不改 RGB）；
+    2. jaw_underlay 只出现在下颌区、neck 上方有限距离、old_head_safe 内；
+    3. neck 中下段不裁，只有顶部带受 B jaw envelope 约束；
+    4. fill_protect 必须包含 neck_visible | jaw_underlay。
+    """
+    h, w = alpha_head.shape
+    bx0, by0, bx1, by1 = [float(v) for v in face_box]
+    bh = by1 - by0
+    yy = np.arange(h, dtype=np.float32)[:, None]
+
+    head_support = alpha_head > 0.02
+    head_core = alpha_head >= 0.995
+    jaw_zone = _jaw_zone_mask(alpha_head.shape, face_box)
+    jaw_soft = jaw_zone & head_support & (~head_core)
+
+    # B 下颌向下的解剖包络，只用于约束 A neck 顶部（不得扩张 B RGB）
+    envelope = directional_dilate_down(
+        head_support & jaw_zone,
+        down_px=neck_taper_height_px,
+        side_px=side_px,
+    ) & jaw_zone
+
+    neck = a_neck_safe.astype(bool)
+    ys = np.nonzero(neck)[0]
+    if len(ys) == 0:
+        return {
+            "neck_visible": neck,
+            "jaw_underlay": np.zeros_like(neck),
+            "fill_protect": neck,
+            "jaw_soft": jaw_soft,
+            "envelope": envelope,
+            "neck_top": None,
+            "top_band": np.zeros_like(neck),
+        }
+
+    # 用 5% 分位而不是单个最高噪点定义 neck 顶部
+    neck_top = int(np.percentile(ys, 5))
+    top_band = (yy >= neck_top) & (yy < neck_top + neck_taper_height_px)
+
+    # 顶部只保留位于 B 下颌向下包络内的 A neck；中下段完全保留（不变量 3）
+    neck_visible = (neck & (~top_band)) | (neck & top_band & envelope)
+
+    # 接缝底层：从已塑形 neck 向上寻找 jaw_underlay_px，但必须同时靠近 B 下颌
+    # 软边（head_near），且必须位于 A old_head_safe 内（不变量 2，不保护远处墙面）
+    neck_reach = extend_mask_upward(
+        neck_visible.astype(np.uint8) * 255, jaw_underlay_px
+    ) > 0
+    head_near = cv2.dilate(
+        head_support.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * side_px + 1, 2 * jaw_underlay_px + 1)
+        ),
+    ) > 0
+    jaw_underlay = jaw_zone & neck_reach & head_near & old_head_safe
+
+    # underlay 包含下颌 soft alpha 正下方的 A 原接合皮肤，禁止墙填充进入（不变量 4）
+    fill_protect = neck_visible | jaw_underlay
+    return {
+        "neck_visible": neck_visible,
+        "jaw_underlay": jaw_underlay,
+        "fill_protect": fill_protect,
+        "jaw_soft": jaw_soft,
+        "envelope": envelope,
+        "neck_top": neck_top,
+        "top_band": top_band,
+    }
+
+
+def head_above_covered(head_support: np.ndarray, check_px: int = 12) -> np.ndarray:
+    """每列上方 1~check_px 行内是否存在 B head 支撑（§26.11 指标 3 用）。
+
+    返回 bool 图：covered[y,x] = 存在 dy∈[1,check_px] 使 head_support[y-dy,x]。
+    """
+    covered = np.zeros_like(head_support, dtype=bool)
+    for dy in range(1, max(1, int(check_px)) + 1):
+        shifted = np.zeros_like(head_support, dtype=bool)
+        shifted[dy:] = head_support[:-dy]
+        covered |= shifted
+    return covered
+
+
+def orphan_neck_top_px(
+    neck_visible: np.ndarray,
+    head_support: np.ndarray,
+    neck_top: int | None,
+    neck_taper_height_px: int,
+    envelope: np.ndarray | None = None,
+    check_px: int = 12,
+) -> int:
+    """§26.11 指标 3：neck 顶部 taper 高度带内，不在 jaw 下包络内、且上方
+    1~12px 没有 B head 覆盖的 neck 像素数。目标 0。
+
+    必须覆盖左右列（禁止只测中部 60%）——正是 §26.5 指出旧 gap 指标漏掉
+    左右悬空脖子尖端的盲区。
+    """
+    if neck_top is None:
+        return 0
+    h = neck_visible.shape[0]
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    top_band = (yy >= neck_top) & (yy < neck_top + neck_taper_height_px)
+    cand = neck_visible & top_band
+    if envelope is not None:
+        cand = cand & (~envelope.astype(bool))
+    if not cand.any():
+        return 0
+    covered = head_above_covered(head_support, check_px=check_px)
+    return int((cand & (~covered)).sum())
+
+
+def junction_wall_component_max_px(
+    residual: np.ndarray,
+    neck_visible: np.ndarray,
+    head_core: np.ndarray,
+    jaw_zone: np.ndarray,
+    dilate_px: int = 12,
+) -> int:
+    """§26.11 指标 2：jaw_zone ∩ dilate(neck_visible) ∩ (~head_core) 内 residual
+    的最大连通域面积。目标 0（至少下颌中部与左右接合锚点附近为 0）。"""
+    region = jaw_zone & (~head_core)
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)
+        )
+        region = region & (cv2.dilate(neck_visible.astype(np.uint8), k) > 0)
+    else:
+        region = region & neck_visible.astype(bool)
+    target = (residual.astype(bool) & region).astype(np.uint8)
+    if not target.any():
+        return 0
+    count, _, stats, _ = cv2.connectedComponentsWithStats(target, connectivity=8)
+    if count <= 1:
+        return 0
+    return int(max(stats[i, cv2.CC_STAT_AREA] for i in range(1, count)))
+
+
+# ------------------------------------------------------- 第六轮（docs §28）
+
+def build_vertical_junction_bridge(
+    alpha_head: np.ndarray,
+    neck_visible: np.ndarray,
+    old_head_safe: np.ndarray,
+    jaw_zone: np.ndarray,
+    max_gap_px: int = 6,
+    alpha_eps: float = 0.02,
+) -> np.ndarray:
+    """逐列封闭 B 下颌底边与 A neck 顶边之间的 1~max_gap_px 窄缝（§28.3 原样）。
+
+    白横纹根因（§28.2）：mask 接近 ≠ mask 连通——neck_visible 与 jaw_underlay
+    任意一个的 1px 边界差异都会留下水平 residual 缝，被 fit_wall_fill 100% 写成
+    墙色。本函数只输出 A 原帧保护 mask；不扩 B RGB、不生成 B 脖子、
+    不跨越大面积真实背景（gap > max_gap_px 不填）。
+    """
+    h, w = alpha_head.shape
+    head = (alpha_head > alpha_eps) & jaw_zone
+    neck = neck_visible.astype(bool) & jaw_zone
+    bridge = np.zeros((h, w), np.uint8)
+
+    for x in range(w):
+        hy = np.flatnonzero(head[:, x])
+        ny = np.flatnonzero(neck[:, x])
+        if len(hy) == 0 or len(ny) == 0:
+            continue
+        head_bottom = int(hy[-1])
+        # 必须找 head_bottom 下面的第一个 neck，不能用整列最小值误接侧脸
+        below = ny[ny > head_bottom]
+        if len(below) == 0:
+            continue
+        neck_top = int(below[0])
+        gap = neck_top - head_bottom - 1
+        if 0 < gap <= max_gap_px:
+            bridge[head_bottom + 1 : neck_top, x] = 255
+
+    # 只保留原本属于 A 旧头安全区且位于 jaw_zone 的像素
+    return (bridge > 0) & old_head_safe & jaw_zone
+
+
+def build_junction_corridor(
+    alpha_head: np.ndarray,
+    neck_visible: np.ndarray,
+    old_head_safe: np.ndarray,
+    jaw_zone: np.ndarray,
+    kernel: tuple[int, int] = (9, 17),
+) -> np.ndarray:
+    """接合走廊（§28.4）：jaw_zone ∩ neck_near ∩ head_near ∩ old_head_safe。
+
+    neck_near/head_near 均为 (9,17) 椭圆膨胀——只有上下同时邻近 head 与 neck
+    的像素才算走廊。走廊内禁止任何 residual（墙色），这是比 §26.11 更严格的
+    硬闸门；不能扩大到整张脸侧，否则会把真实墙面错误保护成 A 旧脸。
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel)
+    neck_near = cv2.dilate(neck_visible.astype(np.uint8), k) > 0
+    head_near = cv2.dilate((alpha_head > 0.02).astype(np.uint8), k) > 0
+    return jaw_zone & neck_near & head_near & old_head_safe
+
+
+def corridor_close_fill_protect(
+    fill_protect: np.ndarray, corridor: np.ndarray, kernel: tuple[int, int] = (3, 5)
+) -> np.ndarray:
+    """走廊内 1px 分割孔洞保险（§28.4）：MORPH_CLOSE 只作用于 corridor。
+
+    核固定为 (3,5)/(3,7) 纵向椭圆核；禁止在全头 mask 上 close（会把发丝
+    边缘和真实背景一起粘进来）。
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel)
+    fp_u8 = (fill_protect > 0).astype(np.uint8) * 255
+    closed = cv2.morphologyEx(fp_u8, cv2.MORPH_CLOSE, k) > 0
+    return (fill_protect > 0) | (closed & corridor)
+
+
+def corridor_wall_like_px(
+    clean_base: np.ndarray,
+    frame_a: np.ndarray,
+    corridor: np.ndarray,
+    wall_lab: np.ndarray | None,
+    wall_de: float = 6.0,
+    skin_de: float = 10.0,
+) -> int:
+    """墙色保险检查（§28.4）：走廊内最终 clean_base 接近墙色、而 A 原帧同位置
+    本来接近 neck 肤色的像素数。目标 0——非零说明接缝又被写成墙，必须回到
+    mask 修复，禁止靠调色掩盖。"""
+    if wall_lab is None or not corridor.any():
+        return 0
+    cb_lab = cv2.cvtColor(clean_base, cv2.COLOR_BGR2LAB).astype(np.float32)
+    a_lab = cv2.cvtColor(frame_a, cv2.COLOR_BGR2LAB).astype(np.float32)
+    de_cb = np.linalg.norm(cb_lab - wall_lab[None, None, :], axis=2)
+    de_a = np.linalg.norm(a_lab - wall_lab[None, None, :], axis=2)
+    bad = corridor & (de_cb <= wall_de) & (de_a > skin_de)
+    return int(bad.sum())
+
+
+# ------------------------------------------------ 第七轮（docs §30）
+
+def build_required_skin_bridge(
+    alpha_head: np.ndarray,
+    neck_visible: np.ndarray,
+    raw_a_skin: np.ndarray,
+    face_box: np.ndarray,
+    max_vertical_gap: int = 14,
+    side_margin: int = 4,
+    no_cap: bool = False,
+) -> np.ndarray:
+    """B 下颌与 A neck 之间必须由 A 人体皮肤连续连接（§30.5 原样）。
+
+    生产不变量：凡位于 B 下颌底边和 A neck 顶边之间、且 A 原帧语义属于
+    face skin/neck 的像素，必须保留 A 原帧人体像素作为 underlay；不得进入
+    residual，不得调用 wall fill。只输出 raw skin 语义内的像素——不会把墙
+    错当皮肤，也不会恢复整张 A 旧脸。
+
+    no_cap=True（第七轮扩展）：gap 超过 max_vertical_gap 的列不整段连接，
+    但仍保留 span 内的 raw skin 像素——满足不变量的字面要求（两侧锚点外
+    的细长 skin 列片），不填任何非皮肤像素。
+    """
+    head = (alpha_head > 0.02).astype(bool)
+    neck = neck_visible.astype(bool)
+    skin = raw_a_skin.astype(bool)
+    required = np.zeros_like(neck)
+
+    neck_cols = np.flatnonzero(neck.any(axis=0))
+    if len(neck_cols) == 0:
+        return required
+    x0 = max(0, int(neck_cols[0]) - side_margin)
+    x1 = min(neck.shape[1], int(neck_cols[-1]) + side_margin + 1)
+
+    for x in range(x0, x1):
+        hy = np.flatnonzero(head[:, x])
+        ny = np.flatnonzero(neck[:, x])
+        if len(hy) == 0 or len(ny) == 0:
+            continue
+        hb = int(hy[-1])
+        below = ny[ny > hb]
+        if len(below) == 0:
+            continue
+        # 连接到颈部主体（最后一个连续段的起点）：§26 taper/envelope 裁剪可能在
+        # 列内部留下空洞（如 939..947 保留、953..968 被剪、969.. 主体），
+        # 洞内的 raw_skin 同样是 jaw→neck 之间的人体像素，不得因空洞漏保护。
+        if len(below) > 1:
+            breaks = np.flatnonzero(np.diff(below) > 1)
+            nt = int(below[breaks[-1] + 1]) if len(breaks) else int(below[0])
+        else:
+            nt = int(below[0])
+        gap = nt - hb - 1
+        if 0 <= gap <= max_vertical_gap or no_cap:
+            # +2px 上下重叠，避免量化/warp 后重新裂开；只保留 A 原帧人体语义
+            y0 = max(0, hb - 2)
+            y1 = min(neck.shape[0], nt + 3)
+            required[y0:y1, x] = skin[y0:y1, x]
+    return required
+
+
+def build_jaw_underlay_skin(
+    alpha_head: np.ndarray,
+    raw_a_skin: np.ndarray,
+    band_px: int = 20,
+) -> np.ndarray:
+    """head 支撑底部 band_px 行内的 raw skin 铺垫（§30.6 audit 第 1 部分语义）。
+
+    audit ROI 第 1 部分覆盖 head alpha 底部 20px 的**所有列**（含 neck 列之外
+    的下颌角两侧列）；这些列没有 neck，§30.5 的逐列 bridge 不处理，但 B 侧影
+    软边下方同样是 A 人体皮肤语义——按不变量保留 A 原帧，不给墙。
+    只取 head 支撑内部底带 ∩ raw skin，不扩大到支撑外。
+    """
+    if band_px <= 0:
+        return np.zeros(alpha_head.shape[:2], dtype=bool)
+    head = (alpha_head > 0.02)
+    required = np.zeros_like(head)
+    has_col = head.any(axis=0)
+    if not has_col.any():
+        return required
+    h = head.shape[0]
+    flipped = np.flip(head, axis=0)
+    bottom = h - 1 - np.argmax(flipped, axis=0)
+    for x in np.flatnonzero(has_col):
+        hb = int(bottom[x])
+        y0 = max(0, hb - band_px + 1)
+        required[y0 : hb + 1, x] = raw_a_skin[y0 : hb + 1, x]
+    return required
+
+
+def build_audit_seam_roi(
+    alpha_head: np.ndarray,
+    raw_neck: np.ndarray,
+    face_box: np.ndarray,
+    bottom_px: int = 20,
+    neck_band_px: int = 16,
+    lower_ratio: float = 0.35,
+) -> np.ndarray:
+    """独立验收 ROI（§30.6）：不得依赖任何 repair mask（corridor/bridge/
+    fill_protect），只读 alpha_head + raw_neck + face_box。
+
+    三部分并集：
+    1. B head alpha 每列底部 bottom_px 行；
+    2. A raw neck 每列顶部 ±neck_band_px；
+    3. 两者的逐列连接带 ∩ 脸框下 lower_ratio 区域。
+    为避免远处误检把 ROI 拉宽，第 2/3 部分限制在脸框 x±0.35bw、
+    y ∈ [by1-0.55bh, by1+0.65bh] 的几何窗内（纯几何，与 repair 无关）。
+    """
+    h, w = alpha_head.shape
+    head = (alpha_head > 0.02).astype(bool)
+    neck = raw_neck.astype(bool)
+    bx0, by0, bx1, by1 = [float(v) for v in face_box]
+    bw, bh = bx1 - bx0, by1 - by0
+    gx0 = max(0, int(bx0 - 0.35 * bw))
+    gx1 = min(w, int(bx1 + 0.35 * bw))
+    gy0 = max(0, int(by1 - 0.55 * bh))
+    gy1 = min(h, int(by1 + 0.65 * bh))
+    y_lower = int(by1 - lower_ratio * bh)
+
+    roi = np.zeros((h, w), dtype=bool)
+    for x in range(w):
+        hy = np.flatnonzero(head[:, x])
+        if len(hy):
+            hb = int(hy[-1])
+            roi[max(0, hb - bottom_px + 1) : hb + 1, x] = True
+        if gx0 <= x < gx1:
+            ny = np.flatnonzero(neck[gy0:gy1, x])
+            if len(ny):
+                nt = int(ny[0]) + gy0
+                roi[max(0, nt - neck_band_px) : nt + neck_band_px + 1, x] = True
+                if len(hy):
+                    lo, hi = min(hb, nt), max(hb, nt)
+                    y0 = max(lo, y_lower)
+                    if y0 <= hi:
+                        roi[y0 : hi + 1, x] = True
+    return roi
+
+
+def audit_seam_metrics(
+    clean_base: np.ndarray,
+    frame_a: np.ndarray,
+    audit_roi: np.ndarray,
+    raw_a_skin: np.ndarray,
+    wall_lab: np.ndarray | None,
+    change_de: int = 20,
+    wall_de: float = 8.0,
+    skin_de: float = 12.0,
+) -> dict:
+    """独立验收（§30.6）：只比较 clean_base 与 A 原帧 + raw skin 语义。
+
+    - changed_from_skin：A 原帧是皮肤但 clean_base 被改掉的像素（绝对失败）；
+    - wall_intrusion：clean_base 接近背景模型、A 原帧是皮肤的像素（绝对失败）；
+    - horizontal_wall_component_width：wall_intrusion 连通域的最大横向宽度。
+    目标三项全部 = 0。
+    """
+    diff = np.abs(clean_base.astype(np.int16) - frame_a.astype(np.int16)).max(axis=2)
+    changed = audit_roi & raw_a_skin.astype(bool) & (diff > change_de)
+
+    wall_like = np.zeros_like(changed)
+    if wall_lab is not None and (audit_roi & raw_a_skin.astype(bool)).any():
+        cb_lab = cv2.cvtColor(clean_base, cv2.COLOR_BGR2LAB).astype(np.float32)
+        a_lab = cv2.cvtColor(frame_a, cv2.COLOR_BGR2LAB).astype(np.float32)
+        de_cb = np.linalg.norm(cb_lab - wall_lab[None, None, :], axis=2)
+        de_a = np.linalg.norm(a_lab - wall_lab[None, None, :], axis=2)
+        wall_like = (
+            audit_roi & raw_a_skin.astype(bool) & (de_cb <= wall_de) & (de_a > skin_de)
+        )
+
+    width = 0
+    if wall_like.any():
+        count, _, stats, _ = cv2.connectedComponentsWithStats(
+            wall_like.astype(np.uint8), connectivity=8
+        )
+        if count > 1:
+            width = int(max(stats[i, cv2.CC_STAT_WIDTH] for i in range(1, count)))
+    return {
+        "audit_changed_from_skin": int(changed.sum()),
+        "audit_wall_intrusion": int(wall_like.sum()),
+        "audit_horizontal_wall_component_width": width,
+    }
+
+
+def wall_texture_energy(frame: np.ndarray, samples: np.ndarray) -> float:
+    """背景纹理能量（§30.8）：墙面样本区的 Laplacian RMS。
+
+    smooth_plane 只适用于纯色/缓变背景；窗帘/书架/条纹的纹理能量高，
+    必须显式拒绝，不允许静默生成平色补丁。
+    """
+    if not samples.any():
+        return 0.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    return float(np.sqrt((lap[samples] ** 2).mean()))
+
+
+def head_bottom_edge_dist(alpha_head: np.ndarray) -> np.ndarray:
+    """每列到 head 支撑底边的距离（§30.7）：底边处 0，向上增大；无 head 列为 -1。"""
+    h, w = alpha_head.shape
+    head = (alpha_head > 0.02)
+    edge = np.full((h, w), -1.0, dtype=np.float32)
+    has_col = head.any(axis=0)
+    if not has_col.any():
+        return edge
+    # 每列最后一个 True 的行号
+    flipped = np.flip(head, axis=0)
+    last = h - 1 - np.argmax(flipped, axis=0)
+    last = np.where(has_col, last, -1)
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    dist = last[None, :].astype(np.float32) - yy
+    edge[:, has_col] = dist[:, has_col]
+    return edge
+
+
+def jaw_luminance_gradient(
+    head_rgb: np.ndarray,
+    alpha_f: np.ndarray,
+    frame_a: np.ndarray,
+    ref_mask: np.ndarray,
+    face_box: np.ndarray,
+    strength: float,
+    band_px: int = 28,
+    max_delta_l: float = 30.0,
+    max_delta_ab: float = 10.0,
+    ema_state: dict | None = None,
+    ema: float = 0.9,
+) -> tuple[np.ndarray, dict]:
+    """下颌局部低频亮度渐变（§30.7 D3）：只改 B head_rgb，不改 A neck。
+
+    band = 下颌底边向上 band_px 内的 head 支撑；权重 smoothstep 从底边 1.0
+    衰减到带顶 0；delta = clamp(A 参考 − B band, L±30, ab±10)，逐帧 EMA。
+    """
+    if strength <= 0:
+        return head_rgb, ema_state or {}
+    edge = head_bottom_edge_dist(alpha_f)
+    band = (edge >= 0) & (edge <= band_px) & (alpha_f > 0.02)
+    src_band = band & (alpha_f > 0.5)
+    if not band.any() or not src_band.any() or not ref_mask.any():
+        return head_rgb, ema_state or {}
+
+    src_stats = lab_stats(np.clip(head_rgb, 0, 255).astype(np.uint8), src_band.astype(np.uint8))
+    dst_stats = lab_stats(frame_a, ref_mask.astype(np.uint8))
+    if src_stats is None or dst_stats is None:
+        return head_rgb, ema_state or {}
+    delta = np.clip(
+        np.asarray(dst_stats[0], dtype=np.float64) - np.asarray(src_stats[0], dtype=np.float64),
+        [-max_delta_l, -max_delta_ab, -max_delta_ab],
+        [max_delta_l, max_delta_ab, max_delta_ab],
+    )
+    if ema_state:
+        prev = np.asarray(ema_state.get("delta", delta), dtype=np.float64)
+        delta = ema * prev + (1.0 - ema) * delta
+
+    # smoothstep(28, 0, edge)：底边 1.0 → 带顶 0.0
+    t = np.clip(edge / max(float(band_px), 1e-6), 0.0, 1.0)
+    w = 1.0 - (t * t * (3.0 - 2.0 * t))
+
+    lab = cv2.cvtColor(np.clip(head_rgb, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    add = (w[..., None] * float(strength) * delta[None, None, :].astype(np.float32))
+    lab[band] = np.clip(lab[band] + add[band], 0, 255)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+    return out, {"delta": delta.tolist()}
 
 
 def motion_safe_union(
@@ -804,6 +1597,10 @@ def _ellipse_matrix(mask: np.ndarray) -> np.ndarray:
 
 
 def run_composite(args) -> int:
+    # §24.11：B neck collar 与 A 脖子保护互斥；保护模式必须有 necks 目录
+    check_neck_mode(bool(args.a_neck_preserve_enabled), bool(args.neck_collar_enabled))
+    if args.a_neck_preserve_enabled and (args.necks_dir is None or not Path(args.necks_dir).is_dir()):
+        raise RuntimeError("a_neck_preserve_enabled 需要 --necks-dir（先重跑 segment 生成 necks/）")
     meta = json.loads(Path(args.meta_json).read_text(encoding="utf-8"))
     frame_meta = meta["frame_meta"]
     total = meta["frames"]
@@ -866,19 +1663,35 @@ def run_composite(args) -> int:
     b_fallback = sum(1 for i in range(n_frames) if head_cache[i] is None)
 
     # ---------- raw 变换轨迹 ----------
+    # 诊断模式：把 B 每帧的稳定锚点对齐到 A 的一个固定参考位置。
+    # 这样会抵消 animated_head 自身的全局头动，只保留嘴型/表情；A 的 bbox、
+    # neck、skin 仍逐帧读取，所以只冻结 B 头，不冻结身体或脖子。
+    frozen_target_kps = None
+    if args.freeze_head_motion:
+        ref_n = min(max(1, int(args.freeze_reference_frames)), n_frames, len(frame_meta))
+        ref_stack = np.asarray(
+            [frame_meta[i]["kps"] for i in range(ref_n)], dtype=np.float32
+        )
+        frozen_target_kps = np.median(ref_stack, axis=0).astype(np.float32)
+
     raw_params: list[tuple[float, float, float, float]] = []
     for i in range(n_frames):
         fm = frame_meta[min(i, len(frame_meta) - 1)]
         kps_a = np.array(fm["kps"], dtype=np.float32)
+        target_kps = frozen_target_kps if frozen_target_kps is not None else kps_a
         src = resolved[i]
         if src is None:
             raw_params.append(raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0))
             continue
         if args.transform_mode == "eyes":
-            p = rigid_from_eyes(np.array(src["kps"], dtype=np.float32), kps_a)
+            p = rigid_from_eyes(np.array(src["kps"], dtype=np.float32), target_kps)
+            raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
+        elif args.transform_mode == "eyes_nose":
+            # §28.7 快速方案：眼睛+鼻尖（嘴点完全不进），滤波窗口配 5/7
+            p = rigid_from_eyes_nose(np.array(src["kps"], dtype=np.float32), target_kps)
             raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
         else:  # five_point（旧版对照）
-            m = similarity(np.array(src["kps"], dtype=np.float32), kps_a)
+            m = similarity(np.array(src["kps"], dtype=np.float32), target_kps)
             raw_params.append(decompose(m) if m is not None else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
 
     # ---------- 滤波 ----------
@@ -890,7 +1703,14 @@ def run_composite(args) -> int:
     else:
         filt_params = raw_params  # 在线模式在循环内用 SmoothedTransform
     online = SmoothedTransform(rot=args.rot_smooth, trans=args.trans_smooth, window=args.transform_window)
-    transforms_log = {"mode": f"{args.transform_mode}+{args.filter_mode}", "raw": raw_params, "filtered": filt_params}
+    transforms_log = {
+        "mode": f"{args.transform_mode}+{args.filter_mode}",
+        "freeze_head_motion": bool(args.freeze_head_motion),
+        "freeze_reference_frames": int(args.freeze_reference_frames),
+        "frozen_target_kps": None if frozen_target_kps is None else frozen_target_kps.tolist(),
+        "raw": raw_params,
+        "filtered": filt_params,
+    }
 
     # ---------- 遍数二：合成 ----------
     import imageio.v2 as imageio
@@ -915,6 +1735,30 @@ def run_composite(args) -> int:
         "fallback_sources": {},
         "collar_frames": 0, "collar_px_mean": 0, "collar_bottom_y_mean": None,
         "neck_color_skip": 0,
+        "a_neck_frames": 0, "a_neck_px_mean": 0, "a_neck_fail_frames": 0,
+        "alpha_neck_max": 0.0,
+        "jaw_neck_gap_px_mean": None, "jaw_neck_gap_px_max": None,
+        "neck_temporal_mad": None,
+        "jaw_color_skip": 0,
+        # 第五轮（§26.11）：下颌—脖子接合区新指标
+        "jaw_soft_wall_overlap_max": 0, "jaw_soft_wall_overlap_mean": None,
+        "junction_wall_component_max": 0,
+        "orphan_neck_top_max": 0,
+        "jaw_underlay_px_mean": None, "neck_visible_px_mean": None,
+        "jaw_underlay_frames": 0,
+        # 第六轮（§28.5）：白横纹封闭指标（目标全 0，bridge_px 允许非零）
+        "junction_bridge_px_mean": None,
+        "junction_corridor_residual_max": 0,
+        "junction_horizontal_component_max_width": 0,
+        "junction_wall_like_max": 0,
+        "junction_corridor_frames": 0,
+        # 第七轮（§30.6）：独立验收指标（不得依赖 repair mask；目标全 0）
+        "audit_changed_from_skin_max": 0,
+        "audit_wall_intrusion_max": 0,
+        "audit_horizontal_wall_component_width_max": 0,
+        "skin_bridge_px_mean": None,
+        "audit_frames": 0,
+        "jaw_gradient_skip": 0,
         "frame_range": [int(args.start_frame), None],
     }
     widths_sum = 0
@@ -924,8 +1768,28 @@ def run_composite(args) -> int:
     prev_head_mask_b = None
     prev_neck_mask_b = None
     prev_box_b = None
+    prev_neck_a = None
+    prev_a_neck_safe = None
     collar_px_sum = 0
     collar_bottom_sum = 0.0
+    a_neck_px_sum = 0
+    neck_mad_sum = 0.0
+    neck_mad_frames = 0
+    gap_mean_sum = 0.0
+    gap_max_overall = 0.0
+    gap_frames = 0
+    jaw_soft_overlap_sum = 0
+    jaw_underlay_px_sum = 0
+    neck_visible_px_sum = 0
+    junction_bridge_sum = 0
+    skin_bridge_sum = 0
+    jaw_grad_state: dict = {}
+    jaw_matcher = ColorMatcher(
+        strength=max(args.jaw_color_strength, 1e-6),
+        max_delta_l=args.max_delta_l,
+        max_delta_ab=args.max_delta_ab,
+        ema=args.color_ema,
+    )
     wall_state: WallModelState | None = None
     global_wall_state: WallModelState | None = None
     wall_rows: list[dict] = []
@@ -982,8 +1846,9 @@ def run_composite(args) -> int:
 
         alpha_neck = None
         collar_bottom_y = None
+        jaw_start_y = None
         if args.neck_collar_enabled:
-            # ---- Round G：分层 warp（§22.7.2），collar 纵向 ramp 在 A 画布施加 ----
+            # ---- Round G（v4 起 deprecated，仅历史复现）：分层 warp（§22.7.2） ----
             layers = build_warped_head_layers(
                 frame_b, box_b, mask_b, neck_b, m_final, (width, height),
                 head_erode_px=args.b_mask_erode_px,
@@ -1007,7 +1872,24 @@ def run_composite(args) -> int:
             head_trim = trim_hard_matte(mask_b, args.b_mask_erode_px)
             alpha_src = head_trim.astype(np.float32) / 255.0
             head_rgb, warped_alpha = warp_premultiplied(frame_b, alpha_src, m_final, (width, height))
-            if args.alpha_mode == "inner":
+            if args.alpha_mode == "region_aware":
+                # ---- Round H2（§24.12）：头发/脸侧 side px，下颌 jaw px，smoothstep 过渡 ----
+                alpha_f, jaw_diag = region_aware_head_alpha(
+                    warped_alpha, box_a,
+                    side_feather_px=args.head_side_feather_px,
+                    jaw_feather_px=args.jaw_feather_px,
+                    jaw_start_ratio=args.jaw_start_ratio,
+                    jaw_full_ratio=args.jaw_full_ratio,
+                )
+                jaw_start_y = jaw_diag["jaw_start_y"]
+                band = (alpha_f > 1e-3) & (alpha_f < 1.0 - 1e-3)
+                if band.any():
+                    contours, _ = cv2.findContours(
+                        (warped_alpha > 0.01).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+                    )
+                    perimeter = sum(cv2.arcLength(c, True) for c in contours)
+                    widths_sum += float(band.sum() / max(perimeter, 1.0))
+            elif args.alpha_mode == "inner":
                 alpha_f, twidth = inner_feather_alpha(warped_alpha, args.alpha_feather_px)
                 widths_sum += twidth
             else:  # blur（旧版对照：erode + 对称 GaussianBlur）
@@ -1033,21 +1915,122 @@ def run_composite(args) -> int:
                 cv2.MORPH_ELLIPSE, (args.safe_margin_px * 2 + 1, args.safe_margin_px * 2 + 1))
             old_head_safe = cv2.dilate(mask_a, k) > 0 if mask_a is not None else np.zeros((height, width), bool)
 
-        # ---- 差集补洞（§22.5.3：颜色参考与补洞保护彻底拆开）----
+        # ---- 差集补洞（颜色参考与补洞保护彻底拆开）----
         color_reference = (
             skins_a > 0 if skins_a is not None else np.zeros((height, width), dtype=bool)
         )
-        # Round G（§22.7.4）：collar 结束线以下才保护 A 脖子——与 collar_bottom 同源
-        neck_keep_y = (
-            collar_bottom_y if collar_bottom_y is not None else by1 + args.neck_keep_ratio * bh_a
-        )
-        fill_protect = build_fill_protect_mask(
-            frame_a=frame_a,
-            face_box=box_a,
-            skins_mask=skins_a,
-            neck_keep_y=neck_keep_y,
-            extra_masks=(),
-        ).astype(bool)
+        a_neck_safe = None
+        junction = None
+        junction_bridge = None
+        junction_corridor = None
+        jaw_zone = _jaw_zone_mask(alpha_f.shape, box_a)
+        if args.a_neck_preserve_enabled:
+            # ---- Round H1（§24.10.2）：按 class14 真实轮廓保护 A 原脖子，
+            #      不再用水平 neck_keep_y —— 这是 v3 脖子顶部被削平的根因 ----
+            neck_path = Path(args.necks_dir) / f"neck_{index:06d}.png"
+            neck_a = cv2.imread(str(neck_path), cv2.IMREAD_GRAYSCALE)
+            if neck_a is None:
+                diag["a_neck_fail_frames"] += 1
+                raise RuntimeError(f"A neck mask 缺失: {neck_path}")
+            a_neck_safe = motion_safe_neck_union(
+                neck_a, prev_neck_a, prev_kps_a, kps_a, upward_px=args.a_neck_upward_px
+            ) > 0
+            if prev_a_neck_safe is not None:
+                neck_mad_sum += float(
+                    np.mean(
+                        np.abs(a_neck_safe.astype(np.float32) - prev_a_neck_safe.astype(np.float32))
+                    )
+                )
+                neck_mad_frames += 1
+            prev_a_neck_safe = a_neck_safe
+            prev_neck_a = neck_a
+            diag["a_neck_frames"] += 1
+            a_neck_px_sum += int(a_neck_safe.sum())
+            if args.jaw_underlay_enabled:
+                # ---- 第五轮（§26.9）：jaw underlay + neck 顶部 taper 塑形。
+                #      fill_protect 不再是整块 a_neck_safe，而是
+                #      neck_visible | jaw_underlay —— B 下颌软边下面是 A 原接合
+                #      皮肤，不是白墙（§26.2 根因一的修复）。
+                junction = build_jaw_neck_junction(
+                    alpha_head=alpha_f,
+                    a_neck_safe=a_neck_safe,
+                    old_head_safe=old_head_safe,
+                    face_box=box_a,
+                    jaw_underlay_px=args.jaw_underlay_px,
+                    neck_taper_height_px=args.neck_taper_height_px,
+                    side_px=args.neck_taper_side_px,
+                )
+                fill_protect = junction["fill_protect"]
+                # ---- 第六轮（§28.3/28.4）：逐列封闭下颌—脖子窄缝 + 走廊硬闸门。
+                #      mask 接近 ≠ mask 连通：underlay/taper 的 1px 边界差异会留
+                #      下水平 residual 缝 → 墙色白横纹（§28.2 根因）。
+                junction_corridor = build_junction_corridor(
+                    alpha_f, junction["neck_visible"], old_head_safe, jaw_zone
+                )
+                fill_protect = corridor_close_fill_protect(fill_protect, junction_corridor)
+                if args.junction_bridge_max_gap_px > 0:
+                    junction_bridge = build_vertical_junction_bridge(
+                        alpha_f,
+                        junction["neck_visible"],
+                        old_head_safe,
+                        jaw_zone,
+                        max_gap_px=args.junction_bridge_max_gap_px,
+                    )
+                    fill_protect = fill_protect | junction_bridge
+                # §28.4 走廊完备化：走廊（上下同时邻近 head/neck ∩ 旧头安全区）内
+                # 非新头核心的像素一律保留 A 原帧——它们要么是接合组织的皮肤底层
+                # （正是 underlay 的目标），要么本来就是墙色（保留与墙填充视觉等价）。
+                # 这使 residual ∩ corridor ≡ ∅ 成为构造性不变量，不再依赖
+                # neck/underlay/bridge 三个 mask 的 1px 边界逐列对齐（§28.2 根因）。
+                fill_protect = fill_protect | (junction_corridor & (alpha_f < 0.995))
+            else:
+                fill_protect = a_neck_safe.copy()
+            # 手/证件/衣服 mask 接入点（§24.10.2 extra_masks）：暂无语义模型
+        else:
+            # 旧路径（v2/v3 复现）：水平线保护。Round G 时与 collar_bottom 同源。
+            neck_keep_y = (
+                collar_bottom_y if collar_bottom_y is not None else by1 + args.neck_keep_ratio * bh_a
+            )
+            fill_protect = build_fill_protect_mask(
+                frame_a=frame_a,
+                face_box=box_a,
+                skins_mask=skins_a,
+                neck_keep_y=neck_keep_y,
+                extra_masks=(),
+            ).astype(bool)
+
+        # ---- 第七轮（§30.5）：raw A skin + required skin bridge ----
+        required_skin_bridge = None
+        raw_skin_a = None
+        raw_neck_a = None
+        if args.raw_skins_dir is not None:
+            rs_path = Path(args.raw_skins_dir) / f"raw_skin_{index:06d}.png"
+            rn_path = Path(args.raw_necks_dir) / f"raw_neck_{index:06d}.png"
+            rs = cv2.imread(str(rs_path), cv2.IMREAD_GRAYSCALE)
+            rn = cv2.imread(str(rn_path), cv2.IMREAD_GRAYSCALE)
+            if rs is None or rn is None:
+                raise RuntimeError(f"raw skin/neck mask 缺失: {rs_path} / {rn_path}")
+            raw_skin_a = rs > 0
+            raw_neck_a = rn > 0
+            if junction is not None:
+                neck_vis_bridge = junction["neck_visible"]
+            elif a_neck_safe is not None:
+                neck_vis_bridge = a_neck_safe
+            else:
+                neck_vis_bridge = raw_neck_a
+            required_skin_bridge = build_required_skin_bridge(
+                alpha_f, neck_vis_bridge, raw_skin_a, box_a,
+                max_vertical_gap=args.skin_bridge_max_gap_px,
+                no_cap=bool(args.skin_bridge_no_cap),
+            )
+            # §30.6 第 1 部分语义：head 底带（含下颌角两侧无 neck 列）的
+            # raw skin 同样保留为 underlay，不给墙
+            jaw_underlay_skin = build_jaw_underlay_skin(
+                alpha_f, raw_skin_a, band_px=args.jaw_underlay_band_px
+            )
+            required_skin_bridge = required_skin_bridge | jaw_underlay_skin
+            # 生产不变量：接合区人体像素不得进入 residual、不得调用 wall fill
+            fill_protect = fill_protect | required_skin_bridge
 
         new_core = alpha_f >= 0.995
         residual = None
@@ -1064,6 +2047,7 @@ def run_composite(args) -> int:
                 ring_width=args.ring_width_px,
                 wall_delta_e=args.wall_delta_e,
                 outer_feather_px=args.fill_outer_feather_px,
+                max_texture=args.wall_max_texture,
             )
             if global_wall_state is None and wall_state.source == "current_frame":
                 global_wall_state = WallModelState(
@@ -1099,6 +2083,104 @@ def run_composite(args) -> int:
         )
         diag["residual_uncovered_max"] = max(diag["residual_uncovered_max"], uncovered)
 
+        # §30.5 硬保险：防止任何上游 mask 误差把接合人体像素写成背景。
+        # 不是伪造新脖子，而是恢复 A 原帧本来就存在的下颌/上颈人体像素；
+        # B 头仍通过 alpha 位于最前层。
+        if required_skin_bridge is not None and required_skin_bridge.any():
+            clean_base[required_skin_bridge] = frame_a[required_skin_bridge]
+
+        # ---- §30.6 独立验收：audit ROI 不读取任何 repair mask ----
+        audit_changed_dbg = None
+        if raw_skin_a is not None:
+            diag["audit_frames"] += 1
+            skin_bridge_sum += int(required_skin_bridge.sum())
+            audit_roi = build_audit_seam_roi(alpha_f, raw_neck_a, box_a)
+            audit_seed = wall_seed_mask(
+                frame_a.shape, box_a, old_head_safe | (fill_protect > 0)
+            )
+            audit_wall_lab = None
+            if int(audit_seed.sum()) >= 200:
+                _lab_seed = cv2.cvtColor(frame_a, cv2.COLOR_BGR2LAB).astype(np.float32)
+                audit_wall_lab = np.median(_lab_seed[audit_seed], axis=0)
+            am = audit_seam_metrics(clean_base, frame_a, audit_roi, raw_skin_a, audit_wall_lab)
+            diag["audit_changed_from_skin_max"] = max(
+                diag["audit_changed_from_skin_max"], am["audit_changed_from_skin"]
+            )
+            diag["audit_wall_intrusion_max"] = max(
+                diag["audit_wall_intrusion_max"], am["audit_wall_intrusion"]
+            )
+            diag["audit_horizontal_wall_component_width_max"] = max(
+                diag["audit_horizontal_wall_component_width_max"],
+                am["audit_horizontal_wall_component_width"],
+            )
+            if args.debug_dir and am["audit_changed_from_skin"] > 0:
+                diff_dbg = np.abs(clean_base.astype(np.int16) - frame_a.astype(np.int16)).max(axis=2)
+                audit_changed_dbg = audit_roi & raw_skin_a & (diff_dbg > 20)
+                vis = (0.4 * frame_a).astype(np.uint8)
+                vis[audit_roi] = (0, 255, 255)
+                vis[audit_changed_dbg] = (0, 0, 255)
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_audit_changed.png"), vis)
+
+        # ---- §26.11 接合区新指标（v4 路径也输出 jaw_soft&residual，供 I0 取证）----
+        # 指标 1：下颌 soft alpha 带内被清成墙的像素 —— 白线根因的直接度量，
+        # 目标每帧 0（§26.2：白线在 clean_base 中已存在时禁止归因于色彩迁移）
+        head_support_dbg = alpha_f > 0.02
+        jaw_zone_dbg = jaw_zone
+        jaw_soft_dbg = jaw_zone_dbg & head_support_dbg & (~new_core)
+        overlap_px = int((jaw_soft_dbg & residual).sum()) if residual is not None else 0
+        jaw_soft_overlap_sum += overlap_px
+        diag["jaw_soft_wall_overlap_max"] = max(diag["jaw_soft_wall_overlap_max"], overlap_px)
+        if junction is not None:
+            # 指标 2：接合区 residual 最大连通域（jaw_zone ∩ dilate(neck)∩~head_core）
+            # 指标 3：neck 顶部悬空像素（覆盖左右列，不限中部 60%）
+            jaw_underlay_px_sum += int(junction["jaw_underlay"].sum())
+            neck_visible_px_sum += int(junction["neck_visible"].sum())
+            diag["jaw_underlay_frames"] += 1
+            if residual is not None:
+                jwcm = junction_wall_component_max_px(
+                    residual, junction["neck_visible"], new_core, jaw_zone_dbg
+                )
+                diag["junction_wall_component_max"] = max(diag["junction_wall_component_max"], jwcm)
+            ontp = orphan_neck_top_px(
+                junction["neck_visible"], head_support_dbg, junction["neck_top"],
+                args.neck_taper_height_px, envelope=junction["envelope"],
+            )
+            diag["orphan_neck_top_max"] = max(diag["orphan_neck_top_max"], ontp)
+
+        # ---- §28.5 白横纹新指标：走廊内禁止任何墙色 residual / 墙色像素 ----
+        if junction_corridor is not None:
+            diag["junction_corridor_frames"] += 1
+            bridge_px = int(junction_bridge.sum()) if junction_bridge is not None else 0
+            junction_bridge_sum += bridge_px
+            corr_res = int((residual & junction_corridor).sum()) if residual is not None else 0
+            diag["junction_corridor_residual_max"] = max(
+                diag["junction_corridor_residual_max"], corr_res
+            )
+            if corr_res > 0:
+                comp_target = (residual & junction_corridor).astype(np.uint8)
+                comp_count, _, comp_stats, _ = cv2.connectedComponentsWithStats(
+                    comp_target, connectivity=8
+                )
+                comp_width = (
+                    int(max(comp_stats[i, cv2.CC_STAT_WIDTH] for i in range(1, comp_count)))
+                    if comp_count > 1 else 0
+                )
+                diag["junction_horizontal_component_max_width"] = max(
+                    diag["junction_horizontal_component_max_width"], comp_width
+                )
+            # 墙色保险：走廊内 clean_base 呈墙色而 A 原帧是肤色的像素（§28.4）
+            wall_seed = wall_seed_mask(
+                frame_a.shape, box_a, old_head_safe | (fill_protect > 0)
+            )
+            wall_lab_cur = None
+            if int(wall_seed.sum()) >= 200:
+                lab_seed = cv2.cvtColor(frame_a, cv2.COLOR_BGR2LAB).astype(np.float32)
+                wall_lab_cur = np.median(lab_seed[wall_seed], axis=0)
+            wall_like = corridor_wall_like_px(
+                clean_base, frame_a, junction_corridor, wall_lab_cur
+            )
+            diag["junction_wall_like_max"] = max(diag["junction_wall_like_max"], wall_like)
+
         # 色彩迁移（仅新头有效区；参考 mask 用 color_reference，禁止用 fill_protect）
         head_zone = alpha_f > 0.6
         matcher.feed(lab_stats(head_rgb.astype(np.uint8), head_zone), lab_stats(frame_a, color_reference))
@@ -1107,8 +2189,7 @@ def run_composite(args) -> int:
         if matcher.ready():
             head_rgb = matcher.apply(head_rgb.astype(np.uint8), head_zone).astype(np.float32)
 
-        # Round G（§22.7.5）：collar 弱局部颜色匹配——几何过闸后才启用
-        # （neck_color_strength=0 时跳过，即先出 nocolor 版）
+        # Round G（§22.7.5，v4 起 deprecated）：collar 弱局部颜色匹配——仅历史复现
         if (
             alpha_neck is not None
             and args.neck_color_strength > 0
@@ -1126,6 +2207,68 @@ def run_composite(args) -> int:
             else:
                 diag["neck_color_skip"] += 1
 
+        # Round H3（§24.13）：jaw 局部颜色匹配——只改 B 下颌带，不修改 A neck；
+        # 仅 H2 几何通过后启用（jaw_color_strength=0 时跳过）
+        if (
+            a_neck_safe is not None
+            and args.jaw_color_strength > 0
+            and jaw_start_y is not None
+        ):
+            yy_grid = np.arange(height, dtype=np.float32)[:, None]
+            jaw_zone = yy_grid >= jaw_start_y
+            src_jaw_band = jaw_zone & (alpha_f > 0.20) & (alpha_f < 0.95)
+            # A 上颈部参考：真实 neck mask 顶部带，不是水平全宽矩形（§24.13）
+            neck_top_band = a_neck_safe & ~(
+                cv2.erode(
+                    a_neck_safe.astype(np.uint8) * 255,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                )
+                > 0
+            )
+            if src_jaw_band.any() and neck_top_band.any():
+                jaw_matcher.feed(
+                    lab_stats(head_rgb.astype(np.uint8), src_jaw_band),
+                    lab_stats(frame_a, neck_top_band),
+                )
+                if jaw_matcher.ready():
+                    head_rgb = jaw_matcher.apply(
+                        head_rgb.astype(np.uint8), src_jaw_band
+                    ).astype(np.float32)
+                else:
+                    diag["jaw_color_skip"] += 1
+
+        # §24.19：B 下颌与 A neck 正面缝合区的纵向间隙（目标 mean<1px / max<=2px）
+        if a_neck_safe is not None:
+            g_mean, g_max = jaw_neck_gap_px(alpha_f, a_neck_safe, by1 - 0.05 * bh_a)
+            if g_mean is not None:
+                gap_mean_sum += g_mean
+                gap_max_overall = max(gap_max_overall, g_max)
+                gap_frames += 1
+
+        # ---- 第七轮 M3（§30.7 D3）：下颌局部低频亮度渐变 ----
+        # 只改 B head_rgb（smoothstep 从下颌底边向上衰减），不改 A neck；
+        # clean_base 几何审核未通过前禁止启用（strength 默认 0）。
+        if args.jaw_gradient_strength > 0 and required_skin_bridge is not None:
+            if a_neck_safe is not None:
+                neck_top_ref = a_neck_safe & ~(
+                    cv2.erode(
+                        a_neck_safe.astype(np.uint8) * 255,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                    )
+                    > 0
+                )
+                grad_ref = required_skin_bridge | neck_top_ref
+            else:
+                grad_ref = required_skin_bridge
+            head_rgb, jaw_grad_state = jaw_luminance_gradient(
+                head_rgb, alpha_f, frame_a, grad_ref, box_a,
+                strength=args.jaw_gradient_strength,
+                band_px=args.jaw_gradient_band_px,
+                ema_state=jaw_grad_state,
+            )
+        elif args.jaw_gradient_strength > 0:
+            diag["jaw_gradient_skip"] += 1
+
         out = np.clip(
             head_rgb * alpha_f[..., None] + clean_base.astype(np.float32) * (1.0 - alpha_f[..., None]),
             0, 255,
@@ -1133,41 +2276,128 @@ def run_composite(args) -> int:
         writer.append_data(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
         diag["frames"] += 1
 
-        # ---- 3×3 九格调试图 + 头部局部放大（§20.8 / §22.5.4）----
+        # ---- 3×3 九格调试图 + 头部局部放大（§24.17 v4 布局 / §22.5.4 v3 布局）----
         if args.debug_dir and index % args.debug_every == 0:
             def b3(g):
                 return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
-            wall_vis = np.zeros((height, width), np.uint8)
-            if seed_dbg is not None:
-                wall_vis[seed_dbg] = 255  # 墙面种子（白）
-            if samples_dbg is not None and samples_dbg.any():
-                wall_vis[samples_dbg] = 160  # 通过 ΔE 门限的墙面样本（灰）
             rp_vis = np.zeros((height, width), np.uint8)
             rp_vis[fill_protect] = 120  # 补洞保护区（灰）
             if residual is not None:
                 rp_vis[residual] = 255  # 补洞差集（白）
-            patch_vis = np.full_like(frame_a, 128)
-            if residual is not None and residual.any():
-                patch_vis[residual] = clean_base[residual]
-
-            grid = compose_debug_grid(
-                [
-                    frame_a, b3(_ellipse_matrix(old_head_safe)), b3(wall_vis),
-                    patch_vis, clean_base, np.clip(head_rgb, 0, 255).astype(np.uint8),
-                    b3((alpha_f * 255).astype(np.uint8)), b3(rp_vis), out,
-                ],
-                (width, height),
-            )
-            cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_grid.png"), grid)
             bw_a = bx1 - bx0
             cx0 = max(0, int(bx0 - 0.9 * bw_a))
             cx1 = min(width, int(bx1 + 0.9 * bw_a))
             cy0 = max(0, int(by0 - 1.2 * bh_a))
             cy1 = min(height, int(by1 + 0.6 * bh_a))
+
+            if junction is not None:
+                # ---- v5（§26.12）3×3 固定布局 + 4 倍 junction 放大图 ----
+                raw_neck_vis = neck_a if neck_a is not None else np.zeros((height, width), np.uint8)
+                # jaw_underlay/residual 面板：绿=underlay，灰=neck_visible，红=residual；
+                # 红色若穿过 B 下颌软边与 neck 之间，直接失败（§26.12）
+                ur_vis = np.zeros((height, width, 3), np.uint8)
+                ur_vis[junction["neck_visible"]] = (120, 120, 120)
+                ur_vis[junction["jaw_underlay"]] = (0, 255, 0)
+                if junction_bridge is not None:
+                    ur_vis[junction_bridge] = (255, 0, 0)   # 蓝 = 逐列 bridge（§28.5）
+                if residual is not None:
+                    ur_vis[residual] = (0, 0, 255)
+                # 第 9 格：clean_base 与 final 左右对照（各半宽）
+                half = (max(2, width // 6), height // 3)
+                two_up = np.hstack(
+                    [cv2.resize(clean_base, half), cv2.resize(out, half)]
+                )
+                grid = compose_debug_grid(
+                    [
+                        frame_a, b3(raw_neck_vis), b3(_ellipse_matrix(junction["neck_visible"])),
+                        np.clip(head_rgb, 0, 255).astype(np.uint8),
+                        b3((alpha_f * 255).astype(np.uint8)),
+                        b3(_ellipse_matrix(junction["envelope"])),
+                        b3(_ellipse_matrix(old_head_safe)), ur_vis, two_up,
+                    ],
+                    (width, height),
+                )
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_grid.png"), grid)
+                # 4 倍放大 junction 区（下颌—上颈）：frame 0 为本素材最差帧
+                jx0 = max(0, int(bx0 - 0.5 * bw_a))
+                jx1 = min(width, int(bx1 + 0.5 * bw_a))
+                jy0 = max(0, int(by0 + 0.45 * bh_a))
+                jy1 = min(height, int(by1 + 0.55 * bh_a))
+                zsize = (max(2, (jx1 - jx0) * 4), max(2, (jy1 - jy0) * 4))
+
+                def zoom4(img):
+                    return cv2.resize(np.ascontiguousarray(img), zsize, interpolation=cv2.INTER_NEAREST)
+
+                crop = (slice(jy0, jy1), slice(jx0, jx1))
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_junction_clean_base.png"), zoom4(clean_base[crop]))
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_junction_final.png"), zoom4(out[crop]))
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_junction_masks.png"), zoom4(ur_vis[crop]))
+                # §28.5：bridge 最近邻 8× 局部图（frame 0 为白横纹最差帧）
+                zsize8 = (max(2, (jx1 - jx0) * 8), max(2, (jy1 - jy0) * 8))
+                zoom8 = cv2.resize(np.ascontiguousarray(ur_vis[crop]), zsize8, interpolation=cv2.INTER_NEAREST)
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_junction_bridge8x.png"), zoom8)
+                js_vis = (0.4 * frame_a).astype(np.uint8)
+                js_vis[jaw_soft_dbg] = (0, 255, 255)  # 黄 = B 下颌软边
+                if residual is not None:
+                    js_vis[residual] = (0, 0, 255)    # 红 = 被清成墙的区域
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_jaw_soft_vs_residual.png"), zoom4(js_vis[crop]))
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_alpha_crop.png"), (alpha_f * 255).astype(np.uint8)[cy0:cy1, cx0:cx1])
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_a_neck.png"), raw_neck_vis[cy0:cy1, cx0:cx1])
+            elif args.a_neck_preserve_enabled:
+                # v4（§24.17）：禁止出现 B neck collar 面板；A raw/safe neck 必须在列
+                raw_neck_vis = neck_a if neck_a is not None else np.zeros((height, width), np.uint8)
+                safe_neck_vis = a_neck_safe.astype(np.uint8) * 255
+                grid = compose_debug_grid(
+                    [
+                        frame_a, b3(raw_neck_vis), b3(safe_neck_vis),
+                        b3(_ellipse_matrix(old_head_safe)), b3(rp_vis), clean_base,
+                        np.clip(head_rgb, 0, 255).astype(np.uint8),
+                        b3((alpha_f * 255).astype(np.uint8)), out,
+                    ],
+                    (width, height),
+                )
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_grid.png"), grid)
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_a_neck.png"), raw_neck_vis[cy0:cy1, cx0:cx1])
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_alpha_crop.png"), (alpha_f * 255).astype(np.uint8)[cy0:cy1, cx0:cx1])
+            else:
+                wall_vis = np.zeros((height, width), np.uint8)
+                if seed_dbg is not None:
+                    wall_vis[seed_dbg] = 255
+                if samples_dbg is not None and samples_dbg.any():
+                    wall_vis[samples_dbg] = 160
+                patch_vis = np.full_like(frame_a, 128)
+                if residual is not None and residual.any():
+                    patch_vis[residual] = clean_base[residual]
+                grid = compose_debug_grid(
+                    [
+                        frame_a, b3(_ellipse_matrix(old_head_safe)), b3(wall_vis),
+                        patch_vis, clean_base, np.clip(head_rgb, 0, 255).astype(np.uint8),
+                        b3((alpha_f * 255).astype(np.uint8)), b3(rp_vis), out,
+                    ],
+                    (width, height),
+                )
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_grid.png"), grid)
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_wall_samples.png"), wall_vis[cy0:cy1, cx0:cx1])
             cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_clean_base_crop.png"), clean_base[cy0:cy1, cx0:cx1])
             cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_final_crop.png"), out[cy0:cy1, cx0:cx1])
-            cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_wall_samples.png"), wall_vis[cy0:cy1, cx0:cx1])
+            # §30.6 五联独立验收图：A原帧 | raw_skin | clean_base | final | diff（3×）
+            if raw_skin_a is not None:
+                jw, jh = cx1 - cx0, cy1 - cy0
+                pw, ph = max(2, jw), max(2, jh)
+                diff_gray = np.abs(out.astype(np.int16) - frame_a.astype(np.int16)).max(axis=2)
+                diff_gray = np.clip(diff_gray * 3, 0, 255).astype(np.uint8)
+                panels = [
+                    frame_a[cy0:cy1, cx0:cx1],
+                    cv2.cvtColor(raw_skin_a[cy0:cy1, cx0:cx1].astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR),
+                    clean_base[cy0:cy1, cx0:cx1],
+                    out[cy0:cy1, cx0:cx1],
+                    cv2.applyColorMap(diff_gray[cy0:cy1, cx0:cx1], cv2.COLORMAP_JET),
+                ]
+                five = np.hstack(
+                    [cv2.resize(np.ascontiguousarray(p), (pw * 3, ph * 3), interpolation=cv2.INTER_NEAREST) for p in panels]
+                )
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_audit5.png"), five)
 
         prev_mask_a = mask_a
         prev_kps_a = kps_a
@@ -1182,6 +2412,23 @@ def run_composite(args) -> int:
     if diag["collar_frames"] > 0:
         diag["collar_px_mean"] = int(collar_px_sum / diag["collar_frames"])
         diag["collar_bottom_y_mean"] = round(collar_bottom_sum / diag["collar_frames"], 1)
+    if diag["a_neck_frames"] > 0:
+        diag["a_neck_px_mean"] = int(a_neck_px_sum / diag["a_neck_frames"])
+    if gap_frames > 0:
+        diag["jaw_neck_gap_px_mean"] = round(gap_mean_sum / gap_frames, 3)
+        diag["jaw_neck_gap_px_max"] = round(gap_max_overall, 3)
+    diag["jaw_soft_wall_overlap_mean"] = round(jaw_soft_overlap_sum / max(diag["frames"], 1), 3)
+    if diag["jaw_underlay_frames"] > 0:
+        diag["jaw_underlay_px_mean"] = int(jaw_underlay_px_sum / diag["jaw_underlay_frames"])
+        diag["neck_visible_px_mean"] = int(neck_visible_px_sum / diag["jaw_underlay_frames"])
+    if diag["junction_corridor_frames"] > 0:
+        diag["junction_bridge_px_mean"] = round(
+            junction_bridge_sum / diag["junction_corridor_frames"], 2
+        )
+    if diag["audit_frames"] > 0:
+        diag["skin_bridge_px_mean"] = int(skin_bridge_sum / diag["audit_frames"])
+    if neck_mad_frames > 0:
+        diag["neck_temporal_mad"] = round(neck_mad_sum / neck_mad_frames, 6)
     if wall_rows:
         de_means = [r["fill_wall_delta_e_mean"] for r in wall_rows if r.get("fill_wall_delta_e_mean") is not None]
         de_maxes = [r["fill_wall_delta_e_max"] for r in wall_rows if r.get("fill_wall_delta_e_max") is not None]
@@ -1222,22 +2469,36 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--det-size", type=int, default=640)
     ap.add_argument("--head-roi-ratio", type=float, default=2.4)
     ap.add_argument("--head-ema", type=float, default=0.5)
-    # 变换与滤波（§17.5）
-    ap.add_argument("--transform-mode", choices=["eyes", "five_point"], default="eyes")
+    # 变换与滤波（§17.5 / §28.7 / §28.10）
+    ap.add_argument("--transform-mode", choices=["eyes", "eyes_nose", "five_point"], default="eyes",
+                    help="eyes=v4/v5；eyes_nose=§28.7 K1/K2（嘴点完全不进）；five_point=旧版对照")
+    ap.add_argument(
+        "--freeze-head-motion", action="store_true",
+        help="诊断：把 B 每帧锚点对齐到 A 前若干帧的固定中位锚点，只保留嘴型/表情",
+    )
+    ap.add_argument(
+        "--freeze-reference-frames", type=int, default=30,
+        help="freeze-head-motion 使用的 A 参考帧数（逐点取中位数）",
+    )
     ap.add_argument("--filter-mode", choices=["offline", "online"], default="offline")
     ap.add_argument("--hampel-window", type=int, default=7)
     ap.add_argument("--filter-window", type=int, default=11)
-    ap.add_argument("--scale-mode", choices=["smooth", "const"], default="smooth")
+    ap.add_argument("--scale-mode", choices=["smooth", "const", "smooth_clamped"], default="smooth",
+                    help="smooth_clamped=§28.10 K2：smooth21 + 中位数±1% clamp")
     ap.add_argument("--angle-window", type=int, default=0, help="roll 强平滑窗口，0=同 filter_window")
     ap.add_argument("--transform-window", type=int, default=9, help="在线模式中位数窗口")
     ap.add_argument("--rot-smooth", type=float, default=0.8)
     ap.add_argument("--trans-smooth", type=float, default=0.8)
-    # alpha（§17.4 / §20.5.2）
-    ap.add_argument("--alpha-mode", choices=["inner", "blur"], default="inner")
+    # alpha（§17.4 / §20.5.2 / §24.12）
+    ap.add_argument("--alpha-mode", choices=["inner", "blur", "region_aware"], default="inner")
     ap.add_argument("--alpha-feather-px", type=float, default=6.0, help="内距羽化过渡宽 4~8px")
     ap.add_argument("--alpha-erode-px", type=int, default=4, help="仅 blur 对照模式")
     ap.add_argument("--b-mask-erode-px", type=int, default=0,
                     help="B 硬 mask 内缩去白色 matte（Round F=1；0=与 v2 一致）")
+    ap.add_argument("--head-side-feather-px", type=float, default=4.0, help="region_aware 头发/脸侧羽化")
+    ap.add_argument("--jaw-feather-px", type=float, default=8.0, help="region_aware 下颌羽化 6~10px")
+    ap.add_argument("--jaw-start-ratio", type=float, default=0.68)
+    ap.add_argument("--jaw-full-ratio", type=float, default=0.82)
     # 补洞（§17.3 / §20.3 / §22.3）
     ap.add_argument("--fill-mode", choices=["wall_residual", "residual", "plate"], default="wall_residual")
     ap.add_argument("--ring-width-px", type=int, default=30)
@@ -1252,12 +2513,52 @@ def build_argparser() -> argparse.ArgumentParser:
     # 旧头清理（§17.6）
     ap.add_argument("--mask-union", choices=["motion_safe", "current"], default="motion_safe")
     ap.add_argument("--safe-margin-px", type=int, default=8)
-    # 下颌—脖子（Round G，§20.6/§22.7）
-    ap.add_argument("--neck-collar-enabled", action="store_true")
+    # 下颌—脖子（Round G，§20.6/§22.7；v4 起 deprecated）
+    ap.add_argument("--neck-collar-enabled", action="store_true",
+                    help="⚠️ v4 已废弃（§24）：B neck collar 被人工否决，仅历史复现")
     ap.add_argument("--neck-collar-ratio", type=float, default=0.12, help="collar 高 = ratio×脸高（0.10~0.14）")
     ap.add_argument("--neck-collar-soft-px", type=float, default=14.0, help="下颌→A 脖子纵向过渡 10~18px")
     ap.add_argument("--neck-color-strength", type=float, default=0.0,
                     help="collar 弱局部颜色匹配强度；0=先出 nocolor 版（§22.7.5）")
+    # A 脖子保护（Round H，§24.10/§24.11）
+    ap.add_argument("--a-neck-preserve-enabled", action="store_true",
+                    help="按 class14 真实轮廓保留 A 原脖子（与 neck_collar 互斥）")
+    ap.add_argument("--necks-dir", type=Path, default=None, help="work/segment/necks（A neck masks）")
+    ap.add_argument("--a-neck-upward-px", type=int, default=3, help="neck 保护只向上延展 px（>6 须人工确认）")
+    ap.add_argument("--jaw-color-strength", type=float, default=0.0,
+                    help="H3：B 下颌带局部调色 0.15~0.20（几何过闸后才启用）")
+    # 下颌—脖子接合（第五轮，§26.10）
+    ap.add_argument("--jaw-underlay-enabled", action="store_true",
+                    help="§26.9：A jaw/neck junction underlay + neck 顶部 taper 塑形"
+                         "（v5 主路径；关闭则完全回退 v4 行为）")
+    ap.add_argument("--jaw-underlay-px", type=int, default=10,
+                    help="A 接合皮肤向上保留距离 8~12（小了仍白裂，大了可能露 A 双下巴）")
+    ap.add_argument("--neck-taper-height-px", type=int, default=16,
+                    help="A neck 顶部从 B 下颌宽过渡到 A 原宽的高度 12~20；0=不 taper（I1 隔离变量）")
+    ap.add_argument("--neck-taper-side-px", type=int, default=2,
+                    help="下颌包络左右扩展 1~4（过大重现脖子侧尖，过小脖子太细）")
+    # 白横纹封闭（第六轮，§28.3/28.5）
+    ap.add_argument("--junction-bridge-max-gap-px", type=int, default=6,
+                    help="逐列封闭下颌—脖子窄缝的最大 gap 4/6/8；0=关闭 bridge；"
+                         ">8 必须人工确认（大间隙可能是真背景）")
+    # 人体接合桥 + 独立验收（第七轮，§30.5/30.6）
+    ap.add_argument("--raw-skins-dir", type=Path, default=None,
+                    help="work/segment/raw_skins（class1∪14 不减 head_pad）；提供后启用 skin bridge + audit")
+    ap.add_argument("--raw-necks-dir", type=Path, default=None,
+                    help="work/segment/raw_necks（class14 无组件过滤）；audit ROI 独立取 neck 顶部")
+    ap.add_argument("--skin-bridge-max-gap-px", type=int, default=14,
+                    help="§30.5 逐列 skin bridge 的最大垂向 gap 8/12/14")
+    ap.add_argument("--skin-bridge-no-cap", action="store_true",
+                    help="gap 超限列仍保留 span 内 raw skin 像素（不变量字面；锚点外侧细 skin 列片）")
+    ap.add_argument("--jaw-underlay-band-px", type=int, default=20,
+                    help="§30.6 第 1 部分语义：head 底带内 raw skin 铺垫宽度；0=关闭")
+    ap.add_argument("--wall-max-texture", type=float, default=0.0,
+                    help="§30.8 smooth_plane 纹理能量上限（Laplacian RMS）；>0 启用，超阈显式报错拒绝")
+    # 下颌局部亮度渐变（第七轮 M3，§30.7）
+    ap.add_argument("--jaw-gradient-strength", type=float, default=0.0,
+                    help="D3：B 下颌底带低频 LAB 向 A 接合皮肤匹配强度 0.5/0.75/1.0；0=关")
+    ap.add_argument("--jaw-gradient-band-px", type=int, default=28,
+                    help="下颌亮度渐变带宽 20~32px")
     # 几何微调
     ap.add_argument("--scale-bias", type=float, default=1.0)
     ap.add_argument("--x-offset", type=float, default=0.0)

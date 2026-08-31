@@ -560,3 +560,815 @@ def test_build_warped_head_layers_returns_consistent_bottom():
     )
     assert layers2["alpha_neck"].max() == 0.0
     npt.assert_array_equal(layers2["alpha_final"], layers2["alpha_head"])
+
+
+# ---------------- 第四轮 Round H（docs §24.18） ----------------
+
+from headswap.composite_head import (
+    check_neck_mode,
+    extend_mask_upward,
+    jaw_neck_gap_px,
+    motion_safe_neck_union,
+    region_aware_head_alpha,
+)
+from headswap.segment_head import filter_a_neck_near_primary_face
+
+
+def _a_canvas_labels():
+    """A 侧 ROI 场景：脸 + 单连通 V 形顶部脖子 + 远处 cloth。
+    脖子必须在 filter_a_neck 窗口内（by1=85, bh=50 → y ∈ [81, 107]）。"""
+    labels = np.zeros((160, 160), np.uint8)
+    labels[40:80, 50:110] = 1    # 脸 skin
+    labels[15:45, 40:120] = 17   # hair
+    # neck：单连通、顶边 V 形（x=80 顶 84，向两侧降到 ~98/94）
+    for x in range(52, 108):
+        top = int(84 + abs(x - 80) * 0.5)
+        labels[top:130, x] = 14
+    labels[155:160, :] = 16      # cloth（必须剔除）
+    return labels
+
+
+def test_segment_old_api_matches_v3_reference():
+    # §24.18-1：segment() 旧 API 的 head/skins 与 v3 实现逐像素一致
+    labels = _a_canvas_labels()
+    box = np.array([45, 35, 115, 85], np.float32)
+    frame = np.zeros((160, 160, 3), np.uint8)
+    seg = HeadSegmenter(_StubParser(labels), roi_ratio=2.6, dilate_px=8, erode_px=0, temporal_ema=0.0)
+    head_new, skins_new = seg.segment(frame, box)
+
+    # v3 参考实现（重构前 segment() 逐行复刻）
+    from headswap.segment_head import square_roi
+    h, w = frame.shape[:2]
+    x0, y0, size = square_roi(frame.shape, box, 2.6)
+    head_roi = np.isin(labels, HEAD_CLASSES).astype(np.uint8) * 255
+    head_roi = filter_components(head_roi, box - np.array([x0, y0, x0, y0], dtype=np.float32))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    head_roi = cv2.morphologyEx(head_roi, cv2.MORPH_CLOSE, k, iterations=1)
+    head_roi = cv2.morphologyEx(head_roi, cv2.MORPH_OPEN, k, iterations=1)
+    kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    head_roi = cv2.dilate(head_roi, kd)
+    ref_mask = np.zeros((h, w), np.uint8)
+    ref_mask[y0 : y0 + size, x0 : x0 + size] = head_roi
+    assert (head_new == ref_mask).all()
+    assert skins_new.shape == (160, 160) and (skins_new > 0).any()
+
+
+def test_segment_parts_returns_raw_neck_not_head_padded():
+    # §24.18-2/3/4：neck 为独立 class14 轮廓——不减 head_pad、无 cloth、顶部形状来自 class14
+    labels = _a_canvas_labels()
+    box = np.array([45, 35, 115, 85], np.float32)
+    frame = np.zeros((160, 160, 3), np.uint8)
+    seg = HeadSegmenter(_StubParser(labels), roi_ratio=2.6, dilate_px=8, erode_px=0, temporal_ema=0.0)
+    head, skins, neck = seg.segment_parts(frame, box)
+
+    assert neck.shape == (160, 160)
+    assert neck[100, 80] > 0                     # 窗口内脖子主体保留（未减 head_pad）
+    assert neck[157, 80] == 0                    # cloth 类 16 不进 neck
+    # 顶部形状来自 class14（V 形），不是水平线：三列的顶边 y 各不相同
+    tops = {int(x): int(np.argmax(neck[:, x] > 0)) for x in (56, 80, 100)}
+    assert tops[80] < tops[56] and tops[80] < tops[100]
+    assert len(set(tops.values())) == 3
+
+
+def test_filter_a_neck_picks_center_component():
+    labels = np.zeros((160, 160), np.uint8)
+    labels[86:107, 60:100] = 14                  # 主脖子（窗口内，脸正下方）
+    labels[130:150, 140:158] = 14                # 远处误检脖子（窗口 x/y 之外）
+    box = np.array([45, 35, 115, 85], np.float32)
+    neck = filter_a_neck_near_primary_face((labels == 14).astype(np.uint8) * 255, box)
+    assert neck[95, 80] > 0                      # 保留主脖子
+    assert neck[:, 140:].max() == 0              # 剔除远处误检
+    assert neck[120:, :].max() == 0              # 窗口以下不含（y1=107 截断）
+
+
+def test_motion_safe_neck_union_covers_leading_edge():
+    # §24.18-6：neck 随头右移时，运动补偿并集不漏前缘
+    prev = np.zeros((100, 100), np.uint8)
+    prev[60:90, 30:70] = 255
+    cur = np.zeros((100, 100), np.uint8)
+    cur[60:90, 35:75] = 255
+    prev_kps = np.array([[30.0, 50.0], [50.0, 50.0]], np.float32)
+    cur_kps = np.array([[35.0, 50.0], [55.0, 50.0]], np.float32)
+    safe = motion_safe_neck_union(cur, prev, prev_kps, cur_kps, upward_px=0) > 0
+    assert safe[60:90, 70:75].all()              # 前缘被覆盖
+    assert safe[60:90, 35:75].all()              # 当前帧本体在保护内
+
+
+def test_extend_mask_upward_only_grows_upward():
+    # §24.18-7：只向上延展，不扩左右
+    mask = np.zeros((100, 100), np.uint8)
+    mask[50:100, 40:60] = 255
+    out = extend_mask_upward(mask, 3)
+    assert (out[47:50, 40:60] == 255).all()      # 上移 3px 支撑
+    assert out[:47].max() == 0
+    assert out[:, :40].max() == 0 and out[:, 60:].max() == 0  # 左右宽度不变
+
+
+def test_check_neck_mode_mutual_exclusion():
+    # §24.18-9：A 脖子保护与 B collar 互斥
+    check_neck_mode(True, False)
+    check_neck_mode(False, True)
+    check_neck_mode(False, False)
+    with pytest.raises(ValueError, match="不能同时开启"):
+        check_neck_mode(True, True)
+
+
+def test_residual_never_covers_preserved_neck():
+    # §24.18-8：fill_protect 含 A neck 时 residual 不得覆盖 neck（§24.10.2 表达式锁定）
+    old_head_safe = np.zeros((80, 80), bool)
+    old_head_safe[20:60, 20:60] = True
+    alpha = np.zeros((80, 80), np.float32)
+    alpha[20:50, 20:60] = 1.0                    # 新头核心只到 y=50
+    a_neck = np.zeros((80, 80), bool)
+    a_neck[52:70, 30:50] = True                  # 脖子在头下方
+    new_core = alpha >= 0.995
+    fill_protect = a_neck.copy()
+    residual = old_head_safe & (~new_core) & (~fill_protect)
+    assert not (residual & a_neck).any()         # neck 绝不进补洞差集
+    assert residual[50:52, 20:60].all()          # neck 之外的旧头区域正常清理
+
+
+def test_region_aware_alpha_side_vs_jaw_feather():
+    # §24.18-11：侧脸 4px、下颌 8px；support 外严格 0（§24.18-13）
+    wa = np.zeros((160, 160), np.float32)
+    wa[40:140, 50:150] = 1.0
+    a_box = np.array([50, 30, 150, 130], np.float32)  # jaw_start=98, jaw_full=112
+    support = (wa > 0.01).astype(np.uint8)
+    dist = cv2.distanceTransform(support, cv2.DIST_L2, 3)  # 3x3 mask 为亚像素近似
+    alpha, diag = region_aware_head_alpha(
+        wa, a_box, side_feather_px=4.0, jaw_feather_px=8.0,
+        jaw_start_ratio=0.68, jaw_full_ratio=0.82,
+    )
+    assert diag["jaw_start_y"] == pytest.approx(98.0) and diag["jaw_full_y"] == pytest.approx(112.0)
+    assert alpha[100, 100] == 1.0                # 内部满 alpha
+    assert alpha[wa <= 0.01].max() == 0.0        # mask 外严格 0
+    # 侧脸区（row 70，feather=4）：alpha = dist/4
+    assert alpha[70, 52] == pytest.approx(float(dist[70, 52]) / 4.0, abs=0.02)
+    # jaw 区（row ≥112，feather=8）：alpha = dist/8
+    assert alpha[139, 100] == pytest.approx(float(dist[139, 100]) / 8.0, abs=0.02)
+    # 同等边界距离下，侧脸羽化（窄）比 jaw（宽）更不透明
+    assert alpha[70, 52] > alpha[139, 100]
+
+
+def test_region_aware_feather_smoothstep_no_horizontal_jump():
+    # §24.18-12：feather_map 从侧脸到 jaw 用 smoothstep，相邻行无水平突变
+    wa = np.zeros((120, 80), np.float32)
+    wa[0:100, :] = 1.0                           # 半平面：每行到下缘距离恒定
+    a_box = np.array([0, 0, 80, 100], np.float32)  # jaw_start=68, jaw_full=82
+    alpha, _ = region_aware_head_alpha(
+        wa, a_box, side_feather_px=4.0, jaw_feather_px=8.0,
+        jaw_start_ratio=0.68, jaw_full_ratio=0.82,
+    )
+    col = alpha[:, 40]
+    diffs = np.abs(np.diff(col[60:99]))
+    # smoothstep 下相邻行变化 ≤0.12（硬切换会在 jaw_start 处产生 ~0.2+ 的断层）
+    assert diffs.max() < 0.15
+
+
+def test_jaw_neck_gap_metric():
+    # §24.19 度量语义：正间隙计入、重叠为 0、无 neck 返回 None
+    alpha = np.zeros((200, 200), np.float32)
+    alpha[40:100, 50:150] = 1.0
+    neck_gap = np.zeros((200, 200), bool)
+    neck_gap[110:160, 50:150] = True
+    g_mean, g_max = jaw_neck_gap_px(alpha, neck_gap)
+    assert g_mean == pytest.approx(11.0) and g_max == pytest.approx(11.0)  # 头底边 99，neck 顶 110
+    neck_touch = np.zeros((200, 200), bool)
+    neck_touch[95:160, 50:150] = True            # 与 jaw 重叠
+    g_mean2, g_max2 = jaw_neck_gap_px(alpha, neck_touch)
+    assert g_mean2 == 0.0 and g_max2 == 0.0
+    assert jaw_neck_gap_px(alpha, np.zeros((200, 200), bool))[0] is None
+
+
+def test_v4_configs_outputs_do_not_overlap():
+    # §24.18-16：H1/H2/H3 三份配置产物互不覆盖；v4 默认路径禁 collar（§24.11）
+    root = _Path(__file__).resolve().parents[1] / "config"
+    names = ["headswap.hs-p1-0004.yaml", "headswap.hs-p1-0004-jaw-blend.yaml", "headswap.hs-p1-0004-jaw-color.yaml"]
+    files = [root / n for n in names]
+    if not all(p.is_file() for p in files):
+        pytest.skip("hs-p1-0004 三份配置尚未全部创建")
+    finals, silents = set(), set()
+    for p in files:
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
+        comp = cfg["composite"]
+        assert comp.get("a_neck_preserve_enabled") is True
+        assert comp.get("neck_collar_enabled") in (False, None)
+        assert comp.get("neck_color_strength", 0.0) == 0.0 or "jaw-color" in p.name
+        finals.add(cfg["video"]["final_name"])
+        silents.add(comp["silent_name"])
+    assert len(finals) == 3 and len(silents) == 3
+
+
+# ---------------- 第五轮 Round I（docs §26.13） ----------------
+
+from headswap.composite_head import (
+    build_jaw_neck_junction,
+    directional_dilate_down,
+    junction_wall_component_max_px,
+    orphan_neck_top_px,
+)
+
+
+def _junction_scene(size=200):
+    """§26 合成场景：B 头（窄）+ A 脖子（宽）+ 下颌软边带 + 旧头安全区。
+
+    face_box=[55,40,145,140]（bh=100）→ jaw_zone 行 [110,170]。
+    B alpha：核心行 40..138，行 139..146 为 8px 下颌软边（0.95→0.03 线性）。
+    A neck：行 144..190、列 50..150（比 B 头支撑列 58..141 宽 → 左右有尖端）。
+    old_head_safe：行 40..160、列 40..160 的旧头大块（含下颌与上颈）。
+    """
+    face_box = np.array([55, 40, 145, 140], np.float32)
+    alpha = np.zeros((size, size), np.float32)
+    alpha[40:139, 58:142] = 1.0
+    ramp = np.linspace(0.95, 0.03, 8, dtype=np.float32)
+    for i, v in enumerate(ramp):
+        alpha[139 + i, 58:142] = v
+    neck = np.zeros((size, size), bool)
+    neck[144:190, 50:150] = True
+    old_head_safe = np.zeros((size, size), bool)
+    old_head_safe[40:160, 40:160] = True
+    return alpha, neck, old_head_safe, face_box
+
+
+def test_directional_dilate_down_never_grows_upward():
+    # §26.13-1：只向下扩，上方行严格保持为 0
+    mask = np.zeros((120, 120), np.uint8)
+    mask[60:65, 50:70] = 255
+    out = directional_dilate_down(mask, down_px=8, side_px=2)
+    assert out[:60].max() == False or not out[:60].any()
+    assert out[60:73].any()               # 向下扩展生效
+    assert out[80:].max() == False or not out[80:].any()  # 不超过 down_px（含核高 3）
+
+
+def test_directional_dilate_down_side_growth_bounded():
+    # §26.13-2：横向扩张不超过 side_px
+    mask = np.zeros((120, 120), np.uint8)
+    mask[60:65, 50:70] = 255
+    out = directional_dilate_down(mask, down_px=8, side_px=2)
+    xs = np.nonzero(out.any(axis=0))[0]
+    assert xs.min() >= 50 - 2 and xs.max() <= 70 + 2
+    # 顶行（dy=0）宽度不变
+    assert out[60, 45:50].any() == False and out[60, 70:75].any() == False
+
+
+def test_junction_neck_midlow_identical_to_original():
+    # §26.13-3：neck 中下段（top_band 以下）逐像素保持原 mask
+    alpha, neck, old_safe, box = _junction_scene()
+    j = build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=10, neck_taper_height_px=16, side_px=2)
+    neck_top = j["neck_top"]
+    below = np.zeros_like(neck)
+    below[neck_top + 16:, :] = True
+    npt.assert_array_equal(j["neck_visible"][below], neck[below])
+
+
+def test_junction_taper_removes_orphan_side_tips():
+    # §26.13-4：neck 顶部左右悬空尖端（B 下颌包络外）被去掉，中部保留
+    alpha, neck, old_safe, box = _junction_scene()
+    j = build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=10, neck_taper_height_px=16, side_px=2)
+    top_band_rows = slice(j["neck_top"], j["neck_top"] + 16)
+    nv = j["neck_visible"]
+    assert nv[top_band_rows, 50:56].any() == False   # 左尖端（envelope 列外）
+    assert nv[top_band_rows, 145:150].any() == False # 右尖端
+    assert nv[top_band_rows, 70:130].all()           # 中部（下颌正下方）保留
+    # 塑形是斜向过渡：顶部窄、向下放宽（左右边缘逐行外扩）
+    mid_rows = slice(j["neck_top"] + 18, j["neck_top"] + 30)  # top_band 以下已全宽
+    assert nv[mid_rows, 50:150].all()
+
+
+def test_junction_legitimate_area_protected_by_underlay():
+    # §26.13-5：B 下颌软边正下方的 A 接合皮肤进入 jaw_underlay
+    alpha, neck, old_safe, box = _junction_scene()
+    j = build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=10, neck_taper_height_px=16, side_px=2)
+    under = j["jaw_underlay"]
+    assert under.any()
+    head_support = alpha > 0.02
+    jaw_zone = (np.arange(200)[:, None] >= 110) & (np.arange(200)[:, None] <= 170)
+    jaw_soft = jaw_zone & head_support & ~(alpha >= 0.995)
+    # 下颌软边 ∩ 旧头安全区 必须被 underlay ∪ neck_visible 完全接住（→ §26.13-7）
+    protected = j["fill_protect"]
+    assert not (jaw_soft & old_safe & ~protected).any()
+
+
+def test_junction_far_old_face_excluded_from_underlay():
+    # §26.13-6：远离 B 下颌的 A 旧脸（下颌区左侧远处）不进 underlay
+    alpha, neck, old_safe, box = _junction_scene()
+    j = build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=10, neck_taper_height_px=16, side_px=2)
+    under = j["jaw_underlay"]
+    assert under[112:126, 8:36].sum() == 0     # 旧脸远离 head_near
+    assert under[:110, :].sum() == 0           # jaw_zone 外严格没有 underlay
+
+
+def test_junction_residual_never_covers_jaw_soft():
+    # §26.13-7：主路径表达式下 jaw_soft & residual == 0（接合范围内无墙）
+    alpha, neck, old_safe, box = _junction_scene()
+    j = build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=10, neck_taper_height_px=16, side_px=2)
+    new_core = alpha >= 0.995
+    residual = old_safe & (~new_core) & (~j["fill_protect"])
+    jaw_zone = (np.arange(200)[:, None] >= 110) & (np.arange(200)[:, None] <= 170)
+    jaw_soft = jaw_zone & (alpha > 0.02) & (~new_core)
+    assert int((jaw_soft & residual).sum()) == 0
+
+
+def test_junction_empty_neck_degrades_safely():
+    # §26.13-9：空 neck 安全退化——不得整帧保护
+    alpha, neck, old_safe, box = _junction_scene()
+    empty = np.zeros_like(neck)
+    j = build_jaw_neck_junction(alpha, empty, old_safe, box)
+    assert j["neck_visible"].sum() == 0
+    assert j["jaw_underlay"].sum() == 0
+    assert j["fill_protect"].sum() == 0        # 不得把整帧当保护区
+    assert j["jaw_soft"].any() and j["envelope"].any()  # 诊断量仍可用
+
+
+def test_junction_underlay_monotonic_no_lateral_blowup():
+    # §26.13-10：jaw_underlay_px 8/10/12 单调增长但不横向失控
+    alpha, neck, old_safe, box = _junction_scene()
+    masks = [
+        build_jaw_neck_junction(alpha, neck, old_safe, box,
+                                jaw_underlay_px=p, neck_taper_height_px=16, side_px=2)
+        for p in (8, 10, 12)
+    ]
+    for a, b in zip(masks, masks[1:]):
+        # 集合单调：小参数的 underlay ⊆ 大参数的 underlay
+        assert not (a["jaw_underlay"] & ~b["jaw_underlay"]).any()
+    for m in masks:
+        under = m["jaw_underlay"]
+        xs = np.nonzero(under.any(axis=0))[0]
+        # 横向不超出 A neck 本身宽度（underlay 是 neck 向上延展，不是横向膨胀）
+        assert xs.min() >= 50 - 1 and xs.max() <= 150 + 1
+
+
+def test_orphan_metric_catches_side_orphan_blind_to_old_gap_metric():
+    # §26.13-11：中部 gap=0、侧边仍悬空的反例——旧 gap 指标测 0，新 orphan 指标必须抓到
+    alpha = np.zeros((200, 200), np.float32)
+    alpha[40:139, 58:142] = 1.0
+    alpha[139:147, 58:142] = np.linspace(0.95, 0.03, 8, dtype=np.float32)[:, None]
+    head_support = alpha > 0.02
+    neck_visible = np.zeros((200, 200), bool)
+    neck_visible[144:190, 58:142] = True   # 主脖子与下颌零间隙
+    neck_visible[150:170, 8:26] = True     # 左侧悬空块：上方永远没有 B 头
+    envelope = directional_dilate_down(head_support, 16, side_px=2)
+    g_mean, g_max = jaw_neck_gap_px(alpha, neck_visible)
+    assert g_mean == 0.0 and g_max == 0.0  # 旧指标：中部 60% 列全缝合 → 盲区
+    orphan = orphan_neck_top_px(
+        neck_visible, head_support, neck_top=144,
+        neck_taper_height_px=16, envelope=envelope,
+    )
+    assert orphan > 0                       # 新指标覆盖左右列，抓到悬空块
+
+
+def test_junction_wall_component_metric_finds_wall_blob():
+    # §26.11 指标 2 语义自检：接合区内的 residual 连通域被度量，区域外不计
+    neck_visible = np.zeros((200, 200), bool)
+    neck_visible[144:190, 58:142] = True
+    head_core = np.zeros((200, 200), bool)
+    head_core[40:139, 58:142] = True
+    jaw_zone = (np.arange(200)[:, None] >= 110) & (np.arange(200)[:, None] <= 170)
+    residual = np.zeros((200, 200), bool)
+    residual[150:158, 70:100] = True       # 接合区内 30x8 墙块
+    residual[10:40, 10:40] = True          # 远处 residual（不在度量区域）
+    val = junction_wall_component_max_px(residual, neck_visible, head_core, jaw_zone)
+    assert val == 30 * 8
+    empty = np.zeros((200, 200), bool)
+    assert junction_wall_component_max_px(empty, neck_visible, head_core, jaw_zone) == 0
+
+
+def test_v5_configs_outputs_do_not_overlap():
+    # §26.13-8/12：v5 三份配置禁 collar、jaw 调色为 0（I3 才允许非 0）、产物互不覆盖；
+    # I3 允许写 final（§26.14"最终候选才写 output/final.mp4"），probe 两轮不得碰它
+    root = _Path(__file__).resolve().parents[1] / "config"
+    names = [
+        "headswap.hs-p1-0004-v5-underlay.yaml",
+        "headswap.hs-p1-0004-v5-junction.yaml",
+        "headswap.hs-p1-0004-v5.yaml",
+    ]
+    files = [root / n for n in names]
+    if not all(p.is_file() for p in files):
+        pytest.skip("v5 三份配置尚未全部创建")
+    v4_finals = {"final-v4-neck-preserve", "final-v4-jaw-blend"}
+    probe_finals, silents, final_writers = set(), set(), []
+    for p in files:
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
+        comp = cfg["composite"]
+        assert comp.get("a_neck_preserve_enabled") is True
+        assert comp.get("neck_collar_enabled") in (False, None)   # §26.13-8
+        assert comp.get("jaw_underlay_enabled") is True
+        assert comp.get("jaw_color_strength", 0.0) == 0.0 or p.name.endswith("-v5.yaml")
+        silents.add(comp["silent_name"])
+        fname = cfg["video"]["final_name"]
+        if p.name.endswith("-v5.yaml"):
+            final_writers.append(fname)
+        else:
+            probe_finals.add(fname)
+    assert len(silents) == 3                       # silent 中间产物互不覆盖
+    assert probe_finals & v4_finals == set()       # probe 轮不得覆盖 v4 产物
+    assert len(probe_finals) == 2
+    assert final_writers == ["final"]              # 只有 I3 终选写 final.mp4
+
+
+# ---------------- 第六轮 Round L（docs §28.13） ----------------
+
+from headswap.composite_head import (
+    build_argparser as _build_composite_argparser,
+    build_junction_corridor,
+    build_vertical_junction_bridge,
+    corridor_close_fill_protect,
+    offline_filter as _offline_filter,
+    rigid_from_eyes_nose,
+    weighted_similarity,
+)
+
+
+def _bridge_scene(size=200, gap=2, head_bottom=140):
+    """下颌—脖子窄缝场景：head 支撑到 head_bottom，neck 从 head_bottom+1+gap 起。
+
+    真实素材中 B 头比 A 脖子宽，old_head_safe 与 head/neck 同宽（不再留侧缝）。"""
+    alpha = np.zeros((size, size), np.float32)
+    alpha[: head_bottom + 1, 60:140] = 1.0
+    nt = head_bottom + 1 + gap
+    neck = np.zeros((size, size), bool)
+    neck[nt:190, 60:140] = True
+    old_head_safe = np.zeros((size, size), bool)
+    old_head_safe[40 : nt + 30, 60:140] = True
+    yy = np.arange(size)[:, None]
+    jaw_zone = (yy >= 100) & (yy <= 180)
+    return alpha, neck, old_head_safe, jaw_zone
+
+
+def test_bridge_fills_legal_gaps_per_column():
+    # §28.13-1：1/3/6px 合法 gap 逐列被填满
+    for gap in (1, 3, 6):
+        alpha, neck, old_safe, jz = _bridge_scene(gap=gap)
+        bridge = build_vertical_junction_bridge(alpha, neck, old_safe, jz, max_gap_px=6)
+        assert bridge[141 : 141 + gap, 60:140].all()   # 缝隙行全部补上
+        assert not bridge[:140, :].any()               # head 区不加
+        assert not bridge[147:, :].any()               # neck 区不加
+
+
+def test_bridge_skips_large_gap_and_true_background():
+    # §28.13-2：gap>max 不填；只有 head / 只有 neck 的真实背景列不填
+    alpha, neck, old_safe, jz = _bridge_scene(gap=7)
+    bridge = build_vertical_junction_bridge(alpha, neck, old_safe, jz, max_gap_px=6)
+    assert not bridge[141:148, 60:140].any()           # 7px 缝不填（可能是真背景）
+    alpha2, neck2, old2, jz2 = _bridge_scene(gap=2)
+    neck2[:, 120:] = False                             # 右侧只有 head
+    b2 = build_vertical_junction_bridge(alpha2, neck2, old2, jz2, max_gap_px=6)
+    assert not b2[141:143, 120:140].any()
+    alpha3, neck3, old3, jz3 = _bridge_scene(gap=2)
+    alpha3[:, :80] = 0.0                               # 左侧只有 neck
+    b3 = build_vertical_junction_bridge(alpha3, neck3, old3, jz3, max_gap_px=6)
+    assert not b3[:, :80].any()
+
+
+def test_bridge_stays_inside_jaw_zone_and_old_head_safe():
+    # §28.13-3：bridge 不超出 jaw_zone / old_head_safe
+    alpha, neck, old_safe, jz = _bridge_scene(gap=2)
+    old_safe[:, 100:110] = False                       # 挖掉几列旧头安全区
+    bridge = build_vertical_junction_bridge(alpha, neck, old_safe, jz, max_gap_px=6)
+    assert not bridge[:, 100:110].any()                # old_head_safe 外不填
+    yy = np.arange(200)[:, None]
+    jz2 = jz & (yy <= 142)                             # jaw_zone 只到缝上沿
+    b2 = build_vertical_junction_bridge(alpha, neck, old_safe, jz2, max_gap_px=6)
+    assert not b2[143:, :].any()                       # jaw_zone 外不填
+
+
+def test_central_10x1_residual_eliminated_by_bridge():
+    # §28.13-4：中央 10×1 水平 residual 反例被 bridge 消除，走廊硬闸门归零
+    alpha, neck, old_safe, jz = _bridge_scene(gap=1)
+    underlay = np.zeros_like(neck)                     # underlay 差 1px 没接上（§28.2 反例）
+    fill_protect = neck | underlay
+    new_core = alpha >= 0.995
+    residual = old_safe & (~new_core) & (~fill_protect)
+    stripe = np.zeros((200, 200), bool)
+    stripe[141, 90:100] = True
+    assert residual[stripe].all()                      # 反例成立：10×1 横纹在 residual
+    corridor = build_junction_corridor(alpha, neck, old_safe, jz)
+    assert corridor[stripe].all()                      # 且落在接合走廊内
+    bridge = build_vertical_junction_bridge(alpha, neck, old_safe, jz, max_gap_px=6)
+    fp2 = corridor_close_fill_protect(fill_protect, corridor) | bridge
+    residual2 = old_safe & (~new_core) & (~fp2)
+    assert not (residual2 & corridor).any()            # 修复后走廊内 residual = 0
+
+
+def test_corridor_gate_catches_1px_horizontal_stripe():
+    # §28.13-5：走廊 residual hard gate 能抓到 1px 横纹（不修时必须报警）
+    alpha, neck, old_safe, jz = _bridge_scene(gap=2)
+    corridor = build_junction_corridor(alpha, neck, old_safe, jz)
+    residual = np.zeros((200, 200), bool)
+    residual[141, 70:130] = True                       # 1px 横纹
+    caught = int((residual & corridor).sum())
+    assert caught >= 50                                # 闸门命中横纹主体
+    target = (residual & corridor).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(target, connectivity=8)
+    widths = [stats[i, cv2.CC_STAT_WIDTH] for i in range(1, count)]
+    assert max(widths) >= 40                           # 横向宽度语义可度量
+
+
+def test_eyes_nose_never_reads_mouth_points():
+    # §28.13-6：eyes_nose 不读取 kps[3:5]——嘴点 NaN/随机，结果不变
+    b = np.array([[100.0, 100.0], [200.0, 102.0], [150.0, 150.0], [130.0, 180.0], [170.0, 182.0]])
+    a = b * 2.0 + np.array([10.0, 20.0])
+    ref = rigid_from_eyes_nose(b, a)
+    b_nan = b.copy()
+    b_nan[3] = [np.nan, np.nan]
+    b_nan[4] = [np.inf, -3.0]
+    assert rigid_from_eyes_nose(b_nan, a) == ref
+    b_rnd = b.copy()
+    b_rnd[3] += np.array([50.0, -40.0])
+    b_rnd[4] -= np.array([70.0, 25.0])
+    assert rigid_from_eyes_nose(b_rnd, a) == ref
+    # 加权重心精确对齐（眼中点 0.7 + 鼻尖 0.3）
+    m = rebuild(*ref)
+    mapped = cv2.transform(b[:3].reshape(-1, 1, 2).astype(np.float32), m).reshape(-1, 2)
+    mapped_w = 0.7 * (mapped[0] + mapped[1]) / 2 + 0.3 * mapped[2]
+    wgt_a = 0.7 * (a[0] + a[1]) / 2 + 0.3 * a[2]
+    npt.assert_allclose(mapped_w, wgt_a, atol=0.05)
+
+
+def test_weighted_similarity_survives_brow_outlier():
+    # §28.13-7：一个眉点异常时仍恢复已知 tx/ty/roll（加权 + MAD 降权）
+    rng = np.random.default_rng(7)
+    s_true, ang_deg, tx_true, ty_true = 1.73, 6.0, 41.0, -12.0
+    ang = np.deg2rad(ang_deg)
+    R = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    src = rng.uniform(-50, 50, size=(12, 2))
+    dst = src @ R.T * s_true + np.array([tx_true, ty_true]) + rng.normal(0, 0.05, size=(12, 2))
+    dst[11] += np.array([18.0, -14.0])                 # 眉点离群
+    weights = np.array([1.0] * 4 + [0.7] * 4 + [0.3] * 4)
+    sol = weighted_similarity(src, dst, weights)
+    assert sol is not None
+    s, a_out, tx, ty = sol
+    assert s == pytest.approx(s_true, abs=0.02)
+    assert np.rad2deg(a_out) == pytest.approx(ang_deg, abs=0.3)
+    assert tx == pytest.approx(tx_true, abs=1.0)
+    assert ty == pytest.approx(ty_true, abs=1.0)
+
+
+def test_weighted_similarity_rejects_insufficient_points():
+    # §28.13-8：有效锚点不足 → None（调用方回退 eyes_nose）
+    pts = np.array([[0.0, 0.0], [10.0, 0.0]])
+    assert weighted_similarity(pts, pts, np.ones(2)) is None
+    assert weighted_similarity(np.zeros((4, 2)), np.zeros((4, 2)), np.zeros(4)) is None
+
+
+def test_no_full_affine_shear_path_in_production():
+    # §28.13-9：full affine/shear 不可进入生产配置；weighted_similarity 只产 4 自由度
+    parser = _build_composite_argparser()
+    action = next(a for a in parser._actions if a.dest == "transform_mode")
+    assert set(action.choices) == {"eyes", "eyes_nose", "five_point"}
+    assert not any("affine" in c or "shear" in c for c in action.choices)
+    rng = np.random.default_rng(3)
+    src = rng.uniform(-30, 30, size=(8, 2))
+    sol = weighted_similarity(src, src + np.array([5.0, 7.0]), np.ones(8))
+    m = rebuild(*sol)
+    npt.assert_allclose(m[0, 0], m[1, 1], atol=1e-9)   # 无 shear：旋转矩阵结构
+    npt.assert_allclose(m[0, 1], -m[1, 0], atol=1e-9)
+
+
+def test_motion_filter_preserves_1hz_amplitude_zero_lag():
+    # §28.13-10：1Hz 正弦经 K1 滤波（Hampel5+smooth5/angle7）幅度保持、lag=0
+    n = 180
+    raw = [
+        (1.0, 0.02 * float(np.sin(i / 9.0)),
+         10.0 * float(np.sin(2 * np.pi * i / 30.0)),
+         6.0 * float(np.sin(2 * np.pi * i / 30.0 + 0.4)))
+        for i in range(n)
+    ]
+    out = _offline_filter(raw, hampel_window=5, smooth_window=5, scale_mode="const", angle_window=7)
+    tx = np.array([p[2] for p in out])
+    ref = np.array([p[2] for p in raw])
+    gain = tx.std() / ref.std()
+    assert 0.85 <= gain <= 1.10                        # 幅度不被吞
+    lags = range(-3, 4)
+    corrs = [
+        float(np.corrcoef(ref[: -abs(l) or None], np.roll(tx, l)[: -abs(l) or None])[0, 1])
+        for l in lags
+    ]
+    assert int(np.argmax(corrs)) == 3                  # lags[3] == 0：零相位
+
+
+def test_scale_clamp_within_one_percent():
+    # §28.13-11：smooth_clamped 的 scale 不超过中位数 ±1%
+    rng = np.random.default_rng(11)
+    t = np.arange(150)
+    scale_series = 1.0 + 0.02 * np.sin(t / 17.0) + rng.normal(0, 0.01, size=len(t))
+    raw = [(float(scale_series[i]), 0.0, 400.0, 600.0) for i in t]
+    out = _offline_filter(raw, hampel_window=5, smooth_window=5, scale_mode="smooth_clamped")
+    s = np.array([p[0] for p in out])
+    med = float(np.median(s))
+    assert np.abs(s - med).max() <= 0.01 * med + 1e-9
+    assert s.std() > 0                                 # clamp 不拍成常量（保留前后摆）
+
+
+def test_v6_configs_do_not_overwrite_previous_products():
+    # §28.13-12：v6 产物命名不覆盖 v4/v5/final
+    root = _Path(__file__).resolve().parents[1] / "config"
+    names = ["headswap.hs-p1-0004-v6-seam.yaml", "headswap.hs-p1-0004-v6-motion.yaml"]
+    files = [root / n for n in names]
+    if not all(p.is_file() for p in files):
+        pytest.skip("v6 两份配置尚未全部创建")
+    taken = {"final", "final-v4-neck-preserve", "final-v4-jaw-blend",
+             "final-v5-underlay", "final-v5-junction"}
+    finals, silents = set(), set()
+    expect = {"final-v6-seam-closed", "final-v6-motion"}
+    for p in files:
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
+        comp = cfg["composite"]
+        assert comp.get("jaw_underlay_enabled") is True
+        assert comp.get("junction_bridge_max_gap_px", 6) > 0
+        assert comp.get("neck_collar_enabled") in (False, None)
+        finals.add(cfg["video"]["final_name"])
+        silents.add(comp["silent_name"])
+    assert finals == expect
+    assert not (finals & taken)
+    assert len(silents) == 2
+
+
+# ---------------- 第七轮 Round M（docs §30） ----------------
+
+from headswap.composite_head import (
+    audit_seam_metrics,
+    build_audit_seam_roi,
+    build_jaw_underlay_skin,
+    build_required_skin_bridge,
+    head_bottom_edge_dist,
+    jaw_luminance_gradient,
+    wall_texture_energy,
+)
+
+WALL2_BGR = np.array([205, 210, 215], np.uint8)
+SKIN2_BGR = np.array([110, 150, 190], np.uint8)
+
+
+def _seam_scene(size=200):
+    """§30 接合场景：B 头（含 8px 下颌软边）+ 下颌下皮肤补丁 + A raw neck。
+
+    face_box=[55,40,145,140]（bh=100）；head 支撑行 40..146（139..146 软边）；
+    submental 皮肤补丁行 148..156（class1 语义、neck 类之外——§30.2 反例同构）；
+    raw_neck 行 164..190。head 底(146)→neck 顶(164) gap=17。
+    """
+    alpha = np.zeros((size, size), np.float32)
+    alpha[40:140, 58:142] = 1.0
+    for i, v in enumerate(np.linspace(0.95, 0.03, 8, dtype=np.float32)):
+        alpha[139 + i, 58:142] = v
+    raw_neck = np.zeros((size, size), bool)
+    raw_neck[164:190, 60:140] = True
+    submental = np.zeros((size, size), bool)
+    submental[148:157, 80:120] = True              # §30.2 反例：head_pad 吞掉的 class1
+    face_skin = np.zeros((size, size), bool)
+    face_skin[60:147, 58:142] = True               # A 面部 class1（head 底带内亦有皮肤）
+    raw_skin = raw_neck | submental | face_skin
+    old_head_safe = np.zeros((size, size), bool)
+    old_head_safe[40:165, 55:145] = True
+    yy = np.arange(size)[:, None]
+    jaw_zone = (yy >= 110) & (yy <= 180)
+    face_box = np.array([55, 40, 145, 140], np.float32)
+    frame_a = np.full((size, size, 3), WALL2_BGR, np.uint8)
+    frame_a[raw_skin] = SKIN2_BGR
+    return alpha, raw_neck, raw_skin, old_head_safe, jaw_zone, face_box, frame_a, submental
+
+
+def _wall_fill_sim(frame_a, residual):
+    clean = frame_a.copy()
+    clean[residual] = WALL2_BGR
+    return clean
+
+
+def test_audit_catches_wall_seam_that_corridor_misses():
+    # §30.4 自证循环的单元复现（M0）：v6 修复链（corridor 完备化）下
+    # corridor 指标 = 0，但独立 audit 抓到 submental 皮肤被写成墙
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, submental = _seam_scene()
+    neck_visible = raw_neck.copy()
+    corridor = build_junction_corridor(alpha, neck_visible, old_safe, jz)
+    fp_v6 = neck_visible | (corridor & (alpha < 0.995))   # v6 走廊完备化
+    residual = old_safe & ~(alpha >= 0.995) & ~fp_v6
+    assert int((residual & corridor).sum()) == 0            # 旧指标：全 0（自证）
+    assert residual[submental].all()                        # 反例皮肤仍被清成墙
+    clean = _wall_fill_sim(frame_a, residual)
+    audit_roi = build_audit_seam_roi(alpha, raw_neck, box)
+    wall_lab = cv2.cvtColor(WALL2_BGR.reshape(1, 1, 3), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    am = audit_seam_metrics(clean, frame_a, audit_roi, raw_skin, wall_lab)
+    assert am["audit_changed_from_skin"] >= submental.sum()  # 独立 audit 抓到
+    assert am["audit_wall_intrusion"] >= submental.sum()
+    assert am["audit_horizontal_wall_component_width"] >= 30
+
+
+def test_skin_bridge_protects_and_audit_zero():
+    # §30.5 M1：raw skin bridge + jaw 底带铺垫后，audit 三指标归零
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, submental = _seam_scene()
+    neck_visible = raw_neck.copy()
+    bridge = build_required_skin_bridge(
+        alpha, neck_visible, raw_skin, box, max_vertical_gap=14, no_cap=True
+    )
+    ju = build_jaw_underlay_skin(alpha, raw_skin, band_px=20)
+    assert bridge[submental].all()                          # 反例皮肤被 bridge 接住
+    fp = neck_visible | bridge | ju
+    residual = old_safe & ~(alpha >= 0.995) & ~fp
+    clean = _wall_fill_sim(frame_a, residual)
+    clean[bridge | ju] = frame_a[bridge | ju]               # §30.5 硬保险
+    audit_roi = build_audit_seam_roi(alpha, raw_neck, box)
+    wall_lab = cv2.cvtColor(WALL2_BGR.reshape(1, 1, 3), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    am = audit_seam_metrics(clean, frame_a, audit_roi, raw_skin, wall_lab)
+    assert am["audit_changed_from_skin"] == 0
+    assert am["audit_wall_intrusion"] == 0
+    assert am["audit_horizontal_wall_component_width"] == 0
+
+
+def test_bridge_is_skin_gated():
+    # §30.5 不变量：span 内只有 raw skin 语义的像素被保留，非 skin（背景）不填
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, _ = _seam_scene()
+    raw_skin_no_sub = raw_neck.copy()                       # 无 submental 皮肤
+    bridge = build_required_skin_bridge(
+        alpha, raw_neck, raw_skin_no_sub, box, max_vertical_gap=20, no_cap=True
+    )
+    assert not bridge[148:157, 80:120].any()                # 无皮肤语义 → 不填
+
+
+def test_bridge_connects_through_taper_holes():
+    # 主体段连接修复：taper 在列内部留"顶部条+洞+主体"时，洞内 raw skin 不许漏保护
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, _ = _seam_scene()
+    neck_visible = raw_neck.copy()
+    neck_visible[150:157, 60:140] = True                    # envelope 保留的顶部条
+    neck_visible[157:172, 60:140] = False                   # taper 洞 + 主体 172+
+    bridge = build_required_skin_bridge(
+        alpha, neck_visible, raw_skin, box, max_vertical_gap=30, no_cap=False
+    )
+    # 洞内的 raw skin 部分（164..171，neck 类）经主体段（172+）span 覆盖；
+    # 若取第一个 neck 像素（150），span 只到 153，洞会漏（157..163 非 skin 语义，
+    # 按不变量本就不填）
+    assert bridge[164:172, 80:120].all()
+    assert not bridge[157:164, 80:120].any()                # 非皮肤语义不填
+
+
+def test_bridge_gap_cap_vs_no_cap():
+    # cap 语义：gap=17 > 14 时 cap 跳过；no_cap 仍保留 span 内 raw skin
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, submental = _seam_scene()
+    capped = build_required_skin_bridge(alpha, raw_neck, raw_skin, box, max_vertical_gap=14)
+    assert not capped[submental].any()                      # 17 > 14：整段跳过
+    nc = build_required_skin_bridge(alpha, raw_neck, raw_skin, box, max_vertical_gap=14, no_cap=True)
+    assert nc[submental].all()
+
+
+def test_jaw_underlay_band_protects_head_bottom_skin():
+    # §30.6 第 1 部分语义：head 底带内的 raw skin 被铺垫，带外不扩
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, _ = _seam_scene()
+    ju = build_jaw_underlay_skin(alpha, raw_skin, band_px=20)
+    # head 底边 ≈ 行 146（支撑行 40..146），底带 = 127..146
+    assert ju[130:146, 80:120].all()                        # 带内 raw skin 铺垫
+    assert not ju[148:, :].any()                            # 带外（向下）不扩
+    assert not ju[:, :58].any() and not ju[:, 143:].any()   # head 支撑列外不扩
+
+
+def test_wall_fill_rejects_textured_background():
+    # §30.8 M4：smooth_plane 遇复杂纹理（窗帘）必须显式报错，不得静默出平色块
+    frame, old_head_safe, fill_protect, face_box, residual, _ = _wall_scene()
+    # 平滑墙应通过（含肤色补丁边界的少量梯度，阈值需高于该基线）
+    out, stats, st = fit_wall_fill(
+        frame, residual, old_head_safe, fill_protect, face_box, max_texture=15.0
+    )
+    assert stats["mode"] == "wall_plane"
+    # 窗帘：竖条纹 + 噪声，纹理能量高 → ValueError
+    curtain = frame.copy()
+    xs = np.arange(curtain.shape[1])
+    stripes = (np.sin(xs / 4.0) * 25 + 25).astype(np.float32)
+    curtain = np.clip(curtain.astype(np.float32) + stripes[None, :, None], 0, 255).astype(np.uint8)
+    noise = np.random.default_rng(3).normal(0, 6, curtain.shape[:2])
+    curtain = np.clip(curtain.astype(np.float32) + noise[..., None], 0, 255).astype(np.uint8)
+    energy = wall_texture_energy(curtain, np.ones(curtain.shape[:2], bool))
+    assert energy > 15.0
+    with pytest.raises(ValueError, match="纹理能量"):
+        fit_wall_fill(curtain, residual, old_head_safe, fill_protect, face_box, max_texture=15.0)
+
+
+def test_jaw_luminance_gradient_band_only_and_smoothstep():
+    # §30.7 D3：只改 band 内 head_rgb，底边权重最强、带顶衰减到 0，不动参考帧
+    alpha, raw_neck, raw_skin, old_safe, jz, box, frame_a, _ = _seam_scene()
+    head = np.full((200, 200, 3), (200, 195, 190), np.uint8)  # B 下颌偏亮
+    ref = raw_skin & (np.arange(200)[:, None] >= 140)         # A 接合皮肤参考
+    out, state = jaw_luminance_gradient(
+        head.astype(np.float32), alpha, frame_a, ref, box, strength=1.0, band_px=28
+    )
+    edge = head_bottom_edge_dist(alpha)
+    band = (edge >= 0) & (edge <= 28) & (alpha > 0.02)
+    # band 内像素被压暗（L 向 A 皮肤靠拢）
+    lab_in = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB)[:, :, 0]
+    lab_out0 = cv2.cvtColor(head, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    darkened = (lab_out0 - lab_in.astype(np.float32)) > 5
+    assert (darkened[band]).mean() > 0.5
+    # band 外（头部高处）不动（LAB 往返有 ±1 量化，阈值放宽到 2）
+    assert (np.abs(out[(edge > 28)] - head[(edge > 28)].astype(np.float32)).max(axis=-1) < 2).all()
+    # 底边（edge≈0）比带顶（edge≈28）压得更暗：smoothstep 单调
+    bottom_dark = float((lab_out0 - lab_in.astype(np.float32))[(edge < 4) & band].mean())
+    top_dark = float((lab_out0 - lab_in.astype(np.float32))[(edge > 24) & band].mean())
+    assert bottom_dark > top_dark
+    # EMA：第二帧 delta 向第一帧平滑（变化幅度受限）
+    out2, state2 = jaw_luminance_gradient(
+        head.astype(np.float32), alpha, frame_a, ref, box, strength=1.0, band_px=28, ema_state=state
+    )
+    d1 = np.asarray(state["delta"]); d2 = np.asarray(state2["delta"])
+    assert np.linalg.norm(d2 - d1) < np.linalg.norm(d1) * 0.2 + 1e-6

@@ -4358,3 +4358,1848 @@ GLM 必须报告：
 不要用 B 的瘦脖子覆盖 A 的粗脖子
 不要再制造独立运动的 neck 前景层
 ```
+
+## 25. 第四轮整改落地记录（2026-08-31 凌晨，GLM 按 §24 处方执行）
+
+> 严格按 §24.20 顺序：A neck 分割接口+单测 → 重跑 segment → H1 单帧/短片/
+> 视觉闸门/全片 → H2 → H3。**§24.21 十四项逐条回答见 §25.4。**
+
+### 25.1 修改的文件与函数
+
+| 文件 | 修改 |
+|---|---|
+| `src/headswap/segment_head.py` | `filter_a_neck_near_primary_face`（§24.8.2 原样：class14 轮廓+连通域打分，窗口 ±0.25bw / 下颌−0.08bh ~ +0.45bh）；`segment_parts()` 返回 (head, skins, neck)——head/skins 与 v3 `segment()` 逐位一致（单测锁定），neck 不减 head_pad、不水平裁、无 EMA；`segment()` 改为委托；worker 输出 `necks/neck_XXXXXX.png`，检测失败帧 head/skins/neck 三者一起沿用，meta 新增 `neck_masks/neck_fail_frames/neck_px_mean`；`filter_neck_near_primary_face`（B 侧）标记 deprecated |
+| `src/headswap/composite_head.py` | 新增 §24.9/24.11/24.12/24.14 函数：`check_neck_mode`（互斥 guard）、`extend_mask_upward`、`motion_safe_neck_union`（当前∪运动补偿上一帧+close+只向上 3px）、`region_aware_head_alpha`（side 4/jaw 8，smoothstep 0.68→0.82）、`jaw_neck_gap_px`（正面缝合区度量）、`extend_neck_rgb_upward`（§24.14 兜底，未启用）；run_composite：`--a-neck-preserve-enabled` 路径读 necks/、`fill_protect = a_neck_safe`（水平 neck_keep_y 退出 v4 主路径）、`alpha_mode=region_aware` 分支、H3 jaw 颜色匹配（src=jaw 带 0.2<alpha<0.95，ref=A neck 顶带）、v4 专属 3×3 调试图（§24.17 布局）、diag 新增 9 键；collar 相关函数保留但标 deprecated，与 a_neck_preserve 互斥直接 raise |
+| `src/headswap/cli.py` | 透传 necks-dir / a-neck-preserve-enabled / a-neck-upward-px / region_aware 四参数 / jaw-color-strength |
+| `config/headswap.hs-p1-0004{,-jaw-blend,-jaw-color}.yaml` | H1/H2/H3 三份（产物互不覆盖，§24.16 + §24.15 的 jaw=4 隔离变量要求） |
+| `tests/test_headswap_units.py` | 新增 11 项（§24.18 对应：旧 API 逐位一致/class14 原始轮廓无 head_pad/无 cloth/V 形顶部非水平/连通域取中/neck 并集前缘/只向上延展/互斥/residual 不覆盖 neck/region_aware 侧 4 颔 8/softstep 无水平突变/gap 度量语义/三配置不覆盖），合计 **44 passed** |
+
+### 25.2 Round H 执行结果（§24.15 三轮）
+
+| 轮次 | 参数 | 产物 | 耗时 |
+|---|---|---|---|
+| segment 重跑 | 同 0003 参数（EMA=0） | `work/segment/necks/`（796 帧，11817px/帧，0 失败） | ~150s |
+| H1 | a_neck_preserve + collar off + jaw feather **4**（隔离变量） | `output/final-v4-neck-preserve.mp4` | ~510s+58s |
+| H2 | H1 + jaw feather **8**（smoothstep） | `output/final-v4-jaw-blend.mp4` | ~505s+58s |
+| H3 | H2 + jaw_color_strength **0.18** | `output/final.mp4` + `previews/side_by_side_v4.mp4` | ~510s+120s |
+
+**§24.19 硬指标（三轮全片 diag 一致）**：
+
+```text
+collar_frames = 0/796        ✅（目标 0）
+alpha_neck_max = 0.0         ✅（目标 0）
+a_neck_frames = 796/796      ✅（≥99%）
+a_neck_fail_frames = 0       ✅
+jaw_neck_gap mean = 0.038px  ✅（<1px）
+jaw_neck_gap max = 5.0px     ⚠️（目标 ≤2px，个别说话大张嘴帧；见 §25.4-9）
+neck_temporal_mad = 0.000135 ✅（脖子层无独立运动/闪烁）
+residual_uncovered = 0       ✅
+```
+
+### 25.3 各轮视觉闸门结论（GLM 读图自判）
+
+- **H1（frame 380/0/400/750）**：下颌与脖子交界连续过渡、无横带/矩形贴片；A 脖子顶部
+  自然弧形、左右斜向曲线连到领口；无 ≥2px 白边；光晕未复发。视觉结论原文：
+  "下巴正下方=下巴肤色→阴影过渡带→A 脖子中段肤色→白 T 恤圆领，无任何非肤色
+  插入物；头—脖子—身体已形成整体"。
+- **H2（frame 400）**：H1 的"下颌缘锐度略高"改善为 6~9px 渐变过渡；嘴唇/下巴清晰
+  未糊；A 脖子未被整体模糊；无雾带；头发/耳朵不受波及。
+- **H3（frame 400）**：肤色阶差轻微收敛（jaw 带仅含 alpha 0.2~0.95 的边缘环，
+  §24.13 设计即轻量）。
+
+### 25.4 §24.21 十四项回答
+
+1. **承认 Round G collar 方案被人工否决**：是。§24.2 列出的 8 条问题（矩形贴片/
+   随头独立移动/瘦脖接粗脖/水平平顶）全部成立，v4 已废弃该方案。
+2. **停止使用 B neck 的代码路径**：v4 主路径 `neck_collar_enabled=false`（三份配置
+   硬编码 false）；`check_neck_mode` 保证与 a_neck_preserve 互斥直接 raise；
+   `build_neck_collar_mask/neck_vertical_ramp/build_warped_head_layers/
+   filter_neck_near_primary_face` 保留仅历史复现并标 deprecated；diag
+   `collar_frames=0、alpha_neck_max=0` 逐帧验证。
+3. **A neck mask 生成/保存/兜底**：segment worker 每帧 `segment_parts()` 输出
+   class14 → 连通域取脸正下方主块（面积−4×|cx−脸心| 打分）→ close(5) →
+   `necks/neck_XXXXXX.png`；检测失败帧（实测 0 帧）三者一起沿用上一帧；
+   composite 侧再经 `motion_safe_neck_union`（运动补偿∪+close+向上 3px）。
+4. **A neck 是否仍用水平 y 阈值**：**不使用**。v4 主路径删除了
+   `neck_keep_y/build_neck_keep_mask`，保护完全来自 class14 真实轮廓
+   （`test_segment_parts_returns_raw_neck_not_head_padded` 断言顶部 V 形三列
+   顶边各不相同）。
+5. **a_neck_upward_px=3 的影响**：只向上 3px 支撑（`extend_mask_upward` 逐 dy 上移
+   取并集，左右宽度不变——单测断言）；实测 neck 保护 12540px/帧。
+6. **region-aware jaw alpha 参数**：side 4px / jaw 8px / 0.68→0.82 smoothstep
+   （H1 为隔离变量 jaw 也用 4px）。
+7. **三轮产物与耗时**：见 §25.2。
+8. **collar_frames=0、alpha_neck_max=0**：是，三轮全片 796/796 帧均为 0。
+9. **gap/jaw seam/嘴型/运动/证件**：gap mean 0.038px ✅、max 5px（个别大张嘴帧，
+   H2 的 8px jaw 羽化视觉覆盖）；嘴型 0.983 ✅、lag 0 ✅、scale 0.95 ✅、
+   证件 34.6dB ✅、halo 1.41 ✅（未复发）。**jaw_seam 代理 9.68→13.06 未达 ≤7.1
+   目标**，但 §25.5 证明该代理在 v3 系是被墙面浅色带"美化"的假象，在 v4 系测到的
+   是真实存在的 B/A 亮度阶差（见 §25.5，本轮最重要发现）。
+10. **局部图与 3×3 debug**：`previews/acceptance_v3matte_vs_v4.png`（v3-matte 上排
+    /v4 下排，帧 0/200/400/600/750）；`debug-v4-{neck-preserve,jaw-blend,jaw-color}/
+    frame_XXXX_grid.png`（§24.17 布局：A帧|raw neck|safe neck / old_head_safe|
+    residual/protect|clean_base / B RGB|alpha|out）+ `frame_XXXX_{a_neck,alpha_crop,
+    clean_base_crop,final_crop}.png`，帧 0/50/.../750。
+11. **完整视频自主观看结论**：静帧链检查（H1 380/0/750 + H2/H3 400）未发现任何
+    独立移动的 neck 层；neck_temporal_mad 0.000135 从数据侧排除脖子层闪烁/漂移；
+    但 **GLM 未逐帧连续播放全片**，说话时 neck 是否随头微动需用户 0.5 倍速确认
+    （§24.19 人工清单第 3 条）。
+12. **相比 v3-matte 改善/退化**：改善——A 脖子真实轮廓恢复（脖子区 L=106 vs 原片
+    112，v3-matte 同区 L=145 为墙面填充）、v3 下颌浅色带消除、矩形贴片根除、
+    下颌羽化区域化。退化——无量化退化项（嘴型/运动/证件/halo 全持平）；
+    下颌处的亮度台阶从"被浅色带掩盖"变为"可见"（本质是遗留问题显性化，§25.5）。
+13. **尚未解决**：见 §25.5/§25.6。
+14. **是否建议进入外部复审**：建议进入**问题诊断复审**而非交付复审——Round H 的
+    几何目标已全部达成，但暴露出上一轮遗留的全局色彩问题（§25.5），需要用户/
+    ChatGPT 决策后才能定交付。**不声称可交付。**
+
+### 25.5 本轮最重要发现：B 头整体偏亮是 jaw seam 数值的真正来源（遗留问题）
+
+对 frame 400 下颌正面区（neck 列范围 ±0.20bw）的 LAB 实测：
+
+| 版本 | 上带（下颌）L | 下带（脖子区）L | ΔE | 下带内容 |
+|---|---:|---:|---:|---|
+| 原片 | 117 | 112 | 5.7 | A 真脖子 |
+| v3-matte | 151 | **145** | 11.4 | **墙面填充**（§24 批评的浅色带）|
+| v4-final | 151 | **106** | 45（该帧）/ 23.8（全片中位） | **A 真脖子**（保护成功）|
+
+结论链：
+
+1. v4 的脖子保护是成功的——下带 L=106 与原片 112 同源；
+2. v3-matte 的 jaw seam 数值"更好"是**假象**：它的下带是被诟病的墙面浅色带（L=145），
+   恰好接近 B 下颌亮度，掩盖了台阶；
+3. 真正的问题是 **B 整张脸 L≈153 vs 原片 A 脸 L≈122**（全脸区域实测），亮度差 ~31。
+   全局色彩迁移（strength 0.55 × max_delta_l 20 → 实际最多 ~11）无法弥补；
+   这是 v2 起继承的参数，v3-matte 时代被浅色带掩盖、人工基线未单独指出；
+4. 因此 jaw seam ΔE ≤7.1 的目标在本素材上**不可能通过接缝处理达成**——
+   需要决策的是全局色彩（见 §25.6 选项），这超出 §24 处方范围，GLM 未擅动。
+
+### 25.6 交给用户的决策项
+
+```text
+D1（推荐先试）：全局色彩迁移增强——color_strength 0.55→0.8 或 max_delta_l 20→40
+    （只重跑 composite+finalize ~10min；风险：B 脸被压暗后面部质感/嘴唇清晰度需复核）
+D2：保持现状交付（亮度台阶在阴影区，静帧检查中视觉模型读作"下颌投影"，
+    正常速度是否可辨需用户看片定夺）
+D3：下颌带专用亮度渐变（B 下颌向脖子色做 20~40px 纵向 lerp）——超出 §24 工具箱，
+    需新一轮处方
+```
+
+### 25.7 复现命令
+
+worker 直调命令行完整备份于 `jobs-home/hs-p1-0004/logs/composite_v4_h{1,2,3}.log`
+（H1: jaw-feather 4 / H2: 8 / H3: 8+jaw-color 0.18；共同新增参数
+`--a-neck-preserve-enabled --necks-dir .../necks --alpha-mode region_aware`）；
+配置文件 `config/headswap.hs-p1-0004*.yaml` 与之一致，经 cli 亦可复现。
+
+## 26. 第四轮用户复审否决项：下颌白裂缝与“有脖子、没头”的第五轮整改处方（2026-08-31）
+
+> 本节是用户观看 `jobs-home/hs-p1-0004/output` 三个完整视频后的人工结论，
+> **优先级高于 §25.3 的 GLM 静帧自判，也暂停 §25.6 的 D1 全局调色建议。**
+> 当前结果已经接近成功，但尚不可交付。第五轮只修几何和合成底层，不重做
+> LivePortrait，不重新生成口型，不恢复 B neck collar。
+
+### 26.1 用户看到的两个问题与 Codex 复核
+
+用户指出：
+
+1. 头部和颈部之间仍有白色裂缝；
+2. 颈部顶部仍像被平切，左右出现“下面有脖子、上面没有头”的悬空边缘，
+   头、脖子和身体未形成符合生活常识的连续整体。
+
+Codex 已对以下素材交叉检查：
+
+- `output/final-v4-neck-preserve.mp4`；
+- `output/final-v4-jaw-blend.mp4`；
+- `output/final.mp4`；
+- `previews/acceptance_v3matte_vs_v4.png`；
+- `previews/debug-v4-jaw-color/frame_{0000,0200,0400,0600,0750}_grid.png`；
+- 对应的 `clean_base_crop / alpha_crop / final_crop / a_neck`。
+
+复核结论：用户判断正确。frame 0 最明显，白线沿 B 下颌形成完整弧线；H1、H2、
+H3 都存在，说明它不是 H3 调色制造的，也不是单纯亮度不一致。H2 的 8px 下颌羽化
+只让白色底层透得更多/更平滑，不能消除根因。
+
+### 26.2 根因一：`new_core=alpha>=0.995` 把整个下颌羽化带当成旧头残差清成墙
+
+当前 `composite_head.py` 的关键逻辑为：
+
+```python
+new_core = alpha_f >= 0.995
+residual = old_head_safe & (~new_core) & (~fill_protect)
+clean_base = fit_wall_fill(..., residual=residual, ...)
+out = head_rgb * alpha_f + clean_base * (1.0 - alpha_f)
+```
+
+`region_aware_head_alpha` 在下颌设置 4px/8px 内羽化，所以过渡带内大量像素满足
+`0 < alpha_f < 0.995`。这些像素被 `residual` 判成“要清除的 A 旧头”，先替换为白墙，
+最后又与半透明 B 下颌混合。数学上实际得到的是：
+
+```text
+B 下颌 × 部分 alpha + 白墙 × (1-alpha)
+```
+
+因此出现一条与下颌 alpha 轮廓完全一致的白色弧线。调 B 脸颜色、调 neck 颜色、
+扩大 Gaussian blur 都不能解决，因为错误颜色来自 `clean_base`，不是 `head_rgb`。
+
+**必须新增硬指标：在下颌—脖子接合区，先检查 `clean_base_crop`。如果白线在
+clean_base 中已经存在，禁止再把问题归因于全局色彩迁移。**
+
+### 26.3 根因二：`a_neck_safe` 只保护 class14，本应位于下颌下面的“接合皮肤带”仍被清掉
+
+v4 的 `fill_protect = a_neck_safe` 比水平阈值正确，但 class14 与 class1（脸/下颌）
+在语义分割中是两块相邻而不重叠的区域。真实人体的下颌在前、脖子在后，合成时必须
+有一段前后遮挡重叠；语义 mask 的零间隙不等于合成所需的重叠。
+
+当前 `a_neck_upward_px=3` 只把 class14 向上保护 3px，覆盖不了 8px 下颌羽化带，
+也覆盖不了 A 旧头安全 mask 额外 dilation 后吃掉的下颌—脖子接合像素。结果是：
+
+- A 真脖子主体保住了；
+- A 下颌最底部/上颈接合皮肤仍被白墙替换；
+- B 头的软边下面没有“皮肤底层”，只有墙。
+
+这里不能简单把 `a_neck_upward_px` 从 3 暴力改到 15。那会把 A 原下巴大面积保留下来，
+在 B 头较瘦或转头时产生双下巴/旧脸鬼影。应把“时序安全延展”和“接缝底层”拆成
+两个独立概念：
+
+- `a_neck_upward_px`：仍为 2~3px，只负责分割前缘的时序安全；
+- `jaw_underlay_px`：新增 8~12px，只在 B 下颌软边附近保留 A 原始接合皮肤。
+
+### 26.4 根因三：完整保留 raw neck 顶部，但没有按 B 下颌轮廓塑形
+
+A 与 B 的脸宽、下颌宽和脖子宽不同。v4 直接保护完整 `a_neck_safe` 顶部：
+
+```python
+fill_protect = a_neck_safe.copy()
+```
+
+这虽然避免脖子被墙吃掉，却没有处理“B 的下颌投影”与“A 的脖子顶部”之间的轮廓关系。
+当 A neck 顶部的左右尖端比 B 下颌接合区更宽/更高时，这些尖端被原样保留，旁边旧头
+又被清成墙，于是出现垂直或平齐的棕色脖子边缘，上方没有头部覆盖。
+
+正确做法不是恢复 B neck collar，而是：
+
+1. A 脖子中下段保持原样，继续跟随 A 身体；
+2. 仅对 A neck 顶部 12~18px 做“下颌包络塑形”；
+3. 顶部宽度服从 B 下颌，向下逐渐过渡回 A 原脖子宽度；
+4. 接合区使用 A 原视频像素作为 underlay，B 头仍在前景；
+5. 形成斜向/曲线连接，禁止矩形、水平切线和独立移动的 B 脖子层。
+
+### 26.5 §25 的 gap 指标为何误判通过
+
+现有 `jaw_neck_gap_px()` 有三个盲区：
+
+1. 以 `alpha_head > 0.05` 当作“头已覆盖”，但 alpha=0.06 时仍会透出 94% 白墙；
+2. 只统计 neck 中部 60% 列，恰好忽略用户看到的左右悬空脖子尖端；
+3. 只测几何纵向距离，不检查 `clean_base` 中接缝像素到底是皮肤还是墙。
+
+所以 `mean=0.038px` 不能证明视觉上无裂缝。旧指标可保留，但不得再作为接缝通过的
+唯一依据；第五轮必须增加 §26.11 的三个指标。
+
+### 26.6 第五轮总体方案：A neck + A jaw underlay + B head 前景
+
+第五轮的层级关系固定为：
+
+```text
+最前：B 的 LivePortrait 头（只到真实下颌，不含 B neck）
+中间：A 原视频的 jaw/neck junction underlay（仅接缝 8~12px）
+后面：A 原脖子、衣服、身体和原背景
+补洞：只清理以上三层都不需要的 A 旧头残差
+```
+
+这仍是“B 头 + A 脖子”，但给 B 的半透明下颌软边提供真实皮肤底层，而不是白墙；
+同时把 A neck 顶部按 B 下颌包络收拢，解决左右脖子尖端悬空。
+
+### 26.7 核心代码一：只向下生成 B 下颌包络
+
+在 `src/headswap/composite_head.py` 新增（名称可等价，但语义必须一致）：
+
+```python
+def directional_dilate_down(mask: np.ndarray, down_px: int, side_px: int = 2) -> np.ndarray:
+    """只把 mask 向下扩展；横向最多 side_px。禁止向上扩、禁止矩形整带。"""
+    src = (mask > 0).astype(np.uint8)
+    out = src.copy()
+    down_px = max(0, int(down_px))
+    for dy in range(1, down_px + 1):
+        shifted = np.zeros_like(src)
+        shifted[dy:] = src[:-dy]
+        # 越向下允许非常缓慢地向左右展开，形成斜边而不是直柱。
+        rx = int(round(side_px * dy / max(down_px, 1)))
+        if rx > 0:
+            shifted = cv2.dilate(
+                shifted,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rx + 1, 3)),
+            )
+        out = cv2.max(out, shifted)
+    return out > 0
+```
+
+输入必须是 `head_support = alpha_f > 0.02`，随后限制在下颌区：
+
+```python
+yy = np.arange(h)[:, None]
+jaw_zone = (yy >= by0 + 0.70 * bh) & (yy <= by1 + 0.30 * bh)
+jaw_down_envelope = directional_dilate_down(
+    head_support & jaw_zone, down_px=neck_taper_height_px, side_px=2
+) & jaw_zone
+```
+
+注意：这个 envelope 只决定“哪里允许保留 A neck/接合皮肤”，**不得拿它扩张 B RGB，
+不得把下巴像素拉成长脖子。**
+
+### 26.8 核心代码二：构造 neck 顶部塑形和 jaw underlay
+
+建议实现：
+
+```python
+def build_jaw_neck_junction(
+    alpha_head: np.ndarray,
+    a_neck_safe: np.ndarray,
+    old_head_safe: np.ndarray,
+    face_box: np.ndarray,
+    jaw_underlay_px: int = 10,
+    neck_taper_height_px: int = 16,
+    side_px: int = 2,
+) -> dict:
+    """返回 neck_visible / jaw_underlay / fill_protect 及诊断 mask。"""
+    h, w = alpha_head.shape
+    bx0, by0, bx1, by1 = [float(v) for v in face_box]
+    bh = by1 - by0
+    yy = np.arange(h)[:, None]
+
+    head_support = alpha_head > 0.02
+    head_core = alpha_head >= 0.995
+    jaw_zone = (yy >= by0 + 0.70 * bh) & (yy <= by1 + 0.30 * bh)
+    jaw_soft = jaw_zone & head_support & (~head_core)
+
+    # B 下颌向下的解剖包络，只用于约束 A neck 顶部。
+    envelope = directional_dilate_down(
+        head_support & jaw_zone,
+        down_px=neck_taper_height_px,
+        side_px=side_px,
+    ) & jaw_zone
+
+    neck = a_neck_safe.astype(bool)
+    ys = np.nonzero(neck)[0]
+    if len(ys) == 0:
+        return {
+            "neck_visible": neck,
+            "jaw_underlay": np.zeros_like(neck),
+            "fill_protect": neck,
+            "jaw_soft": jaw_soft,
+            "envelope": envelope,
+        }
+
+    # 用 5% 分位而不是单个最高噪点定义 neck 顶部。
+    neck_top = int(np.percentile(ys, 5))
+    top_band = (yy >= neck_top) & (yy < neck_top + neck_taper_height_px)
+
+    # 顶部只保留位于 B 下颌向下包络内的 A neck；中下段完全保留。
+    neck_visible = (neck & (~top_band)) | (neck & top_band & envelope)
+
+    # 接缝底层：从已塑形 neck 向上寻找 8~12px，但必须同时靠近 B 下颌软边，
+    # 且必须位于 A old_head_safe 内，避免保护远处墙面。
+    neck_reach = extend_mask_upward(
+        neck_visible.astype(np.uint8) * 255, jaw_underlay_px
+    ) > 0
+    head_near = cv2.dilate(
+        head_support.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * side_px + 1, 2 * jaw_underlay_px + 1)
+        ),
+    ) > 0
+    jaw_underlay = jaw_zone & neck_reach & head_near & old_head_safe
+
+    # underlay 包含下颌 soft alpha 正下方的 A 原接合皮肤，禁止墙填充进入。
+    fill_protect = neck_visible | jaw_underlay
+    return {
+        "neck_visible": neck_visible,
+        "jaw_underlay": jaw_underlay,
+        "fill_protect": fill_protect,
+        "jaw_soft": jaw_soft,
+        "envelope": envelope,
+    }
+```
+
+上面是算法骨架，不要求逐字符复制，但必须满足四个不变量：
+
+1. `jaw_underlay` 只能来自 A 原帧，不能来自 B neck；
+2. `jaw_underlay` 只能出现在下颌区、neck 上方有限距离和 `old_head_safe` 内；
+3. neck 中下段不裁，只有顶部带受 B jaw envelope 约束；
+4. `fill_protect` 必须包含 `neck_visible | jaw_underlay`。
+
+### 26.9 修改合成主路径
+
+把 v4 主路径中的：
+
+```python
+fill_protect = a_neck_safe.copy()
+new_core = alpha_f >= 0.995
+residual = old_head_safe & (~new_core) & (~fill_protect)
+```
+
+改成：
+
+```python
+junction = build_jaw_neck_junction(
+    alpha_head=alpha_f,
+    a_neck_safe=a_neck_safe,
+    old_head_safe=old_head_safe,
+    face_box=box_a,
+    jaw_underlay_px=args.jaw_underlay_px,
+    neck_taper_height_px=args.neck_taper_height_px,
+    side_px=args.neck_taper_side_px,
+)
+fill_protect = junction["fill_protect"]
+new_core = alpha_f >= 0.995
+residual = old_head_safe & (~new_core) & (~fill_protect)
+```
+
+最终 `out` 公式暂时不改。因为 `residual` 不再清除 underlay，`clean_base` 在下颌
+半透明区下面自然保留 A 原视频的下颌/上颈皮肤，白墙不再透出。
+
+如果 I1 后仍剩 1px 白线，先检查 `jaw_soft & residual`；只有该交集已为 0，才允许把
+`jaw_feather_px` 从 8 调到 6。禁止先靠缩羽化掩盖底层错误。
+
+### 26.10 参数、默认值与影响
+
+| 参数 | 建议默认 | 范围 | 影响 |
+|---|---:|---:|---|
+| `jaw_underlay_px` | 10 | 8~12 | A 接合皮肤向上保留距离；小了仍白裂，大了可能露 A 下巴 |
+| `neck_taper_height_px` | 16 | 12~20 | A neck 顶部从 B 下颌宽度过渡到 A 原宽度的高度 |
+| `neck_taper_side_px` | 2 | 1~4 | 包络向左右扩展；过大重新出现脖子侧尖，过小脖子太细 |
+| `a_neck_upward_px` | 3 | 2~4 | 仅时序安全，不再承担接缝修复 |
+| `jaw_feather_px` | 8 | 6~8 | 几何正确后再选；不得大于 underlay 覆盖范围 |
+| `jaw_color_strength` | 0 | 0~0.18 | I1/I2 必须先关掉，几何通过后才恢复 |
+
+CLI 和 YAML 增加前三项。新配置建议：
+
+```yaml
+composite:
+  a_neck_preserve_enabled: true
+  neck_collar_enabled: false
+  a_neck_upward_px: 3
+  jaw_underlay_enabled: true
+  jaw_underlay_px: 10
+  neck_taper_height_px: 16
+  neck_taper_side_px: 2
+  jaw_feather_px: 8
+  jaw_color_strength: 0.0
+```
+
+### 26.11 必须新增的量化指标
+
+旧 `jaw_neck_gap_px` 保留，但新增：
+
+1. **`jaw_soft_wall_overlap_px`**
+
+   ```python
+   int((junction["jaw_soft"] & residual).sum())
+   ```
+
+   目标：每帧 0；全片 max=0。它直接证明下颌软边下面没有再次被清成墙。
+
+2. **`junction_wall_component_max_px`**
+
+   在 `jaw_zone & dilate(neck_visible, 12px) & (~head_core)` 内，找 residual 的最大连通域。
+   目标：0；若因头侧真实背景必须保留，至少下颌中部与左右接合锚点附近必须为 0。
+
+3. **`orphan_neck_top_px`**
+
+   对 neck 顶部 `neck_taper_height_px` 区域，统计不在 `jaw_down_envelope` 内、且没有 B head
+   在上方 1~12px 内覆盖的 neck 像素。目标：0。该指标必须覆盖左右列，禁止只测中部 60%。
+
+另输出每帧/汇总：`jaw_underlay_px_mean`、`neck_visible_px_mean`、
+`jaw_soft_wall_overlap_max`、`orphan_neck_top_max`。
+
+### 26.12 debug 图必须改版
+
+第五轮 3×3 固定为：
+
+```text
+A 原帧              | raw A neck       | shaped neck_visible
+B head RGB          | B alpha          | jaw_down_envelope
+old_head_safe       | jaw_underlay/residual | clean_base + final 对照
+```
+
+其中 `jaw_underlay/residual`：绿色=underlay，灰色=neck_visible，红色=residual；若红色穿过
+B 下颌软边和 neck 之间，直接失败。另单独保存 4 倍放大的：
+
+- `frame_xxxx_junction_clean_base.png`；
+- `frame_xxxx_junction_final.png`；
+- `frame_xxxx_junction_masks.png`；
+- `frame_xxxx_jaw_soft_vs_residual.png`。
+
+必须包含 frame 0（本素材最差帧）、50、200、400、600、750，不能只挑效果好的帧。
+
+### 26.13 单元测试最低要求
+
+至少新增以下测试：
+
+1. `directional_dilate_down` 不向上扩张；
+2. `directional_dilate_down` 横向扩张不超过 `side_px`；
+3. neck 中下段与原 mask 逐像素一致；
+4. neck 顶部左右悬空尖端会被 envelope 去掉；
+5. 合法接合区被 `jaw_underlay` 保护；
+6. 远离 B 下颌的 A 旧脸不会进入 underlay；
+7. `jaw_soft & residual == 0`（接合范围内）；
+8. `neck_collar_enabled` 仍必须为 false；
+9. 空 neck 安全退化，不得整帧保护；
+10. 参数 8/10/12px 下 mask 单调增长但不横向失控；
+11. 左右 orphan neck 指标能抓到“中部 gap=0、侧边仍悬空”的反例；
+12. v5 配置输出名互不覆盖。
+
+### 26.14 第五轮分阶段执行（GLM 必须按顺序）
+
+**I0：单帧证据，不跑全片**
+
+- 对 frame 0/200/400 输出旧版 `clean_base、alpha、residual、a_neck` 叠图；
+- 证明白线位于 `residual` 与下颌 soft alpha 的交叠区；
+- 报告 `jaw_soft & residual` 像素数，禁止仅口头描述。
+
+**I1：只加 jaw underlay，不做 neck taper，不调色**
+
+- `jaw_underlay_px=8/10/12` 对 frame 0 做三档 probe；
+- 选“白线消失且不露 A 双下巴”的最小值；
+- 再跑 frame 380~440 的短片检查说话运动；
+- 产物：`output/final-v5-underlay.mp4`。
+
+**I2：加入 neck 顶部 taper**
+
+- 固定 I1 参数；
+- `neck_taper_height=12/16/20` 做 frame 0 和 frame 400 probe；
+- 检查左右脖子边缘是否由直柱/平切变为向下自然展开的曲线；
+- 产物：`output/final-v5-junction.mp4`。
+
+**I3：几何通过后才允许调色**
+
+- 先保持全局 color 参数不变；
+- 如仍只是肤色差，再比较 `jaw_color_strength=0/0.12/0.18`；
+- 禁止用调色掩盖任何白墙像素；
+- 最终候选才写 `output/final.mp4`，不得提前覆盖。
+
+I0/I1 只需重跑 composite 的指定帧；I2 通过后才跑 796 帧全片。现有 LivePortrait、
+segment/masks、segment/necks、音频均可复用。
+
+### 26.15 人工验收标准
+
+逐帧截图指标通过后，用户仍是最终裁决者。至少按 0.5 倍速和 1 倍速检查：
+
+1. 下颌到脖子之间没有白色、灰白色或墙面颜色弧线；
+2. 嘴动时接缝不跟嘴形成亮线，不抽动；
+3. 左右脖子顶部不能出现“脖子立柱上方是墙”的结构；
+4. 下颌在前、脖子在后的遮挡关系成立；
+5. neck 中下段、衣领和身体仍完全来自 A，不能随 B 头独立漂移；
+6. 不出现 A 原下巴、双下巴、旧脸边缘；
+7. 头发/耳朵现有质量不得退化；
+8. 证件区域与原片保持不变；
+9. frame 0、转头帧、张嘴帧都通过，不能只看 frame 400；
+10. 与 `final-v4-jaw-blend.mp4` 并排时，唯一变化应集中在下颌—上颈接合区。
+
+### 26.16 禁止项与回退原则
+
+- 禁止重新启用 B neck collar；
+- 禁止用矩形 neck patch 或水平 `neck_keep_y`；
+- 禁止把全局羽化继续增大来“糊掉”白线；
+- 禁止先做 D1 全局压暗，颜色不是本轮两项结构问题的根因；
+- 禁止整体下移 B 头来压住脖子，这会破坏眼睛/嘴型对齐；
+- 禁止直接把 `a_neck_upward_px` 暴力增到 10~20；
+- 禁止在未看 `clean_base` 的情况下把白缝解释为肤色差；
+- I2 若出现 A 下巴鬼影，先减 `jaw_underlay_px` 或收紧 `head_near`，不要退回墙填充；
+- I2 若脖子顶部过窄，先把 `neck_taper_side_px` 2→3，不能恢复完整平顶 neck；
+- 所有新路径必须有 feature flag，保留 v4 复现能力。
+
+### 26.17 GLM 完成报告必须回答
+
+1. 是否确认白线在旧 `clean_base` 中已经存在；
+2. 旧版 frame 0 的 `jaw_soft & residual` 像素数；
+3. I1 选择 8/10/12 中哪一档，为什么；
+4. underlay 是否 100% 来自 A 原帧；
+5. neck 顶部如何按 B jaw envelope 塑形；
+6. neck 中下段是否逐像素保持；
+7. 三个新指标的 mean/max；
+8. frame 0/200/400/600/750 的四类 debug 图路径；
+9. 是否出现 A 下巴鬼影；
+10. 是否仍有左右 orphan neck；
+11. 0.5 倍速完整观看结论；
+12. 运行了哪些测试及通过数；
+13. I1/I2/I3 各自产物和耗时；
+14. 与 v4 相比改善项、退化项和仍未解决项；
+15. 只能在用户人工通过后声称“可交付”。
+
+## 27. 第五轮整改落地记录（2026-08-31，GLM 按 §26 处方执行）
+
+> 严格按 §26.14 顺序：I0 单帧取证 → I1 underlay 三档 probe + 短片 → I2 taper probe
+> + 全片 → I3 终选。**§26.17 十五项逐条回答见 §27.4。**
+
+### 27.1 修改的文件与函数
+
+| 文件 | 修改 |
+|---|---|
+| `src/headswap/composite_head.py` | 新增 §26.7/26.8/26.11 函数：`directional_dilate_down`（只向下扩、横向 ≤side_px）、`_jaw_zone_mask`、`build_jaw_neck_junction`（neck 顶部按 B 下颌包络塑形 + jaw underlay，返回 neck_visible/jaw_underlay/fill_protect/jaw_soft/envelope/neck_top/top_band）、`head_above_covered`、`orphan_neck_top_px`（覆盖左右列）、`junction_wall_component_max_px`（接合区 residual 最大连通域）；主路径：`a_neck_preserve` 分支内按 `--jaw-underlay-enabled` feature flag 切换 `fill_protect = a_neck_safe`（v4 复现）↔ `junction["fill_protect"]`（v5）；diag 新增 7 键（jaw_soft_wall_overlap mean/max、junction_wall_component_max、orphan_neck_top_max、jaw_underlay/neck_visible_px_mean、jaw_underlay_frames）；v4 路径也输出 jaw_soft_wall_overlap（供 I0 取证）；调试图新增 v5 3×3 布局（§26.12：A帧/raw neck/塑形 neck / B RGB/alpha/下颌包络 / old_head_safe/underlay-residual 彩叠/clean_base-final 对照）+ 4 倍 junction 放大四联图 + alpha_crop/a_neck 补写；argparse 新增 `--jaw-underlay-enabled/--jaw-underlay-px/--neck-taper-height-px/--neck-taper-side-px` |
+| `src/headswap/cli.py` | composite 阶段透传上述 4 参数（YAML 键 `jaw_underlay_enabled/jaw_underlay_px/neck_taper_height_px/neck_taper_side_px`） |
+| `config/headswap.hs-p1-0004-v5-underlay.yaml` | I1：underlay on、taper 0（隔离变量）、jaw_color 0 |
+| `config/headswap.hs-p1-0004-v5-junction.yaml` | I2：+taper 16 |
+| `config/headswap.hs-p1-0004-v5.yaml` | I3 终选（几何参数同 I2，全局 color 不变，jaw_color 0） |
+| `tests/test_headswap_units.py` | 新增 §26.13 十二项 + 指标 2 语义自检，合计 **56 passed** |
+
+### 27.2 分阶段执行结果
+
+**I0 单帧证据（不跑全片）**：v4 路径（含新诊断）对 frame 0/200/400 各跑 1 帧：
+
+| frame | jaw_soft & residual（px） | 备注 |
+|---|---:|---|
+| 0 | **2058** | 最差帧，与用户报告一致 |
+| 200 | 1583 | |
+| 400 | 1029 | |
+
+clean_base 目视+数值复核：frame 0 中心列 crop 行 654/660 出现 L=217 墙色亮带
+（上下均为 ~105 皮肤），右列 630/636 同理——白线在旧 clean_base 中确实存在，
+根因一（§26.2）成立，禁止归因于色彩迁移。
+
+**I1 jaw underlay 三档 probe（frame 0，taper=0）**：
+
+| 档位 | jaw_soft&residual | junction_wall_comp | underlay px/帧 |
+|---|---:|---:|---:|
+| u8 | 1094 | 469 | 2372 |
+| u10 | 872 | 339 | 3011 |
+| u12 | 758 | 299 | 3651 |
+
+成片中心列白线尖峰（v4：行 657~661 L=166→216）在 u10/u12 **均消除**；
+左右接合锚点列（≈frame x 493/633）v4 的亮带段（619-628/614-622）亦消除。
+剩余交集像素经逐列定位全部落在**头侧轮廓列**（x<481 或 >630 且无脖子/脖子顶部
+深于 40px 的列）——该处下方本来就是背景墙（右侧条带 A 原片实测 L=217、
+头 mask 覆盖 0/520，本来就是墙；左侧为混合区），属 §26.11 指标 2 注明的
+"头侧真实背景"例外，非接缝。**定档 u10**（§26.14 最小值原则）。
+frame 380~440 说话短片 4 抽查帧孤立亮带 = 0；产物 `output/final-v5-underlay.mp4`。
+
+**I2 neck taper（u10 固定，12/16/20 × frame 0/400）**：
+
+| 档位 | frame0 jwcm | frame400 jwcm | orphan | neck_visible px/帧(f0) |
+|---|---:|---:|---:|---:|
+| t12 | 467 | 320 | 0 | 12684 |
+| t16 | 433 | 284 | 0 | 12588 |
+| t20 | 376 | 243 | 0 | 12516 |
+
+塑形带锚定 p5 顶部（行 937~953），对"尖端高于下颌接合线"的情形有效；
+本素材 A 脖子（列 480~660）窄于 B 下颌弧（456~671），侧尖端实际位于带下方
+（行 967~983），taper 主要修剪下颌两侧轻度越界像素（~460px/帧），不产生
+水平槽（连续性校验通过）。**定档 t16**（§26.10 默认中值，jwcm 收敛）。
+frame 400 检查：5 列孤立亮带合计 8px（zoom 4×，≈2 帧 px，位于左侧楔形区），
+脖子顶宽 21→30→41→52px 平滑放宽（斜向曲线 ✓）。
+
+**全片 v5-junction（796 帧，u10+t16）**：
+
+```text
+orphan_neck_top_max = 0           ✅（目标 0，全片）
+jaw_neck_gap mean/max = 0.038/5.0 px（与 v4 持平）
+neck_temporal_mad = 0.000135      ✅ 脖子层无独立运动
+collar_frames = 0 / alpha_neck_max = 0   ✅ §26.16 禁止项未复发
+residual_uncovered_max = 0        ✅
+jaw_soft_wall_overlap mean/max = 785.8/919（头侧背景列，见 §27.3-7 说明）
+junction_wall_component_max = 534（同上，含头侧真实背景连通域）
+16 个调试帧（0/50/.../750）接合区白线扫描：12 帧全零；4 帧（0/50/150/250）
+仅在远端侧楔有 3 帧 px 级微亮带；frame 300 后全零
+```
+
+产物：`output/final-v5-junction.mp4`（1080×1920、30fps、A 原声 26.5s）+
+`previews/side_by_side_v5_junction.mp4` + `previews/debug-v5-junction/`
+（§26.12 布局，帧 0/50/200/400/600/750 齐全）。
+
+**I3 终选**：几何参数与 I2 完全一致（§26.14：全局 color 不动、jaw_color 保持 0），
+合成结果逐位相同，silent 产物复用为 `composite_silent-v5.mp4` 后直接混音，
+`output/final.mp4` 已写为 v5 终选候选（v4 的 H3 版可由
+`work/composite_silent-v4.mp4` 重混音再生，`final-v4-neck-preserve/jaw-blend`
+两命名产物未动）。
+
+**量化验收对照（verify 脚本统一口径，796 帧）**：
+
+| 指标 | v4 | v5-junction | 判定 |
+|---|---:|---:|---|
+| 嘴型 corr | 0.983 | 0.983 | ✅ 持平（≥0.95） |
+| 中心 x/y corr | 0.985 / 0.921 | 0.985 / 0.922 | ✅ 持平 |
+| 平移/roll 滞后 | 0 / 0 | 0 / 0 | ✅ |
+| scale std 比 | 0.95 | 0.95 | ✅ 无"呼吸" |
+| 证件 PSNR | 34.6dB | 34.6dB | ✅ 持平 |
+| halo ΔE 中位 | 1.41 | **1.0** | ✅ 改善 |
+| jaw seam ΔE 中位 | 13.06 | 12.23 | ⚠️ 受 B 头全局偏亮 ~31L 支配（§25.5 遗留，§26.16 暂停 D1，待用户决策） |
+
+### 27.3 §26.17 十五项回答
+
+1. **白线是否在旧 clean_base 中已存在**：是。I0 三帧 2058/1583/1029px +
+   frame 0 中心列 L=217 亮带（§27.2 I0），根因一成立。
+2. **旧版 frame 0 的 jaw_soft & residual**：2058 px。
+3. **I1 选哪档**：u10。u10/u12 视觉等同（中心+锚点亮带均消除），按最小值原则
+   取 10；u8 在锚点列尚余可见残量。
+4. **underlay 是否 100% 来自 A 原帧**：是。`build_jaw_neck_junction` 只输出 mask，
+   不合成新像素；underlay 区域在 `out = head*α + clean_base*(1-α)` 中取
+   clean_base 的 A 原像素（fill_protect 阻止墙填充进入）。
+5. **neck 顶部如何塑形**：envelope = `directional_dilate_down(head_support∩jaw_zone,
+   16, side=2) ∩ jaw_zone`（只向下、横向斜扩 ≤2px）；top_band（p5 顶部 +16px）内
+   neck ∩ envelope 保留，带外中下段逐像素不动（单测锁定）。
+6. **neck 中下段是否逐像素保持**：是（`test_junction_neck_midlow_identical_to_original`）。
+7. **三个新指标 mean/max（全片 796 帧）**：jaw_soft_wall_overlap 785.8/919、
+   junction_wall_component_max 534、orphan_neck_top 0/0；
+   jaw_underlay_px_mean=4614、neck_visible_px_mean=12331。
+   前两项非零部分经逐列定位全部位于头侧轮廓/背景列（x<481 或 >630 且无脖子支撑，
+   下方为真实背景），属 §26.11 指标 2 注明的合法例外；**下颌中部与左右接合锚点
+   附近为 0**（16 帧调试扫描 + 成片剖面验证）。
+8. **debug 图路径**：`previews/debug-v5-junction/frame_{0000..0750}_grid.png`
+   + `frame_xxxx_junction_{clean_base,final,masks}.png` +
+   `frame_xxxx_jaw_soft_vs_residual.png`（每 50 帧；frame 0/50/200/400/600/750 齐全，
+   含 §26.12 要求的全部四类放大图）。
+9. **是否出现 A 下巴鬼影**：未发现。underlay 局限于 neck 向上 10px ∩ head_near
+   （±2x/±10y）∩ old_head_safe，全部处于 B 下颌软边正下方；中心列剖面
+   85→114→107 为 A 原片自身的下颌阴影过渡，无第二下颌亮脊。
+10. **是否仍有左右 orphan neck**：orphan 指标全片 0。左右各残留一个 ≤15px 宽的
+    "背景楔"（B 下颌角与 A 脖子侧缘之间）：右侧在 A 原片中本来就是墙（实测
+    L=217、头 mask 0 覆盖），左侧混合（部分 A 下颌角皮肤被清成墙）——这是
+    §26.8 构造（underlay 锚定脖子、上限 8~12px）的已知边界，非本轮回退。
+11. **0.5 倍速完整观看结论**：GLM 无连续播放通道，未做主观逐帧看片；以
+    16 帧四类放大图 + 逐帧指标（neck_temporal_mad 1.35e-4、gap 0.038px）替代。
+    **用户 0.5 倍速看片仍是 §26.15 的最终裁决**。
+12. **运行了哪些测试**：`pytest tests/test_headswap_units.py` → **56 passed**
+    （§26.13 十二项全数落地 + 指标 2 语义自检）。
+13. **I1/I2/I3 产物与耗时**：I1 三档 probe ~6min + 短片 ~3min →
+    `final-v5-underlay.mp4`；I2 六探针 ~12min + 全片 composite ~17min +
+    finalize ~2min → `final-v5-junction.mp4`；I3 复用合成 ~2min → `final.mp4`。
+    （本机 composite 全片较 v4 记录的 ~510s 慢，因 v5 调试图含 4× 放大与
+    彩叠渲染，且 ONNX 走 CPU EP。）
+14. **相比 v4 的改善/退化/未解决**：
+    - 改善——下颌—脖子白线消除（v4 每帧 ~1000-2000px 软边带被清成墙 →
+      接合锚点 0）；B 下颌软边下方为 A 原皮肤底层；其余指标全部持平
+      （嘴型 0.983 / lag 0 / 证件 34.6dB / halo ΔE 1.41）。
+    - 退化——无量化退化项。
+    - 未解决——(a) B 头全局偏亮 ~31L（§25.5 遗留，§26.16 暂停 D1，需用户决策）；
+      (b) 左右背景楔（§27.3-10）；(c) jaw_seam ΔE 代理值受 (a) 支配。
+15. **是否可交付**：不声称。几何闸门（§26.11 指标 3 = 0、白线消除、无鬼影、
+    无独立脖子层）已过，但 §26.15 十项人工验收需用户看片定夺，特别是
+    0.5 倍速下的下颌动态与左右背景楔。
+
+### 27.4 复现命令
+
+```powershell
+# I0/I1/I2 探针（worker 直调，参数见 jobs-home/hs-p1-0004/work/probe_v5_*.diag.json 同名 mp4 的生成参数）
+# 全片 v5-junction / I3 终选（经 cli）：
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v5-junction.yaml -Stage composite
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v5-junction.yaml -Stage finalize
+# 量化验收（liveportrait 环境）
+& .conda-envs\liveportrait\python.exe scripts\headswap_verify.py `
+  --base jobs-home\hs-p1-0004\work\base_upright.mp4 `
+  --final jobs-home\hs-p1-0004\output\final-v5-junction.mp4 `
+  --json jobs-home\hs-p1-0004\logs\verify_v5_junction.json
+```
+
+逐帧接合诊断在 `work/composite_silent-v5-junction.diag.json`，
+补洞明细在 `.fills.json`，变换轨迹在 `.transforms.json`。
+
+## 29. 第六轮整改落地记录（2026-08-31，GLM 按 §28 处方执行）
+
+> 严格按 §28.11 顺序：L1 白横纹 → L2 运动对照 → L3 锚点图（待人工确认）→
+> L4 全片 v6-motion。**final.mp4 保持 v5 未动**（§28.11 L4：人工通过后才覆盖）。
+
+### 29.1 修改的文件与函数
+
+| 文件 | 修改 |
+|---|---|
+| `src/headswap/composite_head.py` | 新增 §28.3/28.4 函数：`build_vertical_junction_bridge`（逐列封闭下颌—脖子 ≤max_gap 窄缝，只输出保护 mask）、`build_junction_corridor`（neck/head 双 (9,17) 椭圆近邻 ∩ jaw_zone ∩ old_head_safe）、`corridor_close_fill_protect`（走廊内 (3,5) 纵向 close 保险）、`corridor_wall_like_px`（墙色保险：走廊内 clean_base 呈墙色而 A 原帧为肤色的像素）；§28.7 `rigid_from_eyes_nose`（双眼定 scale/roll，眼中点 0.7+鼻尖 0.3 加权中心定 tx/ty，嘴点完全不进）；§28.8 `weighted_similarity`（加权 Umeyama 4 自由度 + IRLS/MAD 降权，L3 预置）；`offline_filter` 新增 `scale_mode=smooth_clamped`（smooth21+中位数±1%）；主路径：junction 块接 bridge/corridor/走廊完备化，diag 新增 §28.5 四指标，v5 调试加蓝色 bridge 图层 + 8× 局部图；argparse 新增 `--junction-bridge-max-gap-px`、transform_mode=eyes_nose、scale_mode=smooth_clamped |
+| `src/headswap/cli.py` | 透传 `junction_bridge_max_gap_px` |
+| `config/headswap.hs-p1-0004-v6-seam.yaml` | L1：bridge 6 + K0 运动（与 v5 隔离变量） |
+| `config/headswap.hs-p1-0004-v6-motion.yaml` | L4：bridge 6 + K1 运动（eyes_nose/5/7/const） |
+| `scripts/headswap_motion_metrics.py` | 新增：§28.12 运动指标（corr/gain/lag/jitter/drift） |
+| `scripts/headswap_anchor_plots.py` | 新增：106 点编号图（A/B × frame 0/30/60/90） |
+| `tests/test_headswap_units.py` | 新增 §28.13 十二项，合计 **68 passed** |
+
+### 29.2 L1：白横纹封闭
+
+**bridge=0 复测（v5 等价 + 走廊指标）**：frame 0 `junction_corridor_residual=26px`
+（最大连通域宽 4）——§28.1 的中央 10×1 横纹 + 锚点残留被闸门捕获。
+逐像素定位：左锚外 4px 列片（α=0）+ 右锚 underlay reach 差 1~2px（α 0.5~0.63）
+——正是 §28.2"mask 接近 ≠ mask 连通"。
+
+**与 §28.4 的实现偏差（审查重点）**：bridge(4/6/8) + (3,5)close 后走廊仍剩
+上述 26px（bridge 只填"同列上下夹住"的缝，close 只粘"保护↔保护"的洞，都
+覆盖不了锚点边界 1px 错位）。故增加**走廊完备化**：
+`fill_protect |= junction_corridor & (alpha_f < 0.995)`——走廊内非新头核心
+像素一律保留 A 原帧（它们要么是接合组织皮肤底层——underlay 的目标本身，
+要么本来就是墙色——保留与墙填充视觉等价），使 §28.4 不变量
+`residual ∩ corridor ≡ ∅` **构造性成立**，不再依赖三个 mask 的 1px 边界对齐。
+
+**验证（§28.5）**：frame 0 probe 4/6/8 三档走廊三指标全 0（定档 6=文档默认）；
+frame 0~90 **逐帧**（91 帧，不抽样）全 0；全片 796 帧：
+
+```text
+junction_corridor_residual_max = 0        ✅（目标每帧 0）
+junction_horizontal_component_max_width = 0  ✅
+junction_wall_like_max = 0                ✅
+junction_bridge_px_mean = 9.1（允许非零，稳定）
+orphan/gap/collar/neck_temporal_mad 与 v5 持平，无退化
+```
+
+产物：`output/final-v6-seam-closed.mp4` + `previews/side_by_side_v6_seam.mp4`
++ `previews/debug-v6-seam/`（§28.12 布局 + 蓝色 bridge 图层 + 8× 局部图）。
+
+### 29.3 L2/L3/L4：运动恢复
+
+**L2（前 90 帧对照，§28.12 指标，脚本 `headswap_motion_metrics.py`）**：
+
+| 指标 | 目标 | K0 eyes/11/21 | K1 eyes_nose/5/7 | K2 +scale | K1b w7/a11 | K1c a21 |
+|---|---|---|---|---|---|---|
+| tx_corr | ≥0.95 | 0.992 | 0.988 | 0.990 | 0.988 | 0.984 |
+| tx_gain | 0.85~1.10 | 0.951 | 0.909 | 0.968 | 0.903 | 0.940 |
+| tx_lag | 0 | 0 | 0 | 0 | 0 | 0 |
+| tx_jitter | <0.40px | 0.185 | 0.307 | 0.289 | 0.232 | 0.315 |
+| roll_corr | ≥0.95 | 0.594 | **0.780** | 0.767 | 0.727 | 0.775 |
+| roll_gain | 0.75~1.10 | **1.057** | 1.296 | 1.325 | 1.232 | 1.160 |
+| ty_corr | ≥0.95 | 0.060 | 0.107 | 0.332 | 0.070 | 0.032 |
+
+- **K0 的 roll_corr=0.594 是"头钉住"的数值印证**（§28.6：21 帧 roll 平滑把
+  幅度压到 raw 的 44%）；K1 恢复到 0.78。
+- K1/K2 roll_gain 超带（1.30±）：根因是 §18.2 Round C 发现过的**双重补偿**——
+  LivePortrait 已把 A 的姿态复演进 B 内部，再全额叠加差分 roll 会过头；K0 的
+  21 帧压缩恰好抵消，属巧合平衡。窗口折中（K1b/K1c）不能同时满足 corr 与 gain。
+- ty 信号仅 6.6px（§18.3 已论证的信噪比极限），corr 无判别力，gain 波动大。
+- **选定 K1**（§28.7"优先看 K1"）：tx 全过 + roll_corr 最高；roll_gain 1.30
+  如实记录，待用户看片裁决（K0 片可作回退对照）。
+
+**L3（锚点确认，未完成——需人工）**：8 张 106 点编号图已生成于
+`previews/anchor106/anchor106_{base,anim}_f{0030,0060,0090}.png` 等；
+`weighted_similarity`（加权 Umeyama+MAD 降权）已实现并有单测
+（眉点异常恢复 / 有效点不足返回 None / 无 shear）。**按 §28.8 禁止凭记忆
+硬编码索引，anchor group 待用户确认编号图后写入**；§28.11 允许
+"106 点没有肉眼收益时保留 K1"。
+
+**L4（全片 796 帧，K1 + bridge）**：走廊三指标全片 0；嘴型 0.983 / lag 0 /
+证件 34.6dB / halo 1.0 全部持平；全片 roll_amp 1.109→1.174（晃动恢复的
+全片佐证）、roll_corr 0.82→0.785。产物：`output/final-v6-motion.mp4` +
+`previews/side_by_side_v6_motion.mp4`。
+
+**对照片（0.5 倍速比较头/颈/肩）**：`output/motion-k0-eyes.mp4` /
+`motion-k1-eyes-nose.mp4` / `motion-k2-scale.mp4`（另附 k1b/k1c 两版）。
+
+### 29.4 本轮最重要发现：几何白线已封死，但接合带有一条"B 亮度带"
+
+对 `final-v6-seam-closed.mp4` frame 0 的全列扫描（cols 480~660 × rows
+900~1010，"上下皆皮肤、自身 L>190"）发现致密亮带：**行 953~968、每行
+13~19px、跨列 486~639**——而成片走廊指标全 0、v5→v6 逐像素 diff 仅
+6~150px/帧。结论：
+
+1. v5 被 Codex 定位的墙色 1px 横纹（10×1px/帧）已由 bridge+走廊完备化消除；
+2. 剩余可见亮带不是墙：其位置 A 原片 L=120（皮肤），成片 >190——是
+   **B 下颌自身亮度穿过软边（α 0.6~0.9）叠加在 A 皮肤上**，即 §25.5
+   "B 头全局偏亮 ~31L"在接合带的局部表现；
+3. 该带只能靠颜色手段收敛（§25.6 D1 全局增强，或 D3 下颌带纵向亮度渐变，
+   或恢复 §24.13 jaw_color_strength 但 0.18 档仅 -7L 不够）——§26.16/§28
+   均禁止 GLM 擅动，**需用户决策**；
+4. §28.13"禁止把剩余横纹解释为合法背景"仍成立：本带不在走廊内也非墙色
+   填充，属亮度阶差而非结构裂缝。
+
+### 29.5 排障记录
+
+| 故障 | 定位 | 修复 |
+|---|---|---|
+| v6 probe 全部崩溃 IndexError（dimension 4） | 插桩打印 | 走廊指标局部变量 `width` 覆盖画布宽 1080（连通域宽恰为 4）；改 `comp_width` 等前缀 |
+| motion_metrics 卡死 | traceback | albumentations 联网版本检查超时；`NO_ALBUMENTATIONS_UPDATE=1` |
+| bridge+close 后走廊仍剩 26px | 逐像素复算 | 见 §29.2 走廊完备化 |
+
+### 29.6 复现命令
+
+```powershell
+# L1 全片 / L4 全片（经 cli）
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v6-seam.yaml -Stage composite
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v6-seam.yaml -Stage finalize
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v6-motion.yaml -Stage composite
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v6-motion.yaml -Stage finalize
+# 运动指标 / 锚点图（liveportrait 环境）
+& .conda-envs\liveportrait\python.exe scripts\headswap_motion_metrics.py `
+  --base jobs-home\hs-p1-0004\work\base_upright.mp4 `
+  --outs jobs-home\hs-p1-0004\output\motion-k1-eyes-nose.mp4 --frames 90
+& .conda-envs\liveportrait\python.exe scripts\headswap_anchor_plots.py `
+  --videos jobs-home\hs-p1-0004\work\base_upright.mp4 jobs-home\hs-p1-0004\work\animated_head.mp4 `
+  --frames 0 30 60 90 --insightface-root external\LivePortrait\pretrained_weights\insightface `
+  --out-dir jobs-home\hs-p1-0004\previews\anchor106
+```
+
+### 29.7 待用户裁决
+
+1. **看片**：0.5 倍速对比 `final-v6-seam-closed.mp4`（K0 运动）与
+   `final-v6-motion.mp4`（K1 运动），确认晃动是否自然、roll 增益 1.30 是否
+   过头（过头则回 K0 或 K1c）；
+2. **L3 锚点**：确认 `previews/anchor106/` 编号图中鼻梁/鼻翼/眼角/眉端索引，
+   或裁定"K1 足够，跳过 106 点"；
+3. **亮度带**：D1（全局 color_strength 0.55→0.8 或 max_delta_l 20→40，
+   ~20min 重跑）/ D3（下颌带纵向亮度渐变，需新一轮处方）/ 维持现状，
+   三选一；
+4. 人工通过后，才把终选覆盖 `output/final.mp4`。
+
+## 28. 第五轮用户复审后的第六轮方案：彻底封死颈中白横纹，并恢复头部随身体的自然晃动（2026-08-31）
+
+> 用户确认 §26~§27 相比之前已有巨大进步，但完整看片后仍否决两个点：
+> （1）颈部中间仍有墙色白横纹，必须完全消除；（2）前三秒身体轻微晃动时，
+> 替换头的晃动感不足。本节人工结论高于 §27.2/§27.3 中“接合锚点为 0、白线已消除”
+> 的自动结论。第六轮禁止先改 LivePortrait 口型，先分别修接缝拓扑和贴回运动轨迹。
+
+### 28.1 白横纹复核：§27 的 underlay 仍漏了一个中心 residual 连通分量
+
+Codex 重新检查：
+
+- `output/final-v4-neck-preserve.mp4`；
+- `output/final-v5-junction.mp4`；
+- `output/final.mp4`；
+- `previews/debug-v5-junction/frame_0000_junction_{clean_base,final,masks}.png`。
+
+用户所说的“颈部中间白色横纹”不是错觉。frame 0 的 v5 `clean_base` 中仍可看到
+颈部中央的一条短白线；`junction_masks` 中同位置存在红色 residual 小连通分量。
+debug 图是 4 倍 nearest 放大，程序复核到中央红色分量尺寸为 **40×4 debug px，
+即原视频约 10×1px**，另有一个约 1×1px 分量。它被墙面模型写成高亮墙色后，
+在视频运动/压缩中会比单帧像素尺寸更显眼。
+
+因此 §27 的两个判断需要纠正：
+
+1. `jaw_soft_wall_overlap` 非零不能全部解释成“头侧真实背景”；中央 10×1px 分量不合法；
+2. 只扫描中心列亮度或每 50 帧抽样仍会漏掉短横向连通分量；必须做接合区拓扑检查。
+
+### 28.2 白横纹根因：mask 接近不等于 mask 连通
+
+v5 的 `jaw_underlay` 为：
+
+```python
+jaw_underlay = jaw_zone & neck_reach & head_near & old_head_safe
+fill_protect = neck_visible | jaw_underlay
+```
+
+这个交集能覆盖大部分下颌软边，但没有保证下面的拓扑不变量：
+
+```text
+在每一个合法的下颌—脖子连接列中，
+从 B 下颌 soft/core 的底边到 A neck_visible 顶边之间，fill_protect 必须纵向连续。
+```
+
+`neck_visible` 经过 top-band/envelope 裁剪，`jaw_underlay` 又经过四个 bool mask 相交，
+任意一个 mask 的 1px 边界差异都可能在两者之间留下水平裂缝。形态学上两块“看起来
+挨着”的 mask，仍可能隔着 1px residual。该 residual 被 `fit_wall_fill` 100% 写成墙色，
+就形成用户看到的白横纹。
+
+### 28.3 第一层修复：逐列封闭接合间隙，而不是继续扩大 underlay
+
+新增 `build_vertical_junction_bridge()`。不要把 `jaw_underlay_px` 全局继续增大；只填
+已经被 B 下颌和 A neck 上下夹住的窄缝：
+
+```python
+def build_vertical_junction_bridge(
+    alpha_head: np.ndarray,
+    neck_visible: np.ndarray,
+    old_head_safe: np.ndarray,
+    jaw_zone: np.ndarray,
+    max_gap_px: int = 6,
+    alpha_eps: float = 0.02,
+) -> np.ndarray:
+    """连接 B 下颌底边与 A neck 顶边之间 1~max_gap_px 的逐列窄缝。
+
+    只输出 A 原帧保护 mask；不扩 B RGB，不生成 B 脖子，不跨越大面积真实背景。
+    """
+    h, w = alpha_head.shape
+    head = (alpha_head > alpha_eps) & jaw_zone
+    neck = neck_visible.astype(bool) & jaw_zone
+    bridge = np.zeros((h, w), np.uint8)
+
+    for x in range(w):
+        hy = np.flatnonzero(head[:, x])
+        ny = np.flatnonzero(neck[:, x])
+        if len(hy) == 0 or len(ny) == 0:
+            continue
+        head_bottom = int(hy[-1])
+        # 必须找 head_bottom 下面的第一个 neck，不能用整列最小值误接侧脸。
+        below = ny[ny > head_bottom]
+        if len(below) == 0:
+            continue
+        neck_top = int(below[0])
+        gap = neck_top - head_bottom - 1
+        if 0 < gap <= max_gap_px:
+            bridge[head_bottom + 1 : neck_top, x] = 255
+
+    # 只保留原本属于 A 旧头安全区且位于 jaw_zone 的像素。
+    return (bridge > 0) & old_head_safe & jaw_zone
+```
+
+主路径改为：
+
+```python
+junction_bridge = build_vertical_junction_bridge(
+    alpha_f,
+    junction["neck_visible"],
+    old_head_safe,
+    jaw_zone,
+    max_gap_px=args.junction_bridge_max_gap_px,  # 默认 6
+)
+fill_protect = (
+    junction["neck_visible"]
+    | junction["jaw_underlay"]
+    | junction_bridge
+)
+residual = old_head_safe & (~new_core) & (~fill_protect)
+```
+
+`max_gap_px` 建议 4/6/8 三档 probe，取能消除横纹的最小值。超过 8px 必须人工确认，
+因为大间隙可能是真背景，不能盲目用 A 下巴填满。
+
+### 28.4 第二层保险：接合走廊禁止出现墙色 residual
+
+逐列 bridge 后，再建立一个比旧指标更严格的 `junction_corridor`：
+
+```python
+neck_near = cv2.dilate(
+    junction["neck_visible"].astype(np.uint8),
+    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 17)),
+) > 0
+head_near = cv2.dilate(
+    (alpha_f > 0.02).astype(np.uint8),
+    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 17)),
+) > 0
+junction_corridor = jaw_zone & neck_near & head_near & old_head_safe
+```
+
+必须满足：
+
+```python
+assert not (residual & junction_corridor).any()
+```
+
+但该 assert 只能用于**上下同时邻近 head 和 neck 的走廊**，不能覆盖整张脸侧，否则会把
+真实墙面错误保护成 A 旧脸。若仍存在极少数 1px 分割孔洞，允许在 corridor 内执行
+`MORPH_CLOSE`，核固定为 `(3, 5)` 或 `(3, 7)` 的纵向椭圆核；禁止在全头 mask 上 close。
+
+再增加墙色保险检查：计算 `clean_base` 在 `junction_corridor` 内与当前 wall model 的
+LAB 距离。如果像素接近墙色、但 A 原帧同位置接近 neck 肤色，则直接判失败；优先回到
+mask 修复，禁止仅靠对该像素调色。
+
+### 28.5 白横纹新指标与验收
+
+新增并逐帧记录：
+
+| 指标 | 含义 | 目标 |
+|---|---|---:|
+| `junction_bridge_px` | 本帧逐列补上的 1~6px 接合窄缝 | 允许非零，需稳定 |
+| `junction_corridor_residual_px` | 严格接合走廊内仍被当成墙补洞的像素 | **每帧 0，全片 max=0** |
+| `junction_horizontal_component_max_width` | 走廊 residual 连通域的最大横向宽度 | **0** |
+| `junction_wall_like_px` | 最终 clean_base 走廊内的墙色像素 | **0** |
+
+必须检查 frame 0、1~90 每帧、200、400、600、750；前三秒不允许只每 50 帧抽样。
+debug 新增 `junction_bridge` 蓝色图层，并单独输出 frame 0 的 nearest 8× 局部图。
+
+### 28.6 头部运动现状：代码已经不用嘴，但只用了两只眼，且滤波过强
+
+用户提出“使用鼻子、眉毛、眼睛等稳定特征，避免嘴部”的方向是正确的。当前工程其实
+已经部分这样做：`rigid_from_eyes()` 只使用 InsightFace 5 点中的左右眼，嘴角完全退出；
+但它只有两点，无法稳健区分检测噪声、真实 roll 和轻微身体摇摆。
+
+Codex 读取 `composite_silent-v5-junction.transforms.json` 与 `segment/meta.json`，
+前三秒（0~89帧）实测：
+
+```text
+A 双眼中点：x range 22.49px，y range 6.60px
+raw transform：tx range 20.28px，ty range 8.73px，roll range 1.74°
+filtered：     tx range 17.49px，ty range 5.70px，roll range 0.77°
+scale：        全程固定（range 0，scale_mode=const）
+```
+
+所以头并非数值上完全不动；问题更接近“自然摇摆被削弱后，肉眼像钉住”：
+
+- `filter_window=11` 抑制了短周期平移；
+- `angle_window=21` 把 roll 幅度压到 raw 的约 44%；
+- `scale_mode=const` 完全删除轻微前后摆产生的尺度变化；
+- 只用双眼，两点噪声只能靠加大平滑压制，进而把真实运动一起压掉；
+- 身体/脖子保留 A 原运动，B 头使用强平滑轨迹，两者运动带宽不同，增强了“身体动、头不动”的感知。
+
+### 28.7 快速低风险方案：先用现有 5 点中的眼睛+鼻子，不用嘴
+
+第一步不必立刻引入新依赖。现有 5 点顺序为：左眼、右眼、鼻尖、左嘴角、右嘴角。
+新增 `transform_mode=eyes_nose`，只取前三点：
+
+```python
+src = np.asarray(kps_b[:3], np.float32)
+dst = np.asarray(kps_a[:3], np.float32)
+M, inliers = cv2.estimateAffinePartial2D(
+    src, dst,
+    method=cv2.LMEDS,  # 或 RANSAC；只允许 similarity/partial affine，禁止 full affine shear
+)
+```
+
+鼻尖会随 yaw 有少量横移，因此不能让单鼻点决定全部平移。推荐先用双眼求 scale/roll，
+再用“眼中点 0.7 + 鼻尖 0.3”的加权中心修正 tx/ty；或者使用加权 Procrustes。
+嘴角仍必须完全排除。
+
+快速版滤波参数做三组前三秒对照：
+
+| 组 | transform | trans window | angle window | scale |
+|---|---|---:|---:|---|
+| K0 | 当前 eyes | 11 | 21 | const |
+| K1 | eyes_nose | 5 | 7 | const |
+| K2 | eyes_nose | 5 | 7 | smooth 21帧并限制中位数±1% |
+
+优先看 K1。K2 只有在确实存在前后摆时使用；若产生头大小“呼吸”，立即退回 const。
+
+### 28.8 推荐正式方案：复用本地 InsightFace 106 点，做稳定锚点鲁棒相似变换
+
+本地已经有模型，无需下载、无需新服务器：
+
+```text
+external/LivePortrait/pretrained_weights/insightface/models/buffalo_l/2d106det.onnx
+```
+
+LivePortrait 自身也已读取 `face.landmark_2d_106`；可复用
+`external/LivePortrait/src/utils/face_analysis_diy.py`。正式版新增一个 landmark cache
+阶段，为 A 原视频和 B reenact 视频逐帧保存 106 点和置信度，避免 composite 每轮重复推理。
+
+稳定锚点原则：
+
+- 高权重：鼻梁、鼻根、鼻翼固定点；
+- 中权重：左右眼内外眼角；
+- 低权重：眉头/眉尾（眉毛会有表情，不应高权重）；
+- 排除：全部上下唇/嘴角、下颌轮廓；
+- 建议排除会随眨眼移动的上下眼睑中间点，只保留眼角；
+- 106 点索引必须先画编号图人工确认，禁止凭记忆硬编码。LivePortrait 本地代码已明确
+  眼中心使用 `[33,35,40,39]` 与 `[87,89,94,93]`，其他鼻/眉索引必须通过可视化确认。
+
+变换只允许 4 自由度 similarity：scale、roll、tx、ty。使用 RANSAC/IRLS 或加权
+Procrustes 剔除局部表情点；禁止 full affine，因为 shear 会让脸型随帧扭曲。
+
+建议权重和鲁棒流程：
+
+```text
+nose bridge/wing: 1.0
+eye corners:      0.7
+brow endpoints:   0.25~0.35
+Huber/IRLS:       2~3 次
+单点残差 > 2.5×MAD：本帧降权或剔除
+有效锚点 < 6：回退 eyes_nose；再失败才沿用上一帧
+```
+
+### 28.9 不要直接让头跟身体：先跟 A 真头，必要时再加低频 torso carrier
+
+从生活常识看，身体晃动时头通常跟随，但颈部也允许反向补偿。因此不能直接把肩膀轨迹
+100% 强加给头，否则会像木偶。执行顺序：
+
+1. 先用多稳定面部锚点恢复 A 原头真实轨迹；
+2. 把平移窗口 11→5、roll 窗口 21→7，确认前三秒摆动恢复；
+3. 只有当 A 面部锚点运动明显小于 neck/shoulder 运动，且用户仍觉得头钉住，才加入
+   低频 `torso carrier`。
+
+可从 A 原片领口/双肩区域做 LK optical flow/ECC，或使用人体姿态肩点，得到 torso 的
+低频 tx/ty/roll。融合必须是低权重、低频补偿：
+
+```python
+# 均为相对各自参考帧的运动量，先统一坐标中心
+motion_final = motion_face + beta * lowpass(motion_torso - motion_face)
+beta = 0.15 ~ 0.30
+```
+
+人脸锚点置信度高时 `beta` 取 0；只在面部轨迹被遮挡/失败或低频幅度明显异常时渐入。
+禁止 torso 直接覆盖 face transform，禁止使用证件上的照片人脸作为跟踪目标。
+
+### 28.10 运动滤波建议
+
+多点鲁棒估计降低噪声后，不再需要 11/21 帧强平滑：
+
+- tx/ty：Hampel 5~7 + centered smooth 5；
+- roll：unwrap 后 centered smooth 7，最大 9；
+- scale：默认 const；若 K2 证明有益，用 smooth 21 + clamp 到中位数±1%；
+- 允许使用 One-Euro 自适应滤波，但离线交付优先保持零相位 centered filter；
+- 不允许因追求“稳”把用户可见的 0.5~2Hz 身体摇摆滤掉；
+- 不允许滤波造成时延，motion cross-correlation lag 必须为 0 帧。
+
+### 28.11 第六轮分阶段执行
+
+**L1：只修白横纹**
+
+- 在现有 v5 上新增 column bridge + corridor hard gate；
+- frame 0 对 `max_gap=4/6/8` probe；
+- 跑 0~90 每帧 debug，不抽样；
+- `junction_corridor_residual_max` 和 `junction_wall_like_max` 必须都为 0；
+- 产物：`final-v6-seam-closed.mp4`。
+
+**L2：现有 5 点快速运动对照**
+
+- 固定 L1 接缝参数；
+- 仅跑前 90 帧 K0/K1/K2；
+- 三视频同步并排，0.5倍速比较头、颈、肩；
+- 产物：`motion-k0-eyes.mp4 / motion-k1-eyes-nose.mp4 / motion-k2-scale.mp4`。
+
+**L3：106 点正式轨迹**
+
+- 先输出 A/B frame 0、30、60、90 的 106 编号锚点图；
+- 人工确认鼻/眼角/眉索引后再写固定 anchor group；
+- 输出 raw、inlier、filtered 三条轨迹 CSV/JSON 和曲线图；
+- 只跑前三秒，与 K1 比较；106 点没有肉眼收益时允许保留更简单的 K1。
+
+**L4：全片与可选 torso fusion**
+
+- 只有 L2/L3 仍显头钉住才试 beta=0.15/0.25；
+- 用户选定运动方案后再跑 796 帧；
+- 最终候选另存 `final-v6-motion.mp4`，人工通过后才覆盖 `final.mp4`。
+
+### 28.12 运动验收指标
+
+前三秒和全片分别记录：
+
+| 指标 | 建议目标 |
+|---|---:|
+| output head tx/ty 与 A 稳定锚点 tx/ty corr | ≥0.95 |
+| motion lag | 0 帧 |
+| tx 低频幅度增益（output/A） | 0.85~1.10 |
+| ty 低频幅度增益 | 0.80~1.15 |
+| roll 幅度增益 | 0.75~1.10 |
+| 静止高频 jitter RMS | <0.40px，roll <0.08° |
+| 头—neck 接合点相对漂移 p95 | ≤2px |
+
+指标只用于排除明显错误。用户需要在 0.5倍速和 1倍速确认：身体向左/右轻晃时头有自然
+跟随，不能钉住，也不能过度同步成木偶；眼睛/鼻子稳定，嘴型不受跟踪算法反向拉扯。
+
+### 28.13 单元测试和禁止项
+
+至少新增：
+
+1. 逐列 1px/3px/6px 合法 gap 被 bridge 填满；
+2. gap>max 或只有 head/只有 neck 的真实背景不填；
+3. bridge 不超出 jaw_zone/old_head_safe；
+4. frame 0 构造反例中中央 10×1 residual 被消除；
+5. corridor 内 residual hard gate 能抓到 1px 横纹；
+6. eyes_nose 不读取 kps[3:5]；
+7. 加权相似变换在一个眉点异常时仍恢复已知 tx/ty/roll；
+8. 106 有效点不足时回退 eyes_nose；
+9. full affine/shear 路径不可进入生产配置；
+10. motion filter 对正弦 1Hz 轨迹的幅度保持和 lag=0；
+11. scale clamp 不超过±1%；
+12. 新产物命名不覆盖 v4/v5/final。
+
+禁止项：
+
+- 禁止把剩余横纹再次解释为“合法头侧背景”；中央/接合走廊不允许任何例外；
+- 禁止用 blur、调色、视频压缩掩盖 1px 墙色线；
+- 禁止扩大 B neck collar；
+- 禁止用嘴角或唇部参与头部全局 transform；
+- 禁止把肩膀轨迹 100% 复制给头；
+- 禁止继续用 21 帧 roll 平滑后声称“头已跟随”；
+- 禁止只看中心位置相关性而不看运动幅度增益；
+- 禁止在前三秒对照未通过前跑全片。
+
+## 30. 第六轮外部复审纠偏：§29 的“全 0”指标存在自证循环，实际仍有墙色缝；复杂背景不能再用平面墙模型（2026-08-31）
+
+> 用户观看 `output/final.mp4` 后仍看到头—脖子白缝，并追问白色来自哪里、复杂背景
+> （如窗帘）时会发生什么。Codex 重新读取实际文件、v6 debug 和源帧后确认：
+> 必须区分“真实墙色补洞缝”和“B 下颌亮度带”；§29.2/§29.4 对几何缝已经完全
+> 消失的结论过早。本节覆盖 §29 中与白缝来源和验收有关的结论。
+
+### 30.1 先明确：当前 `final.mp4` 不是 v6
+
+§29.0 已写明 `final.mp4` 保持 v5 未动。实际文件时间也一致：
+
+```text
+final.mp4                  2026-08-31 12:19（v5，旧终选）
+final-v6-seam-closed.mp4   2026-08-31 15:30（L1）
+final-v6-motion.mp4        2026-08-31 15:52（L4）
+```
+
+所以用户看 `final.mp4` 看到旧缝是符合现状的。人工比较第六轮时必须看
+`final-v6-seam-closed.mp4` 和 `final-v6-motion.mp4`；在真正通过前仍不得覆盖 final。
+
+但这不代表 v6 已经无缝。Codex 对 v6 debug 的复核见下一节。
+
+### 30.2 实物证据：v6 `clean_base` 中仍有约 10×1px 的真实墙色分量
+
+复核文件：
+
+```text
+previews/debug-v6-seam/frame_0000_junction_clean_base.png
+previews/debug-v6-seam/frame_0000_junction_final.png
+previews/debug-v6-seam/frame_0000_junction_bridge8x.png
+work/base_upright.mp4 frame 0
+```
+
+按 debug crop 的真实坐标反算并与 A 原帧逐像素比较，frame 0 至少存在：
+
+```text
+中心短横纹：x=552..561, y=963，10×1px
+clean_base 灰度/L：>190（墙色）
+A 原帧同位置：<160（皮肤）
+```
+
+左右锚点附近还有更大的墙色分量。中心 10×1px 正是用户感知为“脖子中间白横纹”的
+区域。它已经存在于 `clean_base`，因此这一部分**确定来自背景补洞，不是 B 下颌调色**。
+
+与此同时，§29.4 指出的行 953~968 的较宽亮带也可能同时存在；那一带主要是 B 下颌
+偏亮经过 soft alpha 叠加在 A 皮肤上。两种问题可以叠加，不能二选一：
+
+| 类型 | 在哪里首先出现 | 像素来源 | 修复 |
+|---|---|---|---|
+| 几何墙色缝 | `clean_base` 已经发白 | `fit_wall_fill` 的背景预测 | 修 mask/保护区，禁止背景进入接合区 |
+| B 下颌亮度带 | `clean_base` 是皮肤，`final` 才变亮 | 偏亮 B jaw × alpha + A skin | 下颌局部低频颜色/亮度渐变 |
+
+### 30.3 白色到底取自哪里
+
+当前使用 `fill_mode=wall_residual`。计算过程为：
+
+```python
+residual = old_head_safe & (~new_core) & (~fill_protect)
+clean_base = fit_wall_fill(frame_a, residual, ...)
+```
+
+`fit_wall_fill` 从头部周围采样“像墙”的像素，在 BGR/LAB 空间拟合一个随 x/y 变化的
+颜色平面，然后把 residual 区域 100% 写成该预测颜色。因此：
+
+- 它不是透明洞；
+- 它不是固定写死的白色；
+- 本素材背景是白墙，所以预测结果接近白墙，看起来是一条白缝；
+- 如果背景是绿色墙，它可能变成绿色缝；
+- 如果背景是窗帘，当前平面模型无法复原褶皱纹理，通常会变成窗帘平均色/模糊色块，
+  同样很假。
+
+背景补洞本来只应该用于 B 新头之外、旧 A 头需要删除后真正露出的背景。**人体下颌—
+脖子的连接区在解剖上不应露出任何背景。只要此处出现墙或窗帘，就不是“背景模型
+不够好”，而是前景层级/mask 拓扑错误。**
+
+### 30.4 §29 指标为何显示 0：修复区和验收区使用同一个 corridor，形成自证循环
+
+当前代码先构造 `junction_corridor`，然后执行：
+
+```python
+fill_protect |= junction_corridor & (alpha_f < 0.995)
+```
+
+后续指标又只统计：
+
+```python
+residual & junction_corridor
+```
+
+它当然恒等于 0，因为 corridor 已被强制放进 `fill_protect`。这只能证明“选中的
+corridor 内没有 residual”，不能证明“真实视觉接缝全部落在 corridor 内”。frame 0
+的 10×1px 分量恰好落在 corridor 定义之外，指标看不见，但人眼看得见。
+
+这是典型的**修复 mask 与验收 mask 同源导致自证循环**。第七轮必须拆开：
+
+- `repair_corridor`：用于保护/修复，可以较窄；
+- `audit_seam_roi`：独立生成，用于验收，必须比 repair 更宽，不能读取 repair 结果；
+- 验收还必须直接比较 `clean_base` 与 A 原帧，而不仅统计 residual bool。
+
+### 30.5 永久消除背景缝：接合区必须使用人体像素，不允许调用背景模型
+
+第七轮应建立明确的生产不变量：
+
+```text
+凡位于 B 下颌底边和 A neck 顶边之间、且 A 原帧语义属于 face skin/neck 的像素，
+必须保留 A 原帧人体像素作为 underlay；不得进入 residual，不得调用 wall fill。
+```
+
+建议 segment 阶段额外输出**未减 head_pad 的原始 A skin mask**：
+
+```text
+work/segment/raw_skins/raw_skin_XXXXXX.png
+语义类：class 1（face skin）∪ class 14（neck）
+不做 head_pad subtract，不含 cloth，不含背景
+```
+
+然后独立构造人体接合桥：
+
+```python
+def build_required_skin_bridge(
+    alpha_head, neck_visible, raw_a_skin, face_box,
+    max_vertical_gap=14, side_margin=4,
+):
+    """B 下颌与 A neck 之间必须由 A 人体皮肤连续连接。"""
+    head = alpha_head > 0.02
+    neck = neck_visible.astype(bool)
+    skin = raw_a_skin.astype(bool)
+    required = np.zeros_like(neck)
+
+    # 仅处理 neck 主体横向范围及少量 side margin；每列连接 head bottom→neck top。
+    neck_cols = np.flatnonzero(neck.any(axis=0))
+    if len(neck_cols) == 0:
+        return required
+    x0 = max(0, int(neck_cols[0]) - side_margin)
+    x1 = min(neck.shape[1], int(neck_cols[-1]) + side_margin + 1)
+
+    for x in range(x0, x1):
+        hy = np.flatnonzero(head[:, x])
+        ny = np.flatnonzero(neck[:, x])
+        if len(hy) == 0 or len(ny) == 0:
+            continue
+        hb = int(hy[-1])
+        below = ny[ny > hb]
+        if len(below) == 0:
+            continue
+        nt = int(below[0])
+        gap = nt - hb - 1
+        if 0 <= gap <= max_vertical_gap:
+            # +2px 上下重叠，避免量化/warp 后重新裂开；只保留 A 原帧人体语义。
+            y0 = max(0, hb - 2)
+            y1 = min(neck.shape[0], nt + 3)
+            required[y0:y1, x] = skin[y0:y1, x]
+    return required
+```
+
+主路径在背景补洞前执行：
+
+```python
+required_skin_bridge = build_required_skin_bridge(...)
+fill_protect |= required_skin_bridge
+residual = old_head_safe & (~new_core) & (~fill_protect)
+```
+
+背景补洞后再做硬保险：
+
+```python
+# 防止任何上游 mask 误差把接合人体像素写成背景。
+clean_base[required_skin_bridge] = frame_a[required_skin_bridge]
+```
+
+这一步不是伪造新脖子，而是恢复 A 原帧本来就存在的下颌/上颈人体像素。B 头仍通过
+alpha 位于最前层。只要 `required_skin_bridge` 严格受 raw skin 语义约束，就不会把墙
+错误当成皮肤，也不会恢复整张 A 旧脸。
+
+### 30.6 独立验收 ROI：不能再用 repair corridor 自己证明自己
+
+`audit_seam_roi` 应独立于 `junction_corridor/bridge/fill_protect`，建议由三部分并集：
+
+1. B head alpha 底部 20px 的所有列；
+2. A raw neck 顶部向上/向下各 16px；
+3. 两者在脸框下 35% 区域的凸包/逐列连接带。
+
+它只依赖 `alpha_head + raw_neck + face_box`，不得依赖 repair mask。至少检查：
+
+```python
+# A 原帧是皮肤，但 clean_base 被改成背景：绝对失败
+changed_from_skin = (
+    audit_seam_roi
+    & raw_a_skin
+    & (max_abs(clean_base - frame_a) > 20)
+)
+
+# clean_base 与背景模型接近、与 A 原皮肤差异大：绝对失败
+wall_intrusion = audit_seam_roi & raw_a_skin & wall_like(clean_base)
+```
+
+目标：
+
+```text
+audit_changed_from_skin_max = 0
+audit_wall_intrusion_max = 0
+audit_horizontal_wall_component_width_max = 0
+```
+
+并强制保存 0~90 每帧的 8× `A原帧 | raw_skin | clean_base | final | diff` 五联图。
+
+### 30.7 几何墙缝消失后，仍需处理 B 下颌亮度带
+
+如果 `clean_base` 已确认全是 A 皮肤，但 final 仍有一条亮线，才进入颜色阶段。相比 D1
+全局压暗整张脸，优先推荐 D3：只对 B 下颌底部 20~32px 做低频 LAB 匹配。
+
+```python
+edge_dist = distance_to_bottom_of_head(alpha_f > 0.02)
+band = jaw_zone & (edge_dist >= 0) & (edge_dist <= 28) & (alpha_f > 0.02)
+w = smoothstep(28, 0, edge_dist)   # 越靠下颌底边，匹配 A neck 越强
+
+src_stats = lab_stats(head_rgb, band & (alpha_f > 0.5))
+dst_stats = lab_stats(frame_a, required_skin_bridge | neck_top_band)
+delta = clamp(dst_stats.mean - src_stats.mean, L=(-30, 30), ab=(-10, 10))
+head_rgb_lab[band] += w[band, None] * strength * delta
+```
+
+要求：
+
+- 只改 B `head_rgb`，不改 A neck；
+- correction 逐帧做 EMA，避免闪烁；
+- 从底边向上 smoothstep 衰减，禁止水平硬带；
+- 先试 strength 0.5/0.75/1.0；
+- 保留高频皮肤纹理，只校正低频颜色；必要时用 Laplacian/multiband blending；
+- `clean_base` 几何审核未通过前禁止做颜色实验。
+
+### 30.8 如果背景是窗帘，当前 `fit_wall_fill` 会怎样
+
+当前 wall plane 模型只能表示：
+
+```text
+color(x,y) = ax + by + c
+```
+
+它适合白墙、纯色墙、缓慢光照渐变，不具备纹理生成能力。遇到窗帘、书架、瓷砖、文字、
+条纹时，它只能拟合平均颜色/渐变，会产生平色补丁，无法延续褶皱和图案。
+
+复杂背景应按优先级处理：
+
+1. **最佳：客户提供同机位空背景图/空镜视频。** 注册到 A 视频后直接作为 clean plate；
+2. **固定机位且视频中背景曾露出：** 用多帧时域中位数/光流配准建立 temporal clean plate；
+3. **仅边缘小洞：** PatchMatch/纹理合成，从同一窗帘附近复制相似纹理；
+4. **永久遮挡且无空镜：** LaMa/ProPainter/E2FGVI 等图像/视频修复，必须做时序一致性；
+5. 生成式修复应先生成稳定背景 plate，再复用到全片，不能每帧独立生成导致闪烁。
+
+但无论使用哪种复杂背景修复，**头—脖子接合区都必须被人体 skin bridge 排除在背景
+修复 mask 外**。背景复杂度只影响头发/耳朵外侧真正露出的背景，不应影响脖子连接。
+
+建议新增 `background_mode`：
+
+```text
+smooth_plane   # 仅纯色/缓变墙
+clean_plate    # 客户空镜，生产首选
+temporal_plate # 多帧重建
+texture_patch  # PatchMatch 小洞
+video_inpaint  # 最后兜底
+```
+
+并用局部梯度方差/纹理能量自动拒绝：背景纹理超过阈值时禁止继续使用 `smooth_plane`。
+
+### 30.9 第七轮执行顺序
+
+**M0：纠正验收工具**
+
+- 从 v6 frame 0 复现 x=552..561,y=963 的 10×1 墙色分量；
+- 新 `audit_seam_roi` 必须抓到它，旧 corridor 指标可同时为 0，以证明自证循环；
+- 未抓到该反例不得继续。
+
+**M1：raw A skin + required skin bridge**
+
+- segment 输出 raw_skins；
+- bridge max gap 8/12/14 probe，取最小无缝值；
+- `clean_base[required_skin_bridge] = frame_a[...]` 保险开启；
+- 0~90 每帧三个独立 audit 指标全 0。
+
+**M2：全片几何版本**
+
+- 复用选定运动方案；
+- 输出 `final-v7-skin-bridge.mp4`，不得覆盖 final/v6；
+- 用户确认没有任何墙/背景穿过头颈。
+
+**M3：下颌局部亮度渐变**
+
+- 仅当 M2 clean_base 无墙但 final 仍有亮带时执行；
+- strength 0.5/0.75/1.0 短片对照；
+- 输出 `final-v7-jaw-color.mp4`。
+
+**M4：复杂背景回归测试**
+
+- 人工制作/选取窗帘背景测试片；
+- 验证 skin bridge 与背景模式解耦；
+- smooth_plane 必须拒绝复杂纹理或明确报错，不能静默生成平色块。
+
+### 30.10 必须回答用户的结论
+
+1. 当前 `final.mp4` 是旧 v5，不是第六轮结果；
+2. 白缝中至少有一部分确实来自背景白墙：旧头 residual 被 `fit_wall_fill` 写成墙色；
+3. v6 debug 仍能定位到约 10×1px 的真实墙色分量，§29 的“全 0”验收存在盲区；
+4. 另有一条 B 下颌偏亮造成的亮度带，它不是背景，需要局部颜色渐变；
+5. 正确架构必须保证头颈接合区使用 A 人体皮肤 underlay，背景永远不得进入；
+6. 若背景是窗帘，当前平面墙模型只能生成平均色块，不能复原纹理；必须改用 clean plate/
+   temporal plate/PatchMatch/video inpaint；
+7. 即使换成窗帘背景，skin bridge 正确后，窗帘也绝不能出现在脖子连接处。
+
+## 32. 第七轮运动复审：不是“头完全不动”或“脖子完全不动”，而是头与A脖子的纵向/roll轨迹不同步；已生成冻结头诊断版（2026-08-31）
+
+> 用户确认 `final-v7-skin-bridge.mp4` 的脸和嘴已经满意，但观看时感觉脸与脖子不跟随，
+> 难以判断究竟是脸动脖子不动，还是脖子动脸不动，并要求先生成一版“头不动”视频做
+> 因果对照。Codex 已对 A 原片、v7 和 raw neck 轨迹进行实测，并已生成完整冻结头版本。
+
+### 32.1 结论：A脖子在动，B头也在动，但二者运动方向/幅度不完全一致
+
+`final-v7-skin-bridge` 的脖子、衣服和身体来自 A 原视频，因此 neck 主体运动没有被冻结；
+B 头使用 K1 `eyes_nose/5/7/const` 轨迹，同时 LivePortrait 的 `animated_head` 内部已经
+包含 A 的姿态复演。当前肉眼异常不是某一层绝对静止，而是：
+
+- 水平移动基本同步；
+- 垂直移动相关性很差，并出现约2帧相位差；
+- roll 幅度偏大；
+- B头相对A脖子的漂移比A原片更大。
+
+前三秒（0~89帧）实测：
+
+```text
+A原头眼中心范围：x=22.49px，y=6.60px
+A raw neck顶部： x=23.52px，y=6.79px
+v7 B头眼中心：   x=19.83px，y=7.93px
+
+v7 vs A：
+tx corr=0.986，gain=0.914，lag=0       # 水平基本正确
+ty corr=0.090，gain=1.248，lag=-2      # 垂直方向/相位明显错误
+roll corr=0.795，gain=1.394            # roll 过量约39%
+head-body drift p95=5.59px             # 超过原目标2px
+
+脸相对neck顶部漂移：
+A原片 p95=7.13px（真人本身允许的颈部补偿）
+v7    p95=9.51px
+v7相对A原有“face-neck关系”的额外误差 p95=5.59px
+```
+
+典型 frame 30（相对frame 0的y位移）：
+
+```text
+A原脸：-0.79px
+A脖子：-1.82px
+v7脸： +6.01px
+```
+
+也就是说该帧 A 脖子和原脸略向上，而替换脸反而向下约6px，视觉上自然会像头在脖子上
+滑动。这比“头有没有动”更准确地解释了用户的感受。
+
+### 32.2 根因判断
+
+1. **双重姿态补偿**：LivePortrait 已把 A pose 复演到 B 内部，composite 又根据
+   `eyes_nose` 逐帧追加 placement/roll；roll gain=1.394 是重复补偿的数值证据；
+2. **K1对ty不稳**：总y信号只有约6.6px，鼻尖受yaw/表情影响，5帧滤波后仍与 A 垂直
+   轨迹 corr≈0.09；
+3. **运动参考层不同**：A neck/身体逐帧原样运动，B头依赖检测锚点和滤波，二者没有
+   显式的“头相对脖子”约束；
+4. **skin bridge只解决像素连续，不解决刚体运动连续**：接缝可以没有白线，但头仍可
+   在连续的皮肤底层上发生数像素滑动。
+
+### 32.3 已生成“头不动”因果对照版
+
+新增诊断开关：
+
+```yaml
+composite:
+  transform_mode: eyes_nose
+  freeze_head_motion: true
+  freeze_reference_frames: 30
+```
+
+实现语义：
+
+- 取 A 前30帧5点锚点的逐点中位数作为固定目标；
+- B animated_head 每一帧都重新对齐到这个固定目标；
+- 这样抵消 B 内部的全局头动，尽量只留下嘴型/表情；
+- A 的 bbox、neck mask、raw skin、身体视频仍逐帧变化，所以身体和脖子继续运动；
+- 该版本只用于诊断，绝不能作为交付候选。
+
+产物：
+
+```text
+output/final-v7-head-frozen.mp4
+previews/compare-original-v7-frozen.mp4
+```
+
+三联对比顺序：`ORIGINAL A | V7 CURRENT | HEAD FROZEN`。
+
+冻结版前三秒检测结果：
+
+```text
+tx gain=0.149（大部分水平运动已冻结）
+ty gain=0.514
+roll gain=0.611
+head-body drift p95=12.77px
+```
+
+它不可能在检测意义上绝对0，因为说话/表情和LivePortrait非刚性形变仍会轻微改变检测点；
+但全局头动已大幅降低，足以作为肉眼因果对照。
+
+### 32.4 用户看片后的判断方法
+
+1. 如果 `HEAD FROZEN` 明显比 V7 更像“头钉住、身体在晃”，说明 V7 并非头不动，
+   真问题是运动相位/roll增益不一致；
+2. 如果 V7 与 frozen 肉眼几乎相同，说明现有K1运动量确实不足，应提高低频carrier；
+3. 如果 V7 比 frozen自然，但接缝仍像滑动，说明应保持V7的水平运动，只修ty和roll；
+4. 不要根据嘴/下巴判断全局运动，重点看眼睛、鼻梁、耳朵相对衣领/肩膀的位置。
+
+### 32.5 推荐下一步：以A脖子为carrier，恢复A原有的“头相对脖子”运动
+
+不要继续在 K0/K1 窗口之间盲调。应显式建立 neck-anchored transform：
+
+```text
+F_A(t) = A原片稳定面部锚点中心/roll
+N_A(t) = A neck顶部中心/低频roll
+F_B(t) = animated_head 的稳定面部锚点
+```
+
+目标位置定义为：
+
+```python
+desired_face_t = (
+    desired_face_0
+    + (N_A(t) - N_A(0))
+    + gamma * (
+        (F_A(t) - N_A(t))
+        - (F_A(0) - N_A(0))
+    )
+)
+```
+
+含义：
+
+- 第一项保持B脸初始摆放；
+- 第二项保证头跟随A脖子/身体的低频carrier；
+- 第三项恢复A真人原本允许的颈部相对运动；
+- `gamma=0` 是木偶式完全跟neck；`gamma=1` 完整复现A原来的face-neck关系；
+- 建议probe `gamma=0 / 0.6 / 0.8 / 1.0`，优先0.8。
+
+对 B 内部运动必须显式抵消：
+
+```python
+M_B_internal(t) = similarity(F_B(0) -> F_B(t))
+M_desired(t)    = similarity(desired_face_0 -> desired_face_t)
+M_place(t)      = M_desired(t) @ inverse(M_B_internal(t)) @ M_initial_align
+```
+
+否则 LivePortrait 内部pose与外部placement会继续双重计算。实际实现使用106点中的鼻梁/
+眼角稳定锚点，排除嘴和下颌；只能使用similarity，禁止full affine shear。
+
+### 32.6 ty与roll专项约束
+
+短期版本若来不及完整neck carrier，可先做混合轨迹：
+
+```text
+tx：保留K1（corr 0.986，gain 0.914）
+ty：改用A双眼中点或neck carrier的5~9帧低频轨迹，禁用鼻尖决定ty
+roll：K1相对初始roll乘0.70~0.75（1/1.394≈0.72）
+scale：继续const
+```
+
+这比整体退回K0合理：K0会重新制造“头钉住”，而当前真正失配集中在ty与roll。
+
+### 32.7 第八轮对照与验收
+
+只跑前90帧：
+
+```text
+P0 = 当前V7 K1
+P1 = frozen（已完成）
+P2 = neck carrier, gamma=0
+P3 = neck carrier, gamma=0.6
+P4 = neck carrier, gamma=0.8
+P5 = neck carrier, gamma=1.0
+```
+
+硬指标：
+
+```text
+tx corr >=0.95, gain 0.85~1.10, lag 0
+ty corr >=0.80（低信号不强求0.95）, lag 0
+roll gain 0.80~1.10
+额外face-neck关系误差 p95 <=2.5px
+接合点alpha/skin bridge相对漂移 p95 <=2px
+audit墙缝三指标继续全0
+```
+
+用户0.5倍速选择P3/P4/P5后才跑全片。冻结版只做参照，不进入候选集。
+
+## 31. 第七轮整改落地记录（2026-08-31，GLM 按 §30 处方执行）
+
+> 严格按 §30.9 顺序：M0 独立验收反例 → M1 raw skin bridge → M2 全片几何版 →
+> M3（按前置条件判定为不需要运行）→ M4 窗帘回归。**final.mp4 保持 v5 未动**。
+
+### 31.1 修改的文件与函数
+
+| 文件 | 修改 |
+|---|---|
+| `src/headswap/segment_head.py` | `segment_parts(..., return_raw_skin=False)` 可选返回 raw_skin（class1∪class14，**不减 head_pad、无组件过滤**）与 raw_neck（class14 原始轮廓）；worker `--output-raw-skins` 输出 `raw_skins/`、`raw_necks/`，meta 增加 `raw_skin_masks` |
+| `src/headswap/composite_head.py` | 新增 §30 函数：`build_required_skin_bridge`（逐列 head 底边→neck **主体段**连接，raw skin 语义门控，`no_cap` 扩展）、`build_jaw_underlay_skin`（head 底带 raw skin 铺垫，audit 第 1 部分语义）、`build_audit_seam_roi`（独立验收 ROI：head 底 20px 全列 ∪ raw neck 顶±16px ∩ 几何窗 ∪ 逐列连接带∩脸框下 35%，**不读任何 repair mask**）、`audit_seam_metrics`（changed_from_skin / wall_intrusion / 横向连通域宽度）、`wall_texture_energy`（Laplacian RMS）+ `fit_wall_fill(max_texture)` 显式拒绝复杂背景、`head_bottom_edge_dist` + `jaw_luminance_gradient`（§30.7 D3，smoothstep 底边加权 + delta EMA）；主路径：`fill_protect \|= required_skin_bridge \| jaw_underlay_skin` → 补洞后 `clean_base[bridge] = frame_a[bridge]` 硬保险 → 独立 audit 三指标逐帧入 diag；argparse 新增 7 参数 |
+| `src/headswap/cli.py` | segment 阶段 `--output-raw-skins`；composite 透传 raw_skins/raw_necks/skin_bridge_*/jaw_underlay_band/wall_max_texture/jaw_gradient_* |
+| `config/headswap.hs-p1-0004-v7-skin-bridge.yaml` | M2：K1 运动 + skin bridge 全开 + wall_max_texture 10.0 |
+| `config/headswap.hs-p1-0004-v7-jaw-color.yaml` | M3 模板（jaw_gradient 0.75；本轮未启用） |
+| `tests/test_headswap_units.py` | 新增 8 项（自证循环单元复现/bridge+audit 归零/语义门控/taper 洞主体段连接/cap vs no-cap/底带铺垫/纹理拒绝/亮度渐变带内 smoothstep+EMA），合计 **76 passed** |
+
+### 31.2 M0：独立验收抓住既有反例（未抓到不继续——已抓到）
+
+- **反例复核**：v6 `clean_base` 在 (x=552..561, y=963) L=217（墙色），A 原片同位置
+  L=102~107（皮肤），`skins`/`necks` mask 该处均为 0（class1 被 head_pad 减掉）；
+  重跑 segment 后 `raw_skin` 该处 = 255——§30.2 判断成立；
+- **自证循环实证**（bridge 关闭，v6 修复链原样）：
+  `audit_changed_from_skin = 1140 / audit_wall_intrusion = 1146 / 最大横向分量宽 61`
+  同时 `junction_corridor_residual = 0、junction_wall_like = 0`——修复 corridor 与
+  验收 corridor 同源，旧指标对新 audit 可见的墙缝完全失明（§30.4 定性正确）。
+
+### 31.3 M1：raw skin bridge（含三处与 §30.5 的偏差，均由不变量驱动）
+
+演进（frame 0，audit_changed_from_skin）：
+
+| 步骤 | 剩余 | 说明 |
+|---|---:|---|
+| 仅 §30.5 bridge（gap 8/12/14） | 1139/1129/1110 | bridge 只处理 neck 列±4，audit 第 1 部分（head 底 20px 全列）不覆盖 |
+| + jaw 底带 raw skin 铺垫（20px） | 215~232 | 下颌角两侧无 neck 列的 A 皮肤仍漏 |
+| + no_cap（gap>14 列保留 span 内 raw skin） | 107 | taper 在 neck 列内部打洞（939..947 留、953..968 剪、969+ 主体），bridge 取"第一个 neck 像素"时洞内皮肤漏保护 |
+| + 主体段连接（取最后连续段起点为 neck 顶） | **0** | 洞内 raw skin 经主体段 span 覆盖 |
+
+三处偏差（§30.5 骨架之上）：
+1. `no_cap`：大 gap 列不整段连接，但 span 内 raw skin 仍保留——不变量字面要求
+   （左右锚外细长 skin 列片），且 skin 门控保证不会填任何非皮肤像素；
+2. `jaw_underlay_band_px=20`：head 底带内 raw skin 铺垫——§30.6 audit 第 1 部分
+   语义（该带含 neck 之外的下颌角两侧列）；
+3. 主体段连接：neck 列取最后连续段起点，避免 §26 taper 裁剪洞漏保护。
+
+**硬保险开启**：补洞后 `clean_base[required_skin_bridge] = frame_a[...]`；
+反例 (552..561,963) 复核 **diff=0**（A 原帧逐位保留）。
+
+**0~90 逐帧**（91 帧，不抽样）：`audit_changed_from_skin_max = 0`、
+`audit_wall_intrusion_max = 0`、`audit_horizontal_wall_component_width_max = 0`；
+corridor/orphan/gap/neck_temporal_mad 全部与 v6 持平。
+
+### 31.4 M2：全片几何版
+
+796 帧全量：**audit 三指标全片 max = 0**；skin_bridge 5100px/帧；
+`jaw_soft_wall_overlap` mean 749→302（bridge 顺带保护了大部分下颌软边带）；
+`old_head_erased_px_mean` 9988→9385（少删 A 皮肤）。verify 对照 v6-motion：
+嘴型 0.983 / lag 0 / 证件 34.6dB / halo 1.0 / roll 全部持平，无退化。
+
+产物：`output/final-v7-skin-bridge.mp4` + `previews/side_by_side_v7_skin_bridge.mp4`
++ `previews/debug-v7-skin-bridge/`（含 audit5 五联图与 audit_changed 叠加图）。
+
+### 31.5 本轮最重要发现：v6"亮度带"的主因也是墙色透软边，audit 修复后一并归零
+
+§29.4 曾把行 953~968 亮带归因为"B 下颌亮度 × alpha"。本轮 audit=0 之后重测：
+**该带 7 个抽帧（0/50/100/200/400/600/750）的白亮像素全部 = 0（v6 为 270/帧）**。
+原因：v6 该带 clean_base 是墙（corridor 盲区），`out = B×α + 墙×(1-α)` 被
+墙体(217)抬高；换成 A 皮肤(120)底层后 `out` 回落到 <190。§30.2"两种问题可以
+叠加，不能二选一"的判断正确——墙色缝是主因，残余 B/A 肤色阶差
+（jaw_seam ΔE 代理 14.9，§25.5 遗留）仍在但不再是"白横纹"。
+
+### 31.6 M3：按前置条件判定不需要运行（实现保留待命）
+
+§30.9 M3 前置条件="仅当 M2 clean_base 无墙但 final 仍有亮带时执行"。实测
+亮带 = 0（§31.5），故不启用 jaw_gradient。`jaw_luminance_gradient`（smoothstep
+底边加权 + delta EMA，只改 head_rgb）已实现并有单测；配置模板
+`v7-jaw-color.yaml`（strength 0.75）备查，如人工看片仍有肤色阶差可一键启用。
+
+### 31.7 M4：窗帘复杂背景回归
+
+- 阈值标定：真实白墙 seed 区纹理能量实测 **3.06~3.30**（6 帧），产线阈值
+  `wall_max_texture = 10.0`（3 倍余量）；M2/M3 实跑时该闸为 0（关闭），按实测值
+  补开等价（3.2 << 10 会通过，结果不变）；
+- 单测：合成窗帘（褶皱条纹+噪声）能量 >15 被 `fit_wall_fill` 显式 ValueError
+  拒绝，平滑墙通过；
+- 真帧回归：真实 frame 0 人物区外叠加合成窗帘 → (1) `fit_wall_fill` 拒绝
+  （能量 33.4 > 10）；(2) skin bridge 硬保险后 audit = 0/0/0——**窗帘背景下
+  接合区仍全部为 A 人体像素，背景模式与 skin bridge 解耦**（§30.10-7）。
+
+### 31.8 §30.10 七项回答
+
+1. `final.mp4` 是旧 v5（12:19 产物），第六/七轮结果分别为 `final-v6-*` /
+   `final-v7-skin-bridge.mp4`，人工通过前不覆盖；
+2. 白缝确有一部分来自背景白墙：v6 clean_base 在反例位 L=217 vs A 原片 104，
+   `fit_wall_fill` 写入所致——本轮以 raw skin 语义门控 + 硬保险根治；
+3. v6 的 10×1 反例被新 audit 抓到（1140px 级），旧 corridor 指标同时为 0，
+   自证循环成立且已拆除（audit ROI 不读 repair mask）；
+4. B 下颌亮度带：audit=0 后实测归零——其主因是墙色透过软边；残余 B/A 肤色
+   阶差（jaw_seam 代理 ~14.9）仍在，如需收敛用 M3（已备）或 D1（需决策）；
+5. 正确架构已落地：头颈接合区 = A 人体皮肤 underlay（raw skin 语义），
+   背景永不进入（不变量 + 硬保险 + 独立 audit 三重保障）；
+6. 窗帘背景：smooth_plane 显式拒绝（实测 33.4 > 阈值 10），需改 clean_plate/
+   temporal_plate/PatchMatch/视频修复（`background_mode` 枚举已在 §30.8 定义，
+   本轮未实现非平面模式——当前素材是白墙，遇到复杂背景素材时按 §30.8 优先级实现）；
+7. 窗帘回归实证：skin bridge 与背景模式解耦，窗帘不出现在脖子连接处（audit 0/0/0）。
+
+### 31.9 遗留与待用户裁决
+
+1. **人工看片**（最终裁决）：`final-v7-skin-bridge.mp4`（K1 运动 + 全部第七轮
+   整改）0.5×/1× 速度确认头颈无任何墙/背景/白横纹；与 `final-v6-motion.mp4`
+   对比可见 bridge 的贡献；
+2. 运动方案（K0/K1/K1c）与 106 点锚点确认仍待用户（§29.7，未变）；
+3. 肤色阶差（非白线）：M3 一键启用（v7-jaw-color.yaml）或 D1 全局，需决策；
+4. 复杂背景素材到来时按 §30.8 优先级实现 clean_plate/temporal_plate
+   （`background_mode` 已定义未实现）；
+5. 通过后才把终选覆盖 `output/final.mp4`。
+
+### 31.10 复现命令
+
+```powershell
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v7-skin-bridge.yaml -Stage segment   # 生成 raw_skins/raw_necks
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v7-skin-bridge.yaml -Stage composite
+.\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v7-skin-bridge.yaml -Stage finalize
+# 独立验收指标在 work/composite_silent-v7-skin-bridge.diag.json 的 audit_* 键
+```
