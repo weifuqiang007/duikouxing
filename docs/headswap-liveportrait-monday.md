@@ -7584,3 +7584,407 @@ git diff --check: 通过（仅有 Windows LF/CRLF 提示，无 whitespace error�
 
 本轮代码与诊断产物已生成，但未在本节记录时自动提交 Git；待人工看片确认 E3 后再决定
 是否作为正式生产方案提交。
+
+---
+
+## 37. 第一阶段基本满足：E3 恢复 R2 眼部动作后的实现、部署与调参说明（2026-09-01）
+
+本节是第一阶段可复现基线。客户/用户人工查看后认为 E3 的头部稳定性方向正确，但眼神
+不如 R2 自然，因此在不恢复 full-exp 的前提下，只恢复 LivePortrait 官方眼部局部
+expression。最终模式命名为 `rotation_lip_eye`。
+
+第一阶段“基本满足”不表示整个项目已经最终完工，而是表示以下核心问题已达到可继续交付
+和换人物验证的程度：
+
+1. 人物嘴部可以正常随原视频口播；
+2. 头部保留围绕脖子的轻微旋转，不再使用冻结头或纯平移方案；
+3. 相比 R2，念字时头部周期性收缩明显下降；
+4. 恢复接近 R2 的眨眼/眼睑变化；
+5. 头发、整脸及头颈融合继续沿用 E3 路线；
+6. 证件和原视频音频保持不变。
+
+### 37.1 第一阶段的演进过程
+
+#### 37.1.1 R2：动作自然，但 full-exp 造成头部呼吸
+
+R2 使用：
+
+```text
+rotation_exp + B hold-last + binary head_ema=0.5
+```
+
+R2 的眼睛和整体表情最活，但 full expression 会把发音变化传播到脸颊、下颌和头框，
+形成“头一缩一缩”的观感。同时 B 检测失败后 hold-last，以及二值 mask 的 recursive EMA，
+会继续放大边界不连续和慢性轮廓累积。
+
+#### 37.1.2 E3：先限制为嘴部 expression
+
+E3 改为：
+
+```text
+rotation_lip + B offline interpolation + head_ema=0
+```
+
+仅保留嘴部 expression，冻结其他 expression，明显降低头框和 alpha 的周期变化。但副作用
+是眼睑/眨眼也被固定，人物眼神比 R2 僵硬。
+
+#### 37.1.3 E3-eye：只恢复官方眼部索引
+
+最终新增：
+
+```text
+motion_mode: rotation_lip_eye
+```
+
+白名单如下：
+
+```python
+LIP_INDICES = (6, 12, 14, 17, 19, 20)
+EYE_INDICES = (11, 13, 15, 16, 18)
+EXPRESSION_INDICES = LIP_INDICES + EYE_INDICES
+```
+
+其中眼部索引来自 LivePortrait 官方 `animation_region="eyes"` 路径。其余 expression 仍复制
+第一帧，因此脸颊、下颌等区域不会因为恢复眼睛而一起回到 full-exp。
+
+当前没有恢复眉毛索引。若未来认为眉毛太僵，应将眉毛作为独立变量实验，不能直接恢复
+full-exp。
+
+### 37.2 当前正式候选流程
+
+```text
+A 原视频
+  -> prepare：转正、抽取原音频
+  -> LivePortrait rotation_lip_eye：生成 B 头部 RGB
+  -> A 分割：原头、皮肤、脖子及 raw mask
+  -> B 人脸检测：离线前后插值补失败帧
+  -> neck pivot/eyes+nose 对齐：scale 固定，不传外部旋转
+  -> region-aware alpha + jaw underlay + skin bridge
+  -> 颜色匹配
+  -> 合成并回填 A 原音频
+  -> final MP4
+```
+
+必须保持的职责边界：
+
+- LivePortrait 负责嘴、眼和受控三轴旋转；
+- composite 只负责贴回位置与头颈连接，不得再次根据逐帧 bbox 改变 scale；
+- 嘴点不得参与头颈支点估计；
+- mask/颜色层不得通过加宽模糊去隐藏几何问题；
+- A 的证件、手、身体和原音频必须保持原样。
+
+### 37.3 本阶段修改的文件
+
+| 文件 | 本阶段职责 |
+|---|---|
+| `scripts/liveportrait_runner.py` | 新增 `rotation_lip_eye`；嘴部和官方眼部索引白名单；继续输出 motion/stitching 遥测 |
+| `src/headswap/cli.py` | 允许并校验 `rotation_lip_eye` 配置 |
+| `src/headswap/liveportrait_reenact.py` | 将新模式映射到官方 `all + pose-friendly`，再由本项目过滤 expression |
+| `src/headswap/motion_control.py` | 通用 expression 索引白名单；固定 t/scale；控制相对旋转 |
+| `src/headswap/composite_head.py` | B 离线插值、固定 scale、头颈支点、逐层 mask/alpha 遥测 |
+| `src/headswap/segment_head.py` | 输出 parser 到最终 mask 的逐层几何诊断 |
+| `scripts/headswap_shrink_diagnostics.py` | 支持完整视频 full-exp/E3 对比曲线和自动报告 |
+| `tests/test_headswap_units.py` | 验证非白名单 expression 被固定、眼和嘴白名单被保留 |
+| `config/headswap.hs-p1-0004-shrink-full-e3-eye.yaml` | 当前人物的完整片第一阶段候选配置 |
+
+本阶段相关 Git 提交：
+
+```text
+f899e88 诊断并修复头部周期收缩
+917cd7a 添加完整片收缩对比与曲线分析
+3fd11b9 为E3恢复R2眼部动作
+```
+
+### 37.4 当前产物与完整片验收结果
+
+E3-eye 单独成片：
+
+```text
+E:\duikouxing\jobs-home\hs-p1-0004-shrink-full-e3-eye\output\shrink-full-e3-eye.mp4
+```
+
+R2 与 E3-eye 正常速度完整对比：
+
+```text
+E:\duikouxing\jobs-home\hs-p1-0004-shrink-full-review\output\compare-full-r2-vs-e3-eye-normal.mp4
+```
+
+完整片为 26.53 秒、796 帧、30 FPS。自动检测结果：
+
+| 指标 | 结果 |
+|---|---:|
+| E3-eye 眼部开合曲线与 R2 的相关性 | 0.9643 |
+| E3-eye 眼部动作幅度 / R2 | 1.0336 |
+| animated eye-distance 高频相对 R2 | 降低 37.36% |
+| animated bbox-height 高频相对 R2 | 降低 43.82% |
+| alpha@0.5 全程 range 相对 R2 | 降低 72.80% |
+| 2D106 眼部检测成功 | R2/E3/E3-eye 均为 796/796 |
+| 单元测试 | 107 passed |
+
+眼部动作幅度约为 R2 的 103.4%，说明眼睛已经恢复到接近 R2 的活动程度，而头框高频和
+alpha 变化没有回到 R2 的水平。该结果支持“局部恢复眼睛，而不是恢复 full-exp”的方案。
+
+自动报告：
+
+```text
+jobs-home\hs-p1-0004-shrink-full-review\reports\eye-motion-compare.json
+jobs-home\hs-p1-0004-shrink-full-review\reports\e3-eye\shrink-diagnostic-report.json
+jobs-home\hs-p1-0004-shrink-full-review\reports\e3-eye\shrink-layered-curves.png
+```
+
+### 37.5 服务器环境要求
+
+本轮实际验证机器为 Windows + RTX 4070 Ti 12GB，LivePortrait 使用半精度。完整 796 帧
+流水线的显存需求低于显卡容量，但不同 CUDA/PyTorch/ONNX Runtime 组合仍需实测。
+
+建议服务器：
+
+- NVIDIA GPU，建议显存不低于 12GB；8GB 尚未在本阶段正式验收；
+- NVIDIA 驱动、CUDA 依赖可被 PyTorch 和 ONNX Runtime 正确加载；
+- `ffmpeg`、`ffprobe` 在 PATH；
+- 两个独立 Python/Conda 环境：
+  - `.conda-envs/digital-human`：编排、测试；
+  - `.conda-envs/liveportrait`：LivePortrait、InsightFace、Matplotlib 诊断；
+- `external/LivePortrait` 已安装；
+- 以下模型已放置：
+  - LivePortrait 官方模型；
+  - `models/facefusion/bisenet_resnet_34.onnx`；
+  - `external/LivePortrait/pretrained_weights/insightface/models/buffalo_l`。
+
+输入视频、人物肖像和模型不会随 Git 推送到服务器，必须单独上传。服务器配置里的绝对路径
+也必须改为服务器实际路径。
+
+### 37.6 从 GitHub 在服务器拉取
+
+```bash
+git fetch origin
+git checkout codex/headswap-liveportrait-monday
+git pull --ff-only origin codex/headswap-liveportrait-monday
+```
+
+确认版本：
+
+```bash
+git log -5 --oneline
+```
+
+Windows PowerShell 测试：
+
+```powershell
+.\.conda-envs\digital-human\python.exe -m pytest -q
+```
+
+Linux 服务器测试：
+
+```bash
+./.conda-envs/digital-human/bin/python -m pytest -q
+```
+
+若服务器不是通过项目内 `.conda-envs` 管理环境，应将上面的 Python 路径换成实际 Conda
+环境路径，并同步修改 `config/local.*.yaml` 中的 environment、jobs root 和 external repo 路径。
+
+### 37.7 新人物配置方法
+
+不要直接覆盖已经验收的 `hs-p1-0004`。复制配置并使用新的 `job_id`：
+
+```text
+config/headswap.hs-p1-0004-shrink-full-e3-eye.yaml
+  -> config/headswap.<new-job-id>.yaml
+```
+
+至少修改：
+
+```yaml
+job_id: <new-job-id>
+consent_confirmed: true
+source_video: /server/jobs/<new-job-id>/input/shipin.mp4
+source_portrait: /server/jobs/<new-job-id>/input/portrait.png
+side_portraits:
+  - /server/jobs/<new-job-id>/input/side_celian.png
+
+liveportrait:
+  motion_mode: rotation_lip_eye
+
+video:
+  max_seconds: 0.0
+
+composite:
+  max_frames: 0
+```
+
+`max_seconds=0` 和 `max_frames=0` 表示完整片。第一次换人物建议先都设为 10 秒/300 帧，
+人工确认肖像裁剪、头大小和头颈连接后，再运行完整片。
+
+### 37.8 服务器运行命令
+
+Windows PowerShell：
+
+```powershell
+.\.conda-envs\digital-human\python.exe -m src.headswap.cli run `
+  --job config\headswap.<new-job-id>.yaml `
+  --profile home
+```
+
+Linux：
+
+```bash
+./.conda-envs/digital-human/bin/python -m src.headswap.cli run \
+  --job config/headswap.<new-job-id>.yaml \
+  --profile home
+```
+
+注意：
+
+- `--job` 指业务 YAML；
+- `--config` 若使用，指的是 `local.home.yaml/local.office.yaml` 一类机器配置，不能把二者写反；
+- 默认已有产物会跳过；需要重跑某阶段时使用 `--stage`；
+- 不建议每次全流程都加 `--force`，否则会无意义重算约半小时。
+
+分阶段命令示例：
+
+```powershell
+# 只重做 LivePortrait
+.\.conda-envs\digital-human\python.exe -m src.headswap.cli run `
+  --job config\headswap.<new-job-id>.yaml --profile home --stage reenact --force
+
+# 只重做融合
+.\.conda-envs\digital-human\python.exe -m src.headswap.cli run `
+  --job config\headswap.<new-job-id>.yaml --profile home --stage composite --force
+
+# 重新封装音频/输出
+.\.conda-envs\digital-human\python.exe -m src.headswap.cli run `
+  --job config\headswap.<new-job-id>.yaml --profile home --stage finalize --force
+```
+
+只有 A 视频和 prepare 结果完全一致时，才能在不同 expression 实验之间复用
+`work/segment` 和 `background_plate.*`。换人像 B 可以复用 A 分割，但换 A 视频、裁剪、转正
+方式或帧率后必须重新 segment/plate。
+
+### 37.9 主要可调参数
+
+#### 37.9.1 LivePortrait 动作参数
+
+| 参数 | 当前值 | 影响 | 注意 |
+|---|---:|---|---|
+| `motion_mode` | `rotation_lip_eye` | 嘴、眼、旋转职责 | 第一阶段基线，不要改回 `rotation_exp` |
+| `driving_multiplier` | 1.0 | expression 总强度 | 过大会夸张口型/眼睛，过小会显得僵 |
+| `pose_gain_yaw` | 1.0 | 左右转头幅度 | 建议先在 0.75～1.0 内调 |
+| `pose_gain_pitch` | 1.0 | 点头幅度 | 太大会让下颌接缝更难稳定 |
+| `pose_gain_roll` | 1.0 | 歪头幅度 | 与脖子居中观感直接相关 |
+| `pose_limit_yaw_deg` | 5.0 | yaw 上限 | 防异常大转头 |
+| `pose_limit_pitch_deg` | 3.0 | pitch 上限 | 防点头穿帮 |
+| `pose_limit_roll_deg` | 3.0 | roll 上限 | 防脖子连接被拉开 |
+| `pose_smooth_window` | 7 | 旋转时序平滑 | 越大越稳但响应越迟钝；必须为正奇数 |
+| `smooth_variance` | `3e-7` | LP motion 平滑 | 改动会同时影响嘴和眼，非首选调参 |
+| `source_crop_scale/vx/vy` | 2.3/0/-0.125 | B 肖像裁剪 | 换人物首先检查；影响头发是否完整 |
+| `driving_crop_scale/vx/vy` | 2.2/0/-0.1 | A 驱动裁剪 | 不合理会引入检测失败或姿态偏差 |
+
+若仅认为眼睛幅度略大/略小，后续应增加独立 `eye_expression_gain`，而不是调整整个
+`driving_multiplier`。当前实现眼部是 1.0 原幅度，尚未单独乘 gain。
+
+#### 37.9.2 跟踪与几何参数
+
+| 参数 | 当前值 | 影响 | 注意 |
+|---|---:|---|---|
+| `transform_mode` | `eyes_nose` | B 贴回对齐 | 明确排除嘴点，保持 |
+| `filter_mode` | `offline` | 全片轨迹平滑 | 流式业务需另做在线 tracker |
+| `b_track_gap_mode` | `interpolate` | 检测失败帧处理 | 不要改回 `hold` |
+| `scale_mode` | `const` | 贴回头大小 | 必须保持，否则头部可能重新呼吸 |
+| `angle_window` | 7 | 对齐角度平滑 | 太大会滞后，太小会抖 |
+| `neck_pivot_enabled` | true | 头绕脖子支点运动 | 第一阶段核心，保持 |
+| `neck_pivot_smooth_window` | 7 | 脖子支点平滑 | 大值更稳但会产生相位延迟 |
+| `neck_pivot_max_gap` | 5 | 支点短缺口插值 | 太大可能跨越真实姿态变化 |
+| `attachment_offset_x/y` | 0/0 | 头相对脖子静态偏移 | 换人物可小幅调，不能用来补累计漂移 |
+| `max_attachment_drift_px` | 3 | 支点最大漂移 | 太大易偏脖子，太小可能过硬 |
+| `external_rotation_gain` | 0 | composite 外部旋转 | neck pivot 模式必须为 0 |
+
+#### 37.9.3 分割、alpha 与头颈连接参数
+
+| 参数 | 当前值 | 影响 | 注意 |
+|---|---:|---|---|
+| `segmentation.temporal_ema` | 0 | A 分割时序 EMA | 当前保持 0 |
+| `composite.head_ema` | 0 | B 头 mask EMA | 禁止恢复 0.5 二值递归 EMA |
+| `mask_dilate_px` | 8 | 原头/皮肤 mask 扩张 | 大会吞背景，小会漏原头边 |
+| `b_mask_erode_px` | 1 | B mask 内缩 | 大会切掉耳朵/头发边缘 |
+| `head_side_feather_px` | 4 | 头侧边柔化 | 过大会重新产生光晕 |
+| `jaw_feather_px` | 8 | 下颌柔化 | 过大会出现下颌糊带 |
+| `jaw_underlay_px` | 10 | 下颌下方垫底 | 小会裂缝，大会形成色块 |
+| `skin_bridge_max_gap_px` | 14 | 头颈肤色桥最大缺口 | 过大可能侵入衣服/背景 |
+| `junction_bridge_max_gap_px` | 6 | 接缝几何桥 | 只补小缺口，不能无限扩大 |
+| `a_neck_upward_px` | 3 | A 原脖子向上保护 | 过大会与 B 下颌重叠 |
+| `head_ema` | 0 | 最终头轮廓时序 | 生产暂用 0；长期应换 motion-SDF |
+
+#### 37.9.4 颜色与输出
+
+| 参数 | 当前值 | 影响 | 注意 |
+|---|---:|---|---|
+| `color_strength` | 0.55 | B 头向 A 环境色匹配 | 太大可能脸色漂移 |
+| `max_delta_l` | 20 | 亮度最大改变量 | 过大易形成下颌亮带 |
+| `max_delta_ab` | 12 | 色相最大改变量 | 过大易肤色不稳定 |
+| `color_ema` | 0.9 | 颜色时序稳定 | 越大越稳，但场景光线变化响应更慢 |
+| `output_crf` | 14 | 输出质量/体积 | 数字越小质量越高、文件越大 |
+| `keep_original_audio` | true | 保留 A 原音频 | 场景 1 必须保持 true |
+| `max_seconds` | 0 | 输入时长限制 | 0=完整；实验用 10 |
+| `max_frames` | 0 | composite 帧数限制 | 0=完整；实验用 300 |
+
+### 37.10 运行耗时与服务器排程
+
+本机 26.53 秒、796 帧完整片参考耗时：
+
+| 阶段 | 参考耗时 |
+|---|---:|
+| prepare | 约 6 秒 |
+| reenact | 约 120 秒 |
+| segment | 约 136 秒 |
+| plate | 约 11 秒 |
+| composite | 约 1642 秒（约 27 分钟） |
+| finalize | 约 95 秒 |
+| 全流程 | 约 33～34 分钟 |
+
+当前主要瓶颈不是 LivePortrait，而是逐帧 composite/分割/检测。服务器批量排程应按每条
+30～40 分钟预留，并为失败重试保留时间。
+
+本轮首次 E3-eye reenact 在 driving crop 后出现一次无 Python traceback 的进程退出，
+第二次只重跑 `reenact` 即成功。服务器必须保留 `logs/reenact.log`；遇到这种无明确模型或
+配置错误的偶发退出，可以先重试一次该阶段，不要直接删除整个 job。若连续出现，应检查
+GPU 显存、驱动、Conda 子进程和编码器，而不是盲目重试。
+
+### 37.11 第一阶段运行注意事项
+
+1. 禁止恢复 `rotation_exp/full-exp` 作为生产默认，否则头部收缩可能回归；
+2. 禁止 `head_ema=0.5` 配合二值阈值，已证明会形成历史并集；
+3. 禁止 B 检测失败后无限 hold-last，完整片必须离线插值或使用连续 tracker；
+4. 禁止让嘴点进入头部贴回变换和脖子支点估计；
+5. 禁止用扩大 Gaussian feather 掩盖裂缝，会重新产生白色光晕；
+6. 眼部白名单只恢复 `[11,13,15,16,18]`，不要顺手恢复脸颊/下颌；
+7. 换人物时先跑 10 秒，再检查肖像裁剪、头大小、眼睛、口型、头颈接缝；
+8. 三视图当前不是直接逐帧三维重建输入，侧脸图主要用于人工参考，不应误认为已自动融合；
+9. `jobs-home` 产物和人物素材不进入 Git，Git 只保存代码、配置模板和文档；
+10. 最终以正常速度人工看片为准，曲线和相关性不能替代客户观感。
+
+### 37.12 下一阶段遗留问题
+
+第一阶段仍有以下工程债务：
+
+1. E3-eye 原始 B 检测成功仅 205/796，当前靠全片离线插值补齐；长期必须改为稳定的
+   眼眉鼻 tracker + 光流 forward/backward 置信度；
+2. `head_ema=0` 去掉了历史并集，但长期应实现 motion-compensated probability/SDF
+   窄边界时序滤波；
+3. 需要在更多脸型、发型、胖瘦差异和复杂背景上验证头颈接缝；
+4. 若眼睛幅度需要个性化，应新增独立 `eye_expression_gain`；
+5. composite 当前约 27 分钟，是批量业务的主要性能瓶颈；
+6. 第一阶段仅对当前本人授权素材验收，不代表所有客户素材自动满足。
+
+第一阶段的生产候选基线为：
+
+```text
+rotation_lip_eye
++ fixed t/scale
++ neck pivot
++ eyes+nose transform
++ B offline interpolation
++ head_ema=0
++ region-aware alpha / jaw underlay / skin bridge
+```
+
+后续优化必须以这条基线为对照，一次只改一个职责层，保留自动遥测和正常速度对比片。
