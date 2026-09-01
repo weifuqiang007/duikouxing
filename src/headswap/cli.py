@@ -57,9 +57,9 @@ def load_headswap_job(path: Path) -> dict:
         raise HeadswapError("未确认人物肖像授权，任务拒绝运行")
     lp = data.setdefault("liveportrait", {})
     motion_mode = str(lp.get("motion_mode", lp.get("animation_region", "all")))
-    if motion_mode not in {"all", "exp", "rotation_exp"}:
-        raise HeadswapError("liveportrait.motion_mode 只能是 all、exp 或 rotation_exp")
-    if motion_mode == "rotation_exp":
+    if motion_mode not in {"all", "exp", "rotation_exp", "rotation_lip"}:
+        raise HeadswapError("liveportrait.motion_mode 只能是 all、exp、rotation_exp 或 rotation_lip")
+    if motion_mode in {"rotation_exp", "rotation_lip"}:
         if bool(lp.get("transfer_translation", False)):
             raise HeadswapError("rotation_exp 禁止 transfer_translation=true")
         if bool(lp.get("transfer_scale", False)):
@@ -333,6 +333,7 @@ def stage_composite(job: dict, local, dirs: dict) -> None:
             "--mask-union", str(comp.get("mask_union", "motion_safe")),
             "--safe-margin-px", str(int(comp.get("safe_margin_px", 8))),
             "--head-ema", str(float(comp.get("head_ema", 0.5))),
+            "--b-track-gap-mode", str(comp.get("b_track_gap_mode", "hold")),
             "--neck-cut-ratio", str(float(comp.get("neck_cut_y_ratio", 1.35))),
             "--color-strength", str(float(color.get("color_strength", 0.55))),
             "--max-delta-l", str(float(color.get("max_delta_l", 20))),
@@ -341,6 +342,8 @@ def stage_composite(job: dict, local, dirs: dict) -> None:
             "--crf", str(int(job.get("video", {}).get("output_crf", 14))),
             "--debug-dir", dirs["previews"] / comp.get("debug_dir_name", "composite_debug"),
             "--debug-every", "50",
+            *( ["--alpha-diagnostic-output", dirs["previews"] / str(comp["alpha_diagnostic_name"])]
+               if comp.get("alpha_diagnostic_name") else [] ),
         ],
     )
     _run(command, dirs["logs"] / "composite.log", cwd=PROJECT_ROOT)

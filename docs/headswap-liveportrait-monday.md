@@ -6965,3 +6965,622 @@ jaw_neck_gap_px_max                       = 0
 - 不覆盖 final/V7；
 - 不引入三视图融合；
 - 不宣称业务最终通过。
+
+---
+
+## 35. 客户复审：四版观感接近，头部存在不自然的周期性收缩——根因候选、排查矩阵与下一轮处方（2026-09-01）
+
+> 本节只做诊断设计与技术裁决，**本轮尚未修改代码、尚未重新生成视频**。
+> 客户原话的核心不是“头没有跟随”，而是“四个 10 秒版本都差不多，头部一缩一缩，缩得不自然”。
+> 下一步禁止继续凭观感盲调 pose gain、bbox scale 或 feather；必须先确定“缩”最早出现在哪一层。
+
+### 35.1 客户提出的三个候选方向
+
+客户/用户提出：
+
+1. **跟踪层**：人脸 bbox 每帧大小不稳定，导致 AI 头跟着 bbox 逐帧缩放；
+2. **对齐层**：关键点漂移，使相似变换 scale 逐帧变化；
+3. **融合层**：mask/alpha 边界每帧大小不同，造成有效头部轮廓反复收缩。
+
+这三个方向都合理，但结合当前 R1/R2/R3 的真实日志，必须先做一个重要纠偏：
+
+> 当前正式 pivot 版本的**外部 scale 并没有逐帧变化**。因此“最终贴回矩阵直接跟 bbox
+> 一缩一缩”不是 R1/R2/R3 的首要根因；但 bbox/关键点不稳定仍会通过 Q、组件筛选、
+> mask 和 LivePortrait driving motion 间接制造“缩”的观感。
+
+### 35.2 已经可以用现有日志确认或排除的事实
+
+#### 35.2.1 外部合成 scale/angle 已经是常量
+
+正式 300 帧日志：
+
+```text
+R1 external scale min=max=0.5896805286
+R2 external scale min=max=0.5903412995
+R3 external scale min=max=0.5909777154
+
+R1/R2/R3 external angle 也分别为全片常量
+```
+
+因此 `m_final` 不是逐帧根据 A/B bbox 重算 scale。R0 旧 V7 配置同样使用
+`scale_mode=const`。客户说四版观感接近，也与“外部动态 scale 不是主因”一致。
+
+#### 35.2.2 R2/R3 的 LivePortrait t/scale 也已固定
+
+```text
+used_tx_range    = 0
+used_ty_range    = 0
+used_scale_range = 0
+```
+
+但这只能证明 LivePortrait motion 字典里的显式 `t/scale` 不变，**不能证明最终生成
+头部的二维视觉宽高不变**。R、exp、stitching network 和 generator 都可能改变隐式
+关键点的二维跨度、脸颊/下颌轮廓或实际生成纹理的有效边界。
+
+#### 35.2.3 P/Q 数学对齐为零，不代表头部视觉面积稳定
+
+P/Q error 为浮点零，只证明 B 的连接点始终落在 A 的颈支点。即使 Q 完美对齐，
+头发轮廓、脸宽、下颌宽或 alpha 面积仍可能每帧变化。故“头颈不漂移”和“头不呼吸”
+是两个独立验收项，不能用一个指标替代另一个。
+
+#### 35.2.4 B 再演视频的人脸检测失败率异常高
+
+正式 composite 的 B 侧检测 fallback：
+
+```text
+R1:  92 / 300 = 30.7%
+R2: 151 / 300 = 50.3%
+R3: 136 / 300 = 45.3%
+```
+
+当前失败帧会沿用前后最近的 bbox/kps。这样不会直接改变常量 scale，却会造成：
+
+- Q 轨迹分段冻结，恢复检测时发生跳变；
+- `filter_components(head_mask, box_b)` 使用陈旧 box 选择组件；
+- parser 轮廓和检测框的关系在失败/恢复边界突变；
+- 视觉上可能表现为“头突然松一下/紧一下”，被用户描述成缩放。
+
+这是本轮新发现的**高优先级异常**，不能忽略。
+
+#### 35.2.5 现有 `scale_std_ratio` 不能直接证明没有呼吸
+
+68 点复核得到 R1/R2/R3 `scale_std_ratio≈0.56`，它只是“输出眼距标准差 / A 眼距
+标准差”，混合了慢趋势、真实 yaw 透视和高频噪声。它不是专门的高频呼吸指标。
+必须把 15~31 帧低频趋势移除后，再测眼距/脸宽/alpha 面积的 high-pass RMS 和峰峰值。
+
+### 35.3 除用户三个猜想之外，还可能存在的根因
+
+下面按当前证据的优先级排序。
+
+### 35.3.1 根因 A：B 侧 mask 时序 EMA 的二值递归存在结构性问题（高优先级）
+
+当前 `HeadSegmenter` 在 B 再演画布中默认：
+
+```python
+head_ema = 0.5  # YAML 未显式配置时的默认值
+blended = 0.5 * prev_mask + 0.5 * current_mask
+mask = blended >= 127
+```
+
+对 0/255 二值 mask 而言，一个只存在于上一帧或只存在于当前帧的像素都是 `127.5`，
+会通过 `>=127`。由于输出二值 mask 又被写回 `_prev_mask`，历史像素可能长期保留，
+该逻辑更接近**递归历史并集**，不是正常概率 EMA。
+
+它不一定产生纯粹的周期性缩小，也可能产生轮廓外扩、拖尾、局部忽大忽小；但和每帧
+parser 轮廓、component filter、erode=1、region-aware feather 叠加后，最终有效 alpha
+边界会很难预测。客户说四版都像，正好符合“三版共享同一 B 分割/alpha 路径”。
+
+**排查：**
+
+1. 对同一个 animated_head 只重跑 composite：`head_ema=0` 与 `0.5` A/B；
+2. 输出每帧 `mask_area`、`mask_bbox_w/h`、`alpha_area@0.05/0.5/0.95`；
+3. 画出 mask 面积时间曲线，看“缩”的帧是否和面积突变一致；
+4. 生成纯 alpha 黑白视频，用户不看 RGB，只看轮廓是否呼吸。
+
+**正确修法（若命中）：**
+
+- 禁止对未运动补偿的 full-canvas 二值 mask 做递归 EMA；
+- 先用 Q/光流/稳定关键点把上一帧 alpha warp 到当前帧；
+- 对**浮点 signed-distance field 或概率 alpha**做有限窗口双向滤波；
+- 再阈值化，且限制每帧轮廓法向位移；
+- 核心脸区与头发/耳朵边缘分层：核心区稳定，外轮廓仅在窄带内允许变化。
+
+### 35.3.2 根因 B：LivePortrait `exp` 不只控制嘴，可能改变脸颊/下颌整体几何（高优先级）
+
+R1 虽然是 exp-only，但官方 `animation_region=exp` 会转移多个隐式表达点，不是只转移
+内唇。部分隐式点同时影响眼周、脸颊、下颌和脸型。说话时 exp 周期变化，generator
+可能把“张嘴/念字”同时解释成轻微收脸或放脸。
+
+客户认为 R0/R1/R2/R3 都差不多：四版共同拥有较完整的表情/嘴形 transfer，因此
+“exp 驱动了全脸呼吸”比“R2/R3 pose gain 不对”更值得优先检查。
+
+**排查版本：**
+
+```text
+E0: source B 静态重复 10 秒（无 R、无 exp）
+E1: lip-only（只转移官方 lip 索引），R/t/scale 全冻结
+E2: full exp-only（等同 R1 的 LP 部分）
+E3: rotation + lip-only
+E4: rotation + full exp（等同 R2）
+```
+
+如果 E1 不缩、E2 缩，根因就是 full exp 的非嘴部几何污染。正式方案应增加
+`rotation_lip` 或 `rotation_lip_eyes`，只转移嘴和必要眨眼，不转移会改变脸宽/下颌
+整体形状的 exp 索引。
+
+### 35.3.3 根因 C：LivePortrait stitching network 每帧施加全局关键点修正（高优先级）
+
+当前始终启用 `flag_stitching`。官方流程在构造 `x_d_i_new` 后调用 stitching network。
+这个网络的目的之一是把驱动身份和 source 身份接合自然，但它不是“只修边缘”，可能
+对整组隐式关键点施加不同帧的全局校正。即使输入 scale 常量，stitching 后关键点的
+RMS 半径、眼距代理、脸宽代理仍可能轻微变化。
+
+**排查：**
+
+1. 在 LivePortrait 内导出 `x_d_i_new` stitching 前/后的：
+   - XY 质心；
+   - centered RMS radius；
+   - 稳定关键点 pairwise distance；
+   - convex hull area；
+2. 同一 motion 分别跑 stitching on/off，只看 animated_head，不进入 composite；
+3. 如果 pulse 只在 stitching 后出现，应限制 stitching 的全局 similarity 分量，只保留
+   局部 residual，或对其 global scale 分量做全片中位数固定。
+
+注意：直接关 stitching 可能降低嘴/身份稳定并破坏 pasteback，因此只能作为隔离实验，
+不能未经看片直接成为生产配置。
+
+### 35.3.4 根因 D：B 再演视频检测/关键点失败后“保持上一帧”造成阶梯跳变（高优先级）
+
+这和用户提出的“跟踪层”有关，但不是简单 bbox 大小驱动 scale。当前真实问题更像：
+
+- 成功帧：Q 来自当前双眼/鼻尖；
+- 失败帧：Q 和 bbox 沿用上一成功帧；
+- 恢复帧：Q 一次跳到新检测值。
+
+30%~50% fallback 已远超生产可接受范围。即使最终经过 7 帧平滑，也可能保留低频阶梯。
+
+**解决方向：**
+
+1. 不再逐帧重新检测生成 B 头；首帧检测后用 106 点 tracker/光流持续跟踪；
+2. 利用 LivePortrait 已知的 `R/exp` 和 source 几何推导 Q，避免“生成后再检测”的闭环；
+3. 短缺失用前后可靠帧离线插值，不用 hold-last；
+4. 每帧记录 detector score、bbox、眼距、Q、fallback 类型；
+5. 生产门槛：真实检测/跟踪可用率应 `>=98%`，fallback 不得超过 2%，且连续 fallback
+   不得超过 3 帧。
+
+### 35.3.5 根因 E：parser 的 component 选择和 head mask 面积随 B bbox 变化（中高优先级）
+
+`segment_full_parts()` 虽然对全画布解析，但仍用 `filter_components(head, box_b)` 选择
+与主脸相关的组件。box_b 陈旧、跳动或检测失败时，头发、耳朵、脸颊的组件归属可能
+变化。之后还会执行 close/open、erode 和 alpha 内羽化，外轮廓面积可以跳变。
+
+**排查：**记录每帧：
+
+- parser 原始 head class 面积；
+- component filter 后面积；
+- morphology 后面积；
+- erode 后面积；
+- warp 后 alpha 三档面积。
+
+哪个步骤第一次出现和人工“缩”同帧的尖峰，哪个步骤才是根因。禁止只看最终 mask。
+
+### 35.3.6 根因 F：自然三维旋转的投影变化被误认为缩放（中优先级）
+
+yaw/pitch 时二维脸宽或头高自然会变化；绕脖子旋转时鼻子移动、远侧脸颊收窄也是
+正确透视。但客户说四版都类似，R1 缺少 pose 仍能看出“缩”，说明自然投影不是唯一
+根因。
+
+仍需区分：
+
+- **合理投影**：脸宽随 yaw 单调、平滑变化，和 yaw 曲线相关；
+- **不合理呼吸**：在 yaw 基本不变时，脸宽/alpha 面积仍随发音周期高频涨缩。
+
+排查时应回归掉 yaw/pitch 对脸宽的低频解释，再测残差；不能把所有宽度变化都当 bug。
+
+### 35.3.7 根因 G：alpha/颜色变化造成“视觉收缩”，几何其实没缩（中优先级）
+
+人眼判断轮廓不只看 mask。若边缘 alpha 变浅、下颌颜色向墙/脖子靠近，虽然几何边界
+位置没变，视觉上也会感觉头变窄或变小。当前 color matcher 有时序状态，region-aware
+alpha 又按每帧 mask 重新生成，二者可能造成轮廓对比度周期变化。
+
+**排查：**
+
+1. 固定 RGB 为纯色，只播放 alpha；
+2. 固定 alpha，只播放真实 RGB；
+3. 输出 alpha=1 的 hard-core 版本；
+4. 测轮廓内外 LAB contrast，而不只测 alpha 面积。
+
+若纯 alpha 稳定但真实 RGB 看起来缩，应修颜色/亮度而不是继续改跟踪。
+
+### 35.3.8 根因 H：motion blur、压缩和低置信帧污染模型（中低优先级）
+
+A 原视频说话和轻转时可能出现运动模糊。模糊帧会同时影响：
+
+- driving 106 点 tracker；
+- LivePortrait motion extractor；
+- B 再演后的人脸 detector；
+- BiSeNet parser 边缘。
+
+应记录每帧 Laplacian sharpness、detector confidence 和 pulse 指标。如果收缩尖峰总在
+低清晰度帧出现，应做置信度加权的离线插值，而不是让低置信帧直接改几何/轮廓。
+
+### 35.4 关于用户提出的“bbox 逐帧变大变小”的准确裁决
+
+分三层回答：
+
+1. **A driving crop 层：**LivePortrait 先逐帧跟踪 106 点，再把所有 bbox 求
+   `average_bbox_lst()`，后续 driving crop 使用一个全局平均 bbox。因此官方当前路径
+   并不是每帧用不同 bbox 对 256×256 输入做缩放；该层的逐帧 bbox 尺寸跳动不是首因。
+2. **本项目外部贴回层：**R1/R2/R3 scale 已固定，bbox 不直接驱动逐帧贴回缩放。
+3. **B 检测/分割层：**bbox 仍参与 Q 和 component filter，且失败率 30%~50%；它会
+   间接影响位置和 mask，仍是高优先级问题。
+
+所以用户的直觉方向没有错，但应把问题从“bbox 直接乘到 scale”修正为：
+
+> B 侧检测/关键点不连续，连同 parser/component/alpha 形成了不稳定闭环；同时
+> LivePortrait full exp/stitching 可能在模型内部改变二维脸型跨度。
+
+### 35.5 下一轮必须先做的“分层缩放遥测”，不能先调参数
+
+针对每帧输出一张 CSV，至少包括四组独立尺度：
+
+#### L0：外部变换尺度
+
+```text
+external_scale
+external_angle
+tx / ty
+```
+
+已知 external_scale 应严格为常量，用于防回归。
+
+#### L1：LivePortrait 内部几何尺度
+
+```text
+kp_rms_before_stitch
+kp_rms_after_stitch
+kp_hull_area_before/after
+stable_pair_distance_before/after
+R / exp / t / scale
+```
+
+用于判断 full exp 或 stitching 是否制造内部呼吸。
+
+#### L2：B 生成画面特征尺度
+
+```text
+B_detector_success / score / fallback_type
+B_bbox_w / B_bbox_h
+B_eye_distance
+B_68_stable_scale（排除嘴点）
+Q_x / Q_y
+```
+
+用于判断生成 RGB 中的人脸本身是否在缩。
+
+#### L3：融合轮廓尺度
+
+```text
+parser_raw_area
+component_filtered_area
+morph_area
+warped_alpha_area@0.05/0.5/0.95
+alpha_bbox_w/h
+contour_radius_from_Q（上/左/右/下）
+edge_contrast_lab
+```
+
+用于判断 RGB 没缩但 alpha 在缩，或只是边缘对比度在变化。
+
+所有尺度都同时输出：
+
+```text
+raw
+lowpass_15_or_31
+highpass = raw - lowpass
+highpass_rms
+highpass_p95
+peak_to_peak
+```
+
+并自动找出 pulse 最大的 10 帧，生成前后各 3 帧的 7 帧接触表。
+
+### 35.6 根因判定矩阵
+
+| 观测结果 | 根因裁决 | 应采取的修法 |
+|---|---|---|
+| LP stitching 前 kp 已呼吸 | motion extractor/full exp | lip-only、限制全局 exp 几何 |
+| stitching 前稳，stitching 后呼吸 | stitching network | 去除/固定 stitching global similarity 分量 |
+| animated_head 眼距/脸宽已呼吸 | LivePortrait generator | rotation_lip、关键点尺度归一、弱化非嘴 exp |
+| animated_head 稳，parser raw area 呼吸 | BiSeNet 时序不稳 | motion-compensated SDF/probability matte |
+| raw parser 稳，component 后跳 | bbox/component filter | 固定主组件先验、tracker/光流、禁用陈旧 bbox |
+| mask/alpha 稳，final 看起来仍缩 | 颜色/边缘对比度 | 固定 alpha 对照，修 LAB/边缘亮度 |
+| 所有几何稳定，宽度只随 yaw 平滑变化 | 合理三维投影 | 不修；仅按客户偏好减小 yaw gain |
+| pulse 与 detector fallback 同帧 | B 跟踪闭环 | 去逐帧重检测，改连续 tracker + 离线插值 |
+| pulse 与低 sharpness 同帧 | 模糊帧污染 | 置信度加权、邻帧插值 |
+
+### 35.7 建议的最小隔离实验，不再一次生成四个完整业务版本
+
+先取同一个 10 秒，只生成以下诊断片：
+
+1. **D0：animated_head 原始输出**，放大头部，不进入 composite；
+2. **D1：alpha-only**，纯白头/黑背景；
+3. **D2：RGB + hard alpha core**，关闭 feather 和颜色匹配，仅用于定位；
+4. **D3：lip-only + stitching on**；
+5. **D4：lip-only + stitching off**；
+6. **D5：R2 animated_head 不变，只把 B `head_ema 0.5→0` 重做 composite**。
+
+优先级：先做 D0/D1/D5。它们分别回答“LP 已经缩了吗”“轮廓缩了吗”“EMA 是不是
+根因”，成本最低、信息量最大。只有确认 LP 内部有问题，才做 D3/D4。
+
+### 35.8 针对各层的正式修复候选
+
+#### 35.8.1 跟踪层
+
+- B 首帧检测后用 106 点 tracker/光流，不逐帧从零检测；
+- tracker 点组选眉、眼角、鼻梁，排除嘴；
+- 失败帧前后离线插值，不 hold-last；
+- 使用 detector score、光流 forward-backward error 做置信度；
+- Q 来自稳定 tracker 或 LivePortrait 已知几何，不由失败率 50% 的检测闭环决定。
+
+#### 35.8.2 LivePortrait 对齐/生成层
+
+- 新增 `rotation_lip`，默认只传 lip，眨眼另设开关；
+- t/scale 继续固定；
+- 对 stitching 前后隐式点做 centered RMS 分解；
+- stitching 只允许局部 residual，不允许全局 scale 呼吸；
+- pose 继续采用 R2，但在排除 pulse 后再决定 gain 1.0 或 0.75。
+
+#### 35.8.3 Matte/融合层
+
+- 删除当前 binary recursive EMA；
+- 对 motion-warp 后的概率 alpha/SDF 做有限窗口零相位滤波；
+- 设 stable core + dynamic narrow boundary；
+- 每帧 alpha 面积和 contour radius 限速，超限使用预测轮廓；
+- 下颌连接点/skin bridge 保持现有全 0 audit，不因稳 mask 而重开白缝。
+
+#### 35.8.4 感知层
+
+- 单独约束边缘 LAB contrast 和下颌亮度；
+- 禁止用加宽 Gaussian blur 掩盖呼吸；
+- 任何颜色修复不得移动 alpha support。
+
+### 35.9 下一轮验收标准
+
+#### 自动门槛
+
+1. external scale range = 0；
+2. LP used t/scale range = 0；
+3. B 跟踪 fallback `<=2%`，连续 fallback `<=3帧`；
+4. 稳定 68 点尺度去低频后的 high-pass RMS：相对脸宽 `<=0.35%`；
+5. alpha@0.5 面积去低频后的 high-pass RMS `<=0.8%`；
+6. 左/右/顶部 contour radius 单帧变化 p95 `<=1.5px`；
+7. 任何 pulse 尖峰不得和 detector 恢复帧形成明显同帧峰值；
+8. mouth_corr `>=0.98`；
+9. R2 路线 roll_corr `>=0.93`、lag_roll `<=1`；
+10. `audit_wall_intrusion/junction_residual/jaw_neck_gap` 继续全 0；
+11. card PSNR 不得低于 R0 基线 33.7dB。
+
+这些数值是第一轮工程门槛，仍需结合实际曲线和分辨率复核，不能替代人工看片。
+
+#### 人工门槛
+
+- 正常速度下不再感觉头随念字“一缩一缩”；
+- 0.5× 下头发外轮廓、耳朵、脸颊和下颌不周期涨缩；
+- 合理 yaw 可造成远侧脸颊收窄，但不能在姿态不变时呼吸；
+- 脖子仍位于头部中心，首尾无累计漂移；
+- 嘴、脸、白缝和证件质量不得倒退。
+
+### 35.10 当前技术判断与执行顺序
+
+当前优先级判断：
+
+```text
+P0 先量化 animated_head 与 alpha：确定缩最早出现在哪层
+P1 修复 B 检测 fallback 30%~50% 和 binary mask EMA
+P2 对比 lip-only vs full-exp，判断是否需要 rotation_lip
+P3 对比 stitching on/off，并分解 stitching 的 global scale
+P4 只有前三项排除后才调 pose gain/颜色/feather
+```
+
+最可能是**两个问题叠加**，不是三选一：
+
+1. LivePortrait full exp/stitching 让脸部内部二维几何随发音轻微变化；
+2. B 侧高失败率检测 + binary mask EMA/component filter 让外轮廓/alpha 不稳定。
+
+外部 bbox scale 在当前 R1/R2/R3 已经固定，不应再作为第一修改目标。下一轮应先加
+分层遥测和 D0/D1/D5 隔离片，拿到“缩发生在哪一层”的证据后再改生产算法。
+
+---
+
+## 36. 头部“一缩一缩”分层诊断实现与结论（2026-09-01）
+
+本节记录按照 §35 重新编写诊断代码、生成隔离片和执行自动验证后的结果。结论不是只凭
+肉眼猜测，而是按 `LivePortrait -> B 跟踪 -> parser/mask -> alpha -> final` 逐层测量。
+
+### 36.1 本轮代码改动
+
+1. `src/headswap/composite_head.py`
+   - Pass1 记录 B 检测成功、score、候选数、原始 bbox 与眼距；
+   - 新增 `resolve_face_track(..., mode="interpolate")`，失败帧用前后有效帧离线插值，
+     不再默认无限 `hold-last`；
+   - 逐帧输出 external transform、parser/component/morph/EMA/trim mask 几何；
+   - 分别统计 alpha 阈值 0.05、0.5、0.95 的面积、bbox 和相对支点半径；
+   - 输出 `<composite>.scale_telemetry.csv`；
+   - 新增 alpha-only 诊断视频。
+2. `src/headswap/segment_head.py`
+   - `PrimaryFaceTracker` 暴露逐帧检测诊断信息；
+   - `HeadSegmenter` 输出 parser raw 到最终 EMA mask 的各阶段几何；
+   - 新增 `mask_geometry()`，并验证旧 binary recursive EMA 的实际行为。
+3. `scripts/liveportrait_runner.py`
+   - 包装 LivePortrait stitching，记录 stitching 前后关键点 centered RMS、bbox、hull area；
+   - 输出 `motion10-poses-stitch.csv`；
+   - 新增 `rotation_lip` 驱动模式。
+4. `src/headswap/motion_control.py`
+   - `rotation_lip` 只保留指定嘴部关键点的 expression 变化；
+   - 其余非嘴 expression 固定到首帧，pose 旋转仍保留。
+5. `scripts/headswap_shrink_diagnostics.py`
+   - 对 animated/final、stitching、mask/alpha 遥测做统一低频/高频分解；
+   - 关键尺度只使用眼睛和鼻子，排除一直运动的嘴；
+   - 生成 JSON、Markdown 报告和曲线图。
+6. `tests/test_headswap_units.py`
+   - 增加 B 轨迹插值、soft alpha 几何、binary EMA 历史并集、
+     `rotation_lip` 非嘴冻结测试。
+
+### 36.2 隔离实验与成片
+
+| 实验 | 驱动/跟踪/mask | 目的 | 输出 |
+|---|---|---|---|
+| D0 | 原 R2 full-exp animated head | 判断 composite 前是否已经缩放 | `previews/d0-animated-head-zoom.mp4` |
+| D1 | full-exp + hold + `head_ema=0.5` | 复现旧 mask 行为 | `output/shrink-d1-ema05.mp4` |
+| D5 | full-exp + hold + `head_ema=0` | 单独移除旧 EMA | `output/shrink-d5-ema0.mp4` |
+| E3 | `rotation_lip` + interpolate + `head_ema=0` | 候选修复 | `output/shrink-e3-rotation-lip.mp4` |
+
+统一审查目录：
+
+```text
+E:\duikouxing\jobs-home\hs-p1-0004-shrink-review
+```
+
+重点对比视频：
+
+```text
+previews\compare-r2-full-exp-vs-e3-rotation-lip.mp4
+previews\compare-r2-full-exp-vs-e3-rotation-lip-slow.mp4
+previews\compare-alpha-ema05-vs-ema0.mp4
+```
+
+自动报告：
+
+```text
+reports\shrink-diagnostic-report.md
+reports\shrink-diagnostic-report.json
+reports\full-exp-vs-rotation-lip.json
+reports\verify-e3-rotation-lip.json
+reports\shrink-layered-curves.png
+```
+
+### 36.3 已排除的根因
+
+#### 36.3.1 外部 bbox/贴回缩放不是根因
+
+`external_scale` 全片 range 为 `0`。当前 R2 已锁定外部 scale，头部周期性收缩不是
+`composite_head.py` 每帧重新计算贴回尺寸造成的。
+
+#### 36.3.2 stitching 的全局缩放不是根因
+
+stitching 前关键点尺度 high-pass RMS 为 `0.15068%`，stitching 后为 `0.15151%`；
+after/before ratio 自身的 high-pass RMS 只有 `0.00409%`。因此 stitching 没有额外制造
+可解释客户观感的全局呼吸式缩放。
+
+### 36.4 确认的问题点
+
+#### 36.4.1 首发问题：full-exp 让非嘴部二维几何随发音变化
+
+在没有进入 composite 的 `animated_head.mp4` 中已经测到：
+
+| 指标 | full-exp high-pass RMS | rotation_lip high-pass RMS | 改善 |
+|---|---:|---:|---:|
+| 双眼距离 | 0.27087% | 0.20845% | 23.04% |
+| 头框宽度 | 0.18255% | 0.11415% | 37.47% |
+| 头框高度 | 0.29812% | 0.15275% | 48.76% |
+
+而且 full-exp 在 stitching **之前**的 bbox 高度 high-pass RMS 已为 `0.26878%`。
+因此缩放信号最早出现在 LivePortrait 的 full expression/生成几何，不是贴回后才出现。
+完整 expression 把发音相关变化传给了脸颊、下颌等非嘴区域，使头看起来像二维平面随字音
+收缩。`rotation_lip` 显著降低多个外观尺度指标，证明这是主要贡献源之一。
+
+注意：稳定眼鼻 RMS 从 `0.30263%` 变为 `0.30784%`，没有同步改善。因此不能把
+full-exp 表述为唯一根因，也不能只凭某一个关键点指标宣布完全修好，仍必须看片复核。
+
+#### 36.4.2 次生问题：B 检测失败后 hold-last，恢复帧会跳
+
+原 full-exp 300 帧只有 144 帧检测成功，156 帧 fallback，失败率 `52%`。这会形成：
+
+```text
+检测失败 -> 长时间冻结旧 Q -> 检测恢复 -> Q 突然跳到新位置/尺度
+```
+
+它不是外部 scale 本身变化，但会让 parser crop、mask 和融合支点出现不连续。E3 改成
+离线前后插值；即使 E3 原始检测成功只有 84/300，216 个失败帧也不再用陈旧值无限保持。
+这说明检测器本身仍需后续升级为连续 tracker，插值只是对当前固定视频的止血方案。
+
+#### 36.4.3 次生问题：`head_ema=0.5` 对二值 mask 形成历史并集
+
+旧实现将 0/255 二值 mask 做 recursive EMA 后再用 `>=127` 阈值化。当 EMA 为 0.5 时，
+仅在上一帧存在的像素会得到 127.5，仍被判为前景，因此旧轮廓不能及时退出，形成单调累积
+的“历史并集”。实测：
+
+- parser raw area：high-pass RMS `0.2762%`，全程 range `2.212%`；
+- EMA mask area：high-pass RMS `0.0970%`，但全程 range `4.137%`，首尾增长 `4.137%`；
+- alpha@0.5：全程 range `4.282%`，首尾增长 `4.249%`。
+
+所以旧 EMA 是确定的算法 bug，会造成慢性轮廓膨胀、残影和边界历史污染。但它实际上降低
+高频抖动，不是客户所见周期性收缩的首发点。简单改为 EMA0 会去掉累积，却会暴露 parser
+原始高频；长期正确方案是对 motion-warp 后的 probability alpha 或 SDF 做有限窗口滤波。
+
+### 36.5 E3 候选修复结果
+
+E3 同时采用：
+
+```text
+rotation_lip + B 离线插值 + head_ema=0
+```
+
+最终遥测：
+
+- external scale range：`0`；
+- resolved eye-distance high-pass RMS：`0.14272%`；
+- parser raw area high-pass RMS：`0.12696%`；
+- alpha@0.5 high-pass RMS：`0.13339%`；
+- alpha@0.5 全程 range：`1.01875%`；
+- 相对旧 D1 的 alpha 全程 range 下降 `76.21%`；
+- 不再出现旧 EMA 的首尾 `+4.25%` 单调增长。
+
+业务回归指标：
+
+- mouth_corr：`0.98`，刚好达到门槛，但没有安全余量；
+- roll_corr：`0.95`；roll_amp：`0.862`；lag_x/lag_roll：`0/0`；
+- card PSNR：`33.7 dB`，未低于原基线；
+- halo DeltaE median：`1.41`；
+- jaw seam DeltaE median：`13.36`，比旧 R2 的 `8.60` 更差，是 E3 当前明确的回归风险；
+- scale_std_ratio：`0.241`，收缩明显减少，但也可能显得偏“硬”，需人工看片判断。
+
+### 36.6 最终根因判定
+
+不是用户最初怀疑的单一 bbox 缩放，而是三层问题叠加：
+
+1. **主要贡献源：** LivePortrait full-exp 将口播 expression 扩散到非嘴部几何，
+   收缩在 stitching/composite 前已经存在；
+2. **不连续放大源：** B 检测大量失败，旧 `hold-last` 在恢复帧制造位置/尺度突跳；
+3. **慢性轮廓污染源：** binary recursive EMA 形成历史并集，造成 mask 单调膨胀和残影。
+
+已明确排除：外部贴回 scale、stitching 额外全局 scale。融合层并不是周期收缩首发点，
+但会通过检测失败和错误 EMA 改变轮廓观感。
+
+### 36.7 是否可以直接覆盖生产 final
+
+暂时不能。E3 是当前最有证据的候选版，但必须先由人工查看正常速度和 0.5 倍速对比，重点看：
+
+1. 念字时头是否还周期缩放；
+2. `rotation_lip` 是否导致脸颊/下颌过硬、像面具；
+3. 嘴部相关性刚好 0.98，是否存在个别字口型不足；
+4. jaw seam 指标退化后，头颈连接处是否重新出现明显接缝；
+5. 头部是否仍围绕脖子自然旋转，而不是被插值成平移。
+
+人工确认 E3 方向后，下一步不是继续扩大 blur，而是：
+
+- 将 B 的离线 detector+interpolation 升级为稳定眼眉鼻 tracker + 光流置信度；
+- 将 EMA0 升级为 motion-compensated probability/SDF 窄边界时序滤波；
+- 保持 `rotation_lip`，按个别字口型结果微调 lip 点集/强度；
+- 单独修 jaw/neck seam，禁止通过重新放宽 alpha 支持区破坏已取得的尺度稳定性。
+
+### 36.8 验证状态
+
+```text
+pytest -q: 106 passed
+git diff --check: 通过（仅有 Windows LF/CRLF 提示，无 whitespace error）
+```
+
+本轮代码与诊断产物已生成，但未在本节记录时自动提交 Git；待人工看片确认 E3 后再决定
+是否作为正式生产方案提交。

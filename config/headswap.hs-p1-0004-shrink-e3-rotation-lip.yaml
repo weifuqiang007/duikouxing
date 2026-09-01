@@ -1,0 +1,106 @@
+# §35 E3：rotation_lip + EMA0 + B检测离线插值候选
+job_id: hs-p1-0004-shrink-e3-rotation-lip
+consent_confirmed: true
+source_video: E:/duikouxing/jobs-home/hs-p1-0004/input/shipin.mp4
+source_portrait: E:/duikouxing/jobs-home/hs-p1-0004/input/portrait.png
+side_portraits:
+- E:/duikouxing/jobs-home/hs-p1-0004/input/side_celian.png
+liveportrait:
+  animation_region: all
+  driving_multiplier: 1.0
+  smooth_variance: 3.0e-07
+  source_max_dim: 1280
+  source_crop_scale: 2.3
+  source_crop_vx: 0.0
+  source_crop_vy: -0.125
+  driving_crop_scale: 2.2
+  driving_crop_vx: 0.0
+  driving_crop_vy: -0.1
+  use_half_precision: true
+  motion_mode: rotation_lip
+  pose_gain_yaw: 1.0
+  pose_gain_pitch: 1.0
+  pose_gain_roll: 1.0
+  pose_limit_yaw_deg: 5.0
+  pose_limit_pitch_deg: 3.0
+  pose_limit_roll_deg: 3.0
+  pose_smooth_window: 7
+  transfer_translation: false
+  transfer_scale: false
+  motion_report_name: motion10-lip-poses
+plate:
+  sample_frames: 50
+  min_samples: 8
+  mask_expand_for_plate: 12
+  inpaint_radius: 5
+color:
+  color_strength: 0.55
+  max_delta_l: 20
+  max_delta_ab: 12
+  color_ema: 0.9
+video:
+  output_crf: 14
+  keep_original_audio: true
+  final_name: shrink-e3-rotation-lip
+  side_by_side_name: side-by-side-shrink-e3-rotation-lip
+  max_seconds: 10.0
+segmentation:
+  roi_ratio: 2.6
+  mask_dilate_px: 8
+  mask_erode_px: 0
+  temporal_ema: 0.0
+  max_fail_ratio: 0.05
+  output_neck_masks: true
+  output_raw_skins: true
+composite:
+  silent_name: composite-shrink-e3-rotation-lip
+  debug_dir_name: debug-shrink-e3-rotation-lip
+  transform_mode: eyes_nose
+  filter_mode: offline
+  hampel_window: 5
+  filter_window: 5
+  scale_mode: const
+  angle_window: 7
+  scale_bias: 1.0
+  x_offset_px: 0.0
+  y_offset_px: 0.0
+  b_mask_erode_px: 1
+  fill_mode: wall_residual
+  ring_width_px: 30
+  wall_delta_e: 10.0
+  fill_outer_feather_px: 0
+  mask_union: motion_safe
+  safe_margin_px: 8
+  a_neck_preserve_enabled: true
+  a_neck_upward_px: 3
+  neck_collar_enabled: false
+  neck_color_strength: 0.0
+  alpha_mode: region_aware
+  head_side_feather_px: 4
+  jaw_feather_px: 8
+  jaw_start_ratio: 0.68
+  jaw_full_ratio: 0.82
+  jaw_color_strength: 0.0
+  jaw_underlay_enabled: true
+  jaw_underlay_px: 10
+  neck_taper_height_px: 16
+  neck_taper_side_px: 2
+  junction_bridge_max_gap_px: 6
+  skin_bridge_enabled: true
+  skin_bridge_max_gap_px: 14
+  skin_bridge_no_cap: true
+  jaw_underlay_band_px: 20
+  wall_max_texture: 10.0
+  jaw_gradient_strength: 0.0
+  neck_pivot_enabled: true
+  neck_pivot_smooth_window: 7
+  neck_pivot_max_gap: 5
+  attachment_offset_x: 0.0
+  attachment_offset_y: 0.0
+  external_rotation_gain: 0.0
+  max_attachment_drift_px: 3.0
+  start_frame: 0
+  max_frames: 300
+  head_ema: 0.0
+  b_track_gap_mode: interpolate
+  alpha_diagnostic_name: alpha-e3-rotation-lip.mp4

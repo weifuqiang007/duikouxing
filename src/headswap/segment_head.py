@@ -56,17 +56,39 @@ class PrimaryFaceTracker:
         )
         self.app.prepare(ctx_id=0, det_size=(det_size, det_size))
         self.prev_box = None
+        self.last_meta = {"detected": False, "score": None, "candidates": 0}
 
     def track(self, frame: np.ndarray):
         faces = self.app.get(frame)
         if not faces:
+            self.last_meta = {"detected": False, "score": None, "candidates": 0}
             return None
         if self.prev_box is None:
             best = max(faces, key=lambda f: float(f.bbox[2] - f.bbox[0]) * float(f.bbox[3] - f.bbox[1]))
         else:
             best = max(faces, key=lambda f: rect_iou(f.bbox, self.prev_box))
         self.prev_box = best.bbox.copy()
+        self.last_meta = {
+            "detected": True,
+            "score": float(getattr(best, "det_score", 0.0)),
+            "candidates": int(len(faces)),
+        }
         return best.bbox, best.kps
+
+
+def mask_geometry(mask: np.ndarray) -> dict[str, float | int]:
+    """二值 mask 的面积与外接框，供时序轮廓遥测。"""
+    support = np.asarray(mask) > 0
+    ys, xs = np.nonzero(support)
+    if len(xs) == 0:
+        return {"area": 0, "bbox_w": 0, "bbox_h": 0, "cx": float("nan"), "cy": float("nan")}
+    return {
+        "area": int(len(xs)),
+        "bbox_w": int(xs.max() - xs.min() + 1),
+        "bbox_h": int(ys.max() - ys.min() + 1),
+        "cx": float(xs.mean()),
+        "cy": float(ys.mean()),
+    }
 
 
 class BiSeNetParser:
@@ -211,6 +233,7 @@ class HeadSegmenter:
         self.erode_px = erode_px
         self.ema = temporal_ema
         self._prev_mask = None
+        self.last_diag: dict[str, float | int] = {}
 
     def segment(self, frame: np.ndarray, box):
         """旧 API：返回 (head, skins)。v4 起委托 segment_parts，行为逐位一致。"""
@@ -305,16 +328,19 @@ class HeadSegmenter:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+        self.last_diag.update({f"morph_{k}": v for k, v in mask_geometry(mask).items()})
         if self.erode_px > 0:
             ke = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (self.erode_px * 2 + 1, self.erode_px * 2 + 1)
             )
             mask = cv2.erode(mask, ke)
+        self.last_diag.update({f"erode_{k}": v for k, v in mask_geometry(mask).items()})
         if self.dilate_px > 0:
             kd = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (self.dilate_px * 2 + 1, self.dilate_px * 2 + 1)
             )
             mask = cv2.dilate(mask, kd)
+        self.last_diag.update({f"post_{k}": v for k, v in mask_geometry(mask).items()})
         return mask
 
     def segment_full_parts(self, frame: np.ndarray, box):
@@ -328,7 +354,9 @@ class HeadSegmenter:
         labels = self.parser.parse(frame)
 
         head = np.isin(labels, HEAD_CLASSES).astype(np.uint8) * 255
+        self.last_diag = {f"parser_raw_{k}": v for k, v in mask_geometry(head).items()}
         head = filter_components(head, box)
+        self.last_diag.update({f"component_{k}": v for k, v in mask_geometry(head).items()})
         head = self._postprocess_mask(head)
         if self._prev_mask is not None and self.ema > 0:
             blended = (
@@ -337,6 +365,8 @@ class HeadSegmenter:
             )
             head = (blended >= 127).astype(np.uint8) * 255
         self._prev_mask = head.copy()
+        self.last_diag.update({f"ema_{k}": v for k, v in mask_geometry(head).items()})
+        self.last_diag["ema_weight"] = float(self.ema)
 
         neck = (labels == NECK_CLASS).astype(np.uint8) * 255
         neck = filter_neck_near_primary_face(neck, box)

@@ -38,7 +38,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from segment_head import BiSeNetParser, HeadSegmenter, PrimaryFaceTracker  # noqa: E402
+from segment_head import BiSeNetParser, HeadSegmenter, PrimaryFaceTracker, mask_geometry  # noqa: E402
 from color_transfer import ColorMatcher, lab_stats  # noqa: E402
 
 
@@ -321,6 +321,89 @@ def resolve_point_track(
                 out[j] = np.asarray(fallbacks[j], dtype=np.float64)
                 sources[j] = "face_fallback"
     return np.asarray(out, dtype=np.float64), sources
+
+
+def resolve_face_track(
+    cache: list[dict | None], mode: str = "hold"
+) -> tuple[list[dict | None], list[str]]:
+    """离线补全 B 人脸轨迹。
+
+    ``hold`` 精确保留历史行为；``interpolate`` 对检测缺口的 bbox/kps 做前后线性
+    插值，首尾无双侧锚点时才使用最近可靠帧。后者避免恢复检测时的阶梯跳变。
+    """
+    if mode not in {"hold", "interpolate"}:
+        raise ValueError(f"未知 B track gap mode: {mode}")
+    n = len(cache)
+    if n == 0:
+        return [], []
+    if mode == "hold":
+        resolved: list[dict | None] = [None] * n
+        source = ["detected" if item is not None else "hold" for item in cache]
+        last = None
+        for i in range(n):
+            if cache[i] is not None:
+                last = cache[i]
+            resolved[i] = last
+        nxt = None
+        for i in range(n - 1, -1, -1):
+            if cache[i] is not None:
+                nxt = cache[i]
+            elif resolved[i] is None:
+                resolved[i] = nxt
+                source[i] = "edge_nearest"
+        return resolved, source
+
+    good = [i for i, item in enumerate(cache) if item is not None]
+    if not good:
+        return [None] * n, ["missing"] * n
+    resolved = [None if item is None else dict(item) for item in cache]
+    source = ["detected" if item is not None else "interpolated" for item in cache]
+    for i in range(n):
+        if resolved[i] is not None:
+            continue
+        left = max((j for j in good if j < i), default=None)
+        right = min((j for j in good if j > i), default=None)
+        if left is None or right is None:
+            nearest = right if left is None else left
+            resolved[i] = dict(cache[nearest])
+            source[i] = "edge_nearest"
+            continue
+        t = (i - left) / (right - left)
+        box0, box1 = np.asarray(cache[left]["bbox"]), np.asarray(cache[right]["bbox"])
+        kp0, kp1 = np.asarray(cache[left]["kps"]), np.asarray(cache[right]["kps"])
+        resolved[i] = {
+            "bbox": ((1.0 - t) * box0 + t * box1).tolist(),
+            "kps": ((1.0 - t) * kp0 + t * kp1).tolist(),
+            "score": None,
+        }
+    return resolved, source
+
+
+def soft_mask_geometry(
+    alpha: np.ndarray,
+    threshold: float,
+    pivot: np.ndarray | None = None,
+) -> dict[str, float | int]:
+    """浮点 alpha 在指定阈值的面积、框和相对支点四向半径。"""
+    support = np.asarray(alpha, dtype=np.float32) >= float(threshold)
+    ys, xs = np.nonzero(support)
+    prefix = f"alpha_{str(threshold).replace('.', 'p')}"
+    if len(xs) == 0:
+        return {
+            f"{prefix}_area": 0, f"{prefix}_bbox_w": 0, f"{prefix}_bbox_h": 0,
+            f"{prefix}_left_r": float("nan"), f"{prefix}_right_r": float("nan"),
+            f"{prefix}_top_r": float("nan"), f"{prefix}_bottom_r": float("nan"),
+        }
+    p = np.asarray(pivot if pivot is not None else [xs.mean(), ys.mean()], dtype=np.float64)
+    return {
+        f"{prefix}_area": int(len(xs)),
+        f"{prefix}_bbox_w": int(xs.max() - xs.min() + 1),
+        f"{prefix}_bbox_h": int(ys.max() - ys.min() + 1),
+        f"{prefix}_left_r": float(p[0] - xs.min()),
+        f"{prefix}_right_r": float(xs.max() - p[0]),
+        f"{prefix}_top_r": float(p[1] - ys.min()),
+        f"{prefix}_bottom_r": float(ys.max() - p[1]),
+    }
 
 
 def build_neck_pivot_transforms(
@@ -1850,7 +1933,8 @@ def run_composite(args) -> int:
 
     # ---------- 遍数一：逐帧 B 检测（供离线滤波与缓存，避免二次检测） ----------
     print("pass 1: B landmark scan", flush=True)
-    head_cache: list[dict | None] = []  # {"bbox", "kps"}，失败帧 None
+    head_cache: list[dict | None] = []  # {"bbox", "kps", "score"}，失败帧 None
+    detector_rows: list[dict] = []
     index = 0
     while True:
         ok, frame_b = head_cap.read()
@@ -1858,27 +1942,22 @@ def run_composite(args) -> int:
             break
         t = tracker.track(frame_b)
         head_cache.append(
-            {"bbox": [float(v) for v in t[0]], "kps": [[float(x), float(y)] for x, y in t[1]]}
+            {
+                "bbox": [float(v) for v in t[0]],
+                "kps": [[float(x), float(y)] for x, y in t[1]],
+                "score": tracker.last_meta.get("score"),
+            }
             if t is not None else None
         )
+        detector_rows.append(dict(tracker.last_meta))
         index += 1
     head_frames = index
     head_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     n_frames = min(total, head_frames)
 
-    # 检测失败帧沿用前后最近的成功帧
-    resolved: list[dict | None] = [None] * n_frames
-    last = None
-    for i in range(n_frames):
-        if head_cache[i] is not None:
-            last = head_cache[i]
-        resolved[i] = last
-    nxt = None
-    for i in range(n_frames - 1, -1, -1):
-        if head_cache[i] is not None:
-            nxt = head_cache[i]
-        elif resolved[i] is None:
-            resolved[i] = nxt
+    resolved, resolved_sources = resolve_face_track(
+        head_cache[:n_frames], mode=str(args.b_track_gap_mode)
+    )
     b_fallback = sum(1 for i in range(n_frames) if head_cache[i] is None)
 
     # ---------- raw 变换轨迹 ----------
@@ -1972,6 +2051,8 @@ def run_composite(args) -> int:
         "raw": raw_params,
         "filtered": filt_params,
         "pivot": pivot_log,
+        "b_track_gap_mode": str(args.b_track_gap_mode),
+        "b_track_sources": resolved_sources,
     }
 
     # ---------- 遍数二：合成 ----------
@@ -1984,6 +2065,14 @@ def run_composite(args) -> int:
         ffmpeg_params=["-crf", str(args.crf), "-preset", "fast",
                        "-pix_fmt", "yuv420p", "-threads", "1"],
     )
+    alpha_writer = None
+    if args.alpha_diagnostic_output is not None:
+        args.alpha_diagnostic_output.parent.mkdir(parents=True, exist_ok=True)
+        alpha_writer = imageio.get_writer(
+            str(args.alpha_diagnostic_output), fps=fps, codec="libx264", quality=None,
+            bitrate=None, macro_block_size=None,
+            ffmpeg_params=["-crf", "10", "-preset", "fast", "-pix_fmt", "yuv420p", "-threads", "1"],
+        )
     if args.debug_dir:
         args.debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2073,6 +2162,7 @@ def run_composite(args) -> int:
     wall_state: WallModelState | None = None
     global_wall_state: WallModelState | None = None
     wall_rows: list[dict] = []
+    scale_telemetry_rows: list[dict] = []
 
     # 帧范围调试（§22.5.5）：pass1 始终全片扫描（离线滤波需要完整轨迹），
     # pass2 只合成 [start, start+max) —— 一个 bug 不该陪上 8 分钟全片
@@ -2121,6 +2211,30 @@ def run_composite(args) -> int:
             mask_b = np.zeros(frame_b.shape[:2], np.uint8)
             neck_b = None
 
+        raw_det = head_cache[index] if index < len(head_cache) else None
+        det_meta = detector_rows[index] if index < len(detector_rows) else {}
+        resolved_kps = np.asarray(src["kps"], dtype=np.float64) if src is not None else None
+        resolved_box = np.asarray(src["bbox"], dtype=np.float64) if src is not None else None
+        telemetry_row = {
+            "frame": int(index),
+            "detected": int(raw_det is not None),
+            "detector_score": det_meta.get("score"),
+            "detector_candidates": int(det_meta.get("candidates", 0)),
+            "track_source": resolved_sources[index],
+            "resolved_bbox_w": float(resolved_box[2] - resolved_box[0]) if resolved_box is not None else float("nan"),
+            "resolved_bbox_h": float(resolved_box[3] - resolved_box[1]) if resolved_box is not None else float("nan"),
+            "resolved_eye_distance": (
+                float(np.linalg.norm(resolved_kps[1] - resolved_kps[0]))
+                if resolved_kps is not None else float("nan")
+            ),
+            "external_scale": float(filt_params[index][0]),
+            "external_angle": float(filt_params[index][1]),
+            "external_tx": float(filt_params[index][2]),
+            "external_ty": float(filt_params[index][3]),
+            "head_ema": float(args.head_ema),
+        }
+        telemetry_row.update(dict(b_segmenter.last_diag))
+
         bx0, by0, bx1, by1 = [float(v) for v in box_a]
         bw_a, bh_a = bx1 - bx0, by1 - by0
 
@@ -2150,6 +2264,7 @@ def run_composite(args) -> int:
             # ---- v2/F 路径：预乘 warp + 内距羽化（Round F 起 B 硬 matte 内缩
             #      1~2px 去白色 matte，§20.5.2/§22.6；erode=0 时与 v2 逐位一致）----
             head_trim = trim_hard_matte(mask_b, args.b_mask_erode_px)
+            telemetry_row.update({f"trim_{k}": v for k, v in mask_geometry(head_trim).items()})
             alpha_src = head_trim.astype(np.float32) / 255.0
             head_rgb, warped_alpha = warp_premultiplied(frame_b, alpha_src, m_final, (width, height))
             if args.alpha_mode == "region_aware":
@@ -2183,6 +2298,18 @@ def run_composite(args) -> int:
             # 下颌软切割（以 A 人脸框为基准；collar 启用时由 collar 纵向 ramp 取代）
             cut_y = by0 + args.neck_cut_ratio * bh_a
             alpha_f = alpha_f * soft_cut(height, cut_y, args.neck_cut_soft)
+
+        pivot_for_alpha = (
+            np.asarray(pivot_log["p_neck_used"][index], dtype=np.float64)
+            if pivot_log is not None
+            else np.array([0.5 * (bx0 + bx1), by1], dtype=np.float64)
+        )
+        for alpha_threshold in (0.05, 0.5, 0.95):
+            telemetry_row.update(soft_mask_geometry(alpha_f, alpha_threshold, pivot_for_alpha))
+        scale_telemetry_rows.append(telemetry_row)
+        if alpha_writer is not None:
+            alpha8 = np.clip(alpha_f * 255.0, 0, 255).astype(np.uint8)
+            alpha_writer.append_data(cv2.cvtColor(alpha8, cv2.COLOR_GRAY2RGB))
 
         # 旧头安全清理区（运动补偿并集）
         if args.mask_union == "motion_safe":
@@ -2702,6 +2829,8 @@ def run_composite(args) -> int:
             print(f"composited frame {index}", flush=True)
 
     writer.close()
+    if alpha_writer is not None:
+        alpha_writer.close()
     base_cap.release()
     head_cap.release()
     diag["alpha_transition_width_px"] = round(widths_sum / max(diag["frames"], 1), 2)
@@ -2775,6 +2904,14 @@ def run_composite(args) -> int:
                 )
     args.output.with_suffix(".diag.json").write_text(
         json.dumps(diag, ensure_ascii=False), encoding="utf-8")
+    if scale_telemetry_rows:
+        telemetry_path = args.output.with_suffix(".scale_telemetry.csv")
+        with telemetry_path.open("w", newline="", encoding="utf-8-sig") as fp:
+            telemetry_writer = csv.DictWriter(
+                fp, fieldnames=list(scale_telemetry_rows[0].keys()), extrasaction="ignore"
+            )
+            telemetry_writer.writeheader()
+            telemetry_writer.writerows(scale_telemetry_rows)
     print(f"OK: composited {diag['frames']} frames -> {args.output}")
     print(json.dumps(diag, ensure_ascii=False))
     return 0
@@ -2794,6 +2931,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--det-size", type=int, default=640)
     ap.add_argument("--head-roi-ratio", type=float, default=2.4)
     ap.add_argument("--head-ema", type=float, default=0.5)
+    ap.add_argument(
+        "--b-track-gap-mode", choices=["hold", "interpolate"], default="hold",
+        help="B 检测缺口：hold=历史行为；interpolate=前后可靠帧离线插值",
+    )
     # 变换与滤波（§17.5 / §28.7 / §28.10）
     ap.add_argument("--transform-mode", choices=["eyes", "eyes_nose", "five_point"], default="eyes",
                     help="eyes=v4/v5；eyes_nose=§28.7 K1/K2（嘴点完全不进）；five_point=旧版对照")
@@ -2915,6 +3056,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--crf", type=int, default=14)
     ap.add_argument("--debug-dir", type=Path, default=None)
     ap.add_argument("--debug-every", type=int, default=50)
+    ap.add_argument(
+        "--alpha-diagnostic-output", type=Path, default=None,
+        help="可选：输出 full-frame alpha-only 黑白诊断视频",
+    )
     return ap
 
 

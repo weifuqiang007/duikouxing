@@ -105,7 +105,11 @@ def scale_relative_rotations(
     return out.astype(np.float32), diagnostics
 
 
-def control_motion_template(template: dict, control: RotationControl) -> tuple[dict, list[dict]]:
+def control_motion_template(
+    template: dict,
+    control: RotationControl,
+    expression_indices: tuple[int, ...] | None = None,
+) -> tuple[dict, list[dict]]:
     """原位改写 LivePortrait driving template 为 rotation_exp 运动职责。
 
     表达 ``exp`` 和关键点保持官方结果；R 使用受控相对旋转；所有帧 t/scale 复制
@@ -122,6 +126,7 @@ def control_motion_template(template: dict, control: RotationControl) -> tuple[d
     controlled, rot_diag = scale_relative_rotations(rotations, control)
     t0 = np.asarray(motion[0]["t"], dtype=np.float32).copy()
     scale0 = np.asarray(motion[0]["scale"], dtype=np.float32).copy()
+    exp0 = np.asarray(motion[0]["exp"], dtype=np.float32).copy()
     rows: list[dict] = []
     for i, item in enumerate(motion):
         t_raw = np.asarray(item["t"], dtype=np.float32).reshape(-1)
@@ -129,6 +134,12 @@ def control_motion_template(template: dict, control: RotationControl) -> tuple[d
         item["R"] = controlled[i].reshape(np.asarray(item["R"]).shape)
         item["t"] = t0.copy()
         item["scale"] = scale0.copy()
+        if expression_indices is not None:
+            exp_raw = np.asarray(item["exp"], dtype=np.float32)
+            exp_used = exp0.copy()
+            valid = [idx for idx in expression_indices if 0 <= idx < exp_raw.shape[-2]]
+            exp_used[..., valid, :] = exp_raw[..., valid, :]
+            item["exp"] = exp_used
         rows.append(
             {
                 "frame": i,
@@ -144,6 +155,7 @@ def control_motion_template(template: dict, control: RotationControl) -> tuple[d
                 "used_ty": float(t0.reshape(-1)[1]),
                 "raw_scale": float(scale_raw[0]),
                 "used_scale": float(scale0.reshape(-1)[0]),
+                "expression_mode": "full" if expression_indices is None else "indices:" + ",".join(map(str, expression_indices)),
             }
         )
     return template, rows

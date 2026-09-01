@@ -12,6 +12,7 @@ import runpy
 import sys
 import csv
 import json
+import atexit
 from pathlib import Path
 
 
@@ -64,11 +65,12 @@ def _pop_custom_options(argv: list[str]) -> tuple[list[str], dict[str, str]]:
 
 def _install_rotation_exp_patch(options: dict[str, str], project_root: Path) -> None:
     mode = options.get("headswap_motion_mode", "all")
-    if mode != "rotation_exp":
+    if mode not in {"rotation_exp", "rotation_lip"}:
         return
     sys.path.insert(0, str(project_root / "src"))
     from headswap.motion_control import RotationControl, control_motion_template
     from src.live_portrait_pipeline import LivePortraitPipeline
+    from src.live_portrait_wrapper import LivePortraitWrapper
 
     control = RotationControl(
         pitch_gain=float(options.get("headswap_pose_gain_pitch", "0.65")),
@@ -85,12 +87,15 @@ def _install_rotation_exp_patch(options: dict[str, str], project_root: Path) -> 
 
     def patched(self, I_lst, c_eyes_lst, c_lip_lst, **kwargs):
         template = original(self, I_lst, c_eyes_lst, c_lip_lst, **kwargs)
-        template, rows = control_motion_template(template, control)
+        expression_indices = (6, 12, 14, 17, 19, 20) if mode == "rotation_lip" else None
+        template, rows = control_motion_template(
+            template, control, expression_indices=expression_indices
+        )
         report.parent.mkdir(parents=True, exist_ok=True)
         report.with_suffix(".json").write_text(
             json.dumps(
                 {
-                    "mode": "rotation_exp",
+                    "mode": mode,
                     "control": control.__dict__,
                     "frames": len(rows),
                     "rows": rows,
@@ -107,6 +112,47 @@ def _install_rotation_exp_patch(options: dict[str, str], project_root: Path) -> 
         return template
 
     LivePortraitPipeline.make_motion_template = patched
+
+    stitch_rows: list[dict] = []
+    original_stitching = LivePortraitWrapper.stitching
+
+    def kp_metrics(tensor, prefix: str) -> dict:
+        import cv2
+        import numpy as np
+
+        arr = tensor.detach().float().cpu().numpy().reshape(-1, 3)
+        xy = arr[:, :2]
+        centered = xy - xy.mean(axis=0, keepdims=True)
+        rms = float(np.sqrt(np.mean(np.sum(centered * centered, axis=1))))
+        hull = cv2.convexHull(xy.astype(np.float32))
+        return {
+            f"{prefix}_rms_xy": rms,
+            f"{prefix}_bbox_w": float(np.ptp(xy[:, 0])),
+            f"{prefix}_bbox_h": float(np.ptp(xy[:, 1])),
+            f"{prefix}_hull_area": float(cv2.contourArea(hull)),
+            f"{prefix}_cx": float(xy[:, 0].mean()),
+            f"{prefix}_cy": float(xy[:, 1].mean()),
+        }
+
+    def stitching_with_telemetry(self, kp_source, kp_driving):
+        before = kp_metrics(kp_driving, "before")
+        out = original_stitching(self, kp_source, kp_driving)
+        after = kp_metrics(out, "after")
+        stitch_rows.append({"frame": len(stitch_rows), **before, **after})
+        return out
+
+    LivePortraitWrapper.stitching = stitching_with_telemetry
+
+    def flush_stitch_report() -> None:
+        if not stitch_rows:
+            return
+        path = report.parent / f"{report.name}-stitch.csv"
+        with path.open("w", newline="", encoding="utf-8-sig") as fp:
+            writer = csv.DictWriter(fp, fieldnames=list(stitch_rows[0]))
+            writer.writeheader()
+            writer.writerows(stitch_rows)
+
+    atexit.register(flush_stitch_report)
 
 
 def main() -> None:

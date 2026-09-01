@@ -105,9 +105,11 @@ from headswap.composite_head import (
     inner_feather_alpha,
     motion_safe_union,
     offline_filter,
+    resolve_face_track,
     resolve_point_track,
     rigid_from_eyes,
     smooth_point_track,
+    soft_mask_geometry,
     transform_point,
     warp_premultiplied,
 )
@@ -1436,6 +1438,27 @@ def test_control_motion_template_freezes_translation_and_scale_but_keeps_exp():
     assert rows[2]["used_scale"] == 1.0
 
 
+def test_rotation_lip_template_freezes_non_lip_expression_indices():
+    template = {"motion": []}
+    for i in range(2):
+        template["motion"].append(
+            {
+                "R": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+                "t": np.zeros((1, 3), np.float32),
+                "scale": np.ones((1, 1), np.float32),
+                "exp": np.full((1, 21, 3), float(i), np.float32),
+            }
+        )
+    controlled, rows = control_motion_template(
+        template, RotationControl(smooth_window=1), expression_indices=(6, 12, 14, 17, 19, 20)
+    )
+    exp = controlled["motion"][1]["exp"]
+    for idx in range(21):
+        expected = 1.0 if idx in {6, 12, 14, 17, 19, 20} else 0.0
+        npt.assert_allclose(exp[:, idx, :], expected)
+    assert rows[1]["expression_mode"].startswith("indices:")
+
+
 def test_head_attachment_does_not_use_mouth_points():
     kps = np.array([[40, 40], [60, 40], [50, 55], [42, 70], [58, 70]], np.float32)
     box = np.array([30, 25, 70, 85], np.float32)
@@ -1492,3 +1515,60 @@ def test_neck_pivot_transforms_lock_attachment_without_accumulated_drift():
     for i in range(n):
         mapped = transform_point(log["q_attach_used"][i], rebuild(*params[i]))
         npt.assert_allclose(mapped, log["p_neck_used"][i], atol=1e-9)
+
+
+# ---------------- 第九轮：头部“呼吸”分层遥测（docs §35） ----------------
+
+def _face_item(x):
+    return {
+        "bbox": [x, 10.0, x + 20.0, 40.0],
+        "kps": [[x + 5, 20], [x + 15, 20], [x + 10, 27], [x + 7, 33], [x + 13, 33]],
+        "score": 0.9,
+    }
+
+
+def test_resolve_face_track_interpolates_instead_of_hold_jump():
+    cache = [_face_item(0.0), None, None, _face_item(6.0)]
+    interp, source = resolve_face_track(cache, mode="interpolate")
+    assert source == ["detected", "interpolated", "interpolated", "detected"]
+    assert interp[1]["bbox"][0] == pytest.approx(2.0)
+    assert interp[2]["bbox"][0] == pytest.approx(4.0)
+    hold, hold_source = resolve_face_track(cache, mode="hold")
+    assert hold[1]["bbox"][0] == 0.0 and hold[2]["bbox"][0] == 0.0
+    assert hold_source[1:3] == ["hold", "hold"]
+
+
+def test_soft_mask_geometry_reports_area_bbox_and_pivot_radii():
+    alpha = np.zeros((20, 30), np.float32)
+    alpha[5:15, 8:18] = 0.8
+    got = soft_mask_geometry(alpha, 0.5, np.array([13.0, 15.0]))
+    assert got["alpha_0p5_area"] == 100
+    assert got["alpha_0p5_bbox_w"] == 10
+    assert got["alpha_0p5_bbox_h"] == 10
+    assert got["alpha_0p5_left_r"] == 5.0
+    assert got["alpha_0p5_right_r"] == 4.0
+
+
+def test_binary_ema_half_behaves_like_persistent_union_and_diag_exposes_it():
+    # 0.5*255 = 127.5 >= 127：只在上一帧存在的像素不会消失，会被递归写回。
+    labels1 = np.zeros((80, 80), np.uint8)
+    labels1[20:40, 20:35] = 1
+    parser = _StubParser(labels1)
+    seg = HeadSegmenter(parser, dilate_px=0, erode_px=0, temporal_ema=0.5)
+    frame = np.zeros((80, 80, 3), np.uint8)
+    box = np.array([15, 15, 55, 55], np.float32)
+    first, _, _ = seg.segment_full_parts(frame, box)
+    assert first[25, 25] == 255
+
+    labels2 = np.zeros_like(labels1)
+    labels2[20:40, 40:55] = 1
+    parser.labels = labels2
+    second, _, _ = seg.segment_full_parts(frame, box)
+    assert second[25, 25] == 255      # 历史左块仍在
+    assert second[25, 45] == 255      # 当前右块也进入
+
+    parser.labels = np.zeros_like(labels1)
+    third, _, _ = seg.segment_full_parts(frame, box)
+    assert third[25, 25] == 255 and third[25, 45] == 255
+    assert seg.last_diag["parser_raw_area"] == 0
+    assert seg.last_diag["ema_area"] >= int((third > 0).sum())
