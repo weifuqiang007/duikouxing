@@ -57,9 +57,11 @@ def load_headswap_job(path: Path) -> dict:
         raise HeadswapError("未确认人物肖像授权，任务拒绝运行")
     lp = data.setdefault("liveportrait", {})
     motion_mode = str(lp.get("motion_mode", lp.get("animation_region", "all")))
-    if motion_mode not in {"all", "exp", "rotation_exp", "rotation_lip"}:
-        raise HeadswapError("liveportrait.motion_mode 只能是 all、exp、rotation_exp 或 rotation_lip")
-    if motion_mode in {"rotation_exp", "rotation_lip"}:
+    if motion_mode not in {"all", "exp", "rotation_exp", "rotation_lip", "rotation_lip_eye"}:
+        raise HeadswapError(
+            "liveportrait.motion_mode 只能是 all、exp、rotation_exp、rotation_lip 或 rotation_lip_eye"
+        )
+    if motion_mode in {"rotation_exp", "rotation_lip", "rotation_lip_eye"}:
         if bool(lp.get("transfer_translation", False)):
             raise HeadswapError("rotation_exp 禁止 transfer_translation=true")
         if bool(lp.get("transfer_scale", False)):

@@ -1459,6 +1459,29 @@ def test_rotation_lip_template_freezes_non_lip_expression_indices():
     assert rows[1]["expression_mode"].startswith("indices:")
 
 
+def test_rotation_lip_eye_keeps_only_official_eye_and_lip_indices():
+    template = {"motion": []}
+    for i in range(2):
+        template["motion"].append(
+            {
+                "R": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+                "t": np.zeros((1, 3), np.float32),
+                "scale": np.ones((1, 1), np.float32),
+                "exp": np.full((1, 21, 3), float(i), np.float32),
+            }
+        )
+    lip = {6, 12, 14, 17, 19, 20}
+    eyes = {11, 13, 15, 16, 18}
+    kept = lip | eyes
+    controlled, rows = control_motion_template(
+        template, RotationControl(smooth_window=1), expression_indices=tuple(sorted(kept))
+    )
+    exp = controlled["motion"][1]["exp"]
+    for idx in range(21):
+        npt.assert_allclose(exp[:, idx, :], 1.0 if idx in kept else 0.0)
+    assert rows[1]["expression_mode"] == "indices:" + ",".join(map(str, sorted(kept)))
+
+
 def test_head_attachment_does_not_use_mouth_points():
     kps = np.array([[40, 40], [60, 40], [50, 55], [42, 70], [58, 70]], np.float32)
     box = np.array([30, 25, 70, 85], np.float32)

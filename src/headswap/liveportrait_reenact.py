@@ -52,9 +52,10 @@ def run_reenact(
         raise RuntimeError(f"缺少 LivePortrait 启动包装脚本: {runner}")
 
     motion_mode = str(settings.get("motion_mode", settings.get("animation_region", "all")))
-    if motion_mode not in {"all", "exp", "rotation_exp", "rotation_lip"}:
+    controlled_modes = {"rotation_exp", "rotation_lip", "rotation_lip_eye"}
+    if motion_mode not in {"all", "exp", *controlled_modes}:
         raise ValueError(f"不支持的 LivePortrait motion_mode: {motion_mode}")
-    official_region = "all" if motion_mode in {"rotation_exp", "rotation_lip"} else str(
+    official_region = "all" if motion_mode in controlled_modes else str(
         settings.get("animation_region", motion_mode)
     )
     command = conda_run(
@@ -70,7 +71,7 @@ def run_reenact(
             "--driving_option", str(
                 settings.get(
                     "driving_option",
-                    "pose-friendly" if motion_mode in {"rotation_exp", "rotation_lip"} else "expression-friendly",
+                    "pose-friendly" if motion_mode in controlled_modes else "expression-friendly",
                 )
             ),
             "--driving_multiplier", str(float(settings.get("driving_multiplier", 1.0))),
@@ -86,7 +87,7 @@ def run_reenact(
             "--audio_priority", "source",
         ],
     )
-    if motion_mode in {"rotation_exp", "rotation_lip"}:
+    if motion_mode in controlled_modes:
         report = work_dir / str(settings.get("motion_report_name", "motion10-poses"))
         command.extend(
             [

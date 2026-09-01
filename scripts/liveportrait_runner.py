@@ -65,7 +65,7 @@ def _pop_custom_options(argv: list[str]) -> tuple[list[str], dict[str, str]]:
 
 def _install_rotation_exp_patch(options: dict[str, str], project_root: Path) -> None:
     mode = options.get("headswap_motion_mode", "all")
-    if mode not in {"rotation_exp", "rotation_lip"}:
+    if mode not in {"rotation_exp", "rotation_lip", "rotation_lip_eye"}:
         return
     sys.path.insert(0, str(project_root / "src"))
     from headswap.motion_control import RotationControl, control_motion_template
@@ -87,7 +87,15 @@ def _install_rotation_exp_patch(options: dict[str, str], project_root: Path) -> 
 
     def patched(self, I_lst, c_eyes_lst, c_lip_lst, **kwargs):
         template = original(self, I_lst, c_eyes_lst, c_lip_lst, **kwargs)
-        expression_indices = (6, 12, 14, 17, 19, 20) if mode == "rotation_lip" else None
+        lip_indices = (6, 12, 14, 17, 19, 20)
+        # LivePortrait 官方 animation_region="eyes" 使用的局部表达索引。
+        # 只把这些眼部点和嘴部点交给 driving，避免重新启用 full-exp 的脸颊/下颌呼吸。
+        eye_indices = (11, 13, 15, 16, 18)
+        expression_indices = {
+            "rotation_exp": None,
+            "rotation_lip": lip_indices,
+            "rotation_lip_eye": lip_indices + eye_indices,
+        }[mode]
         template, rows = control_motion_template(
             template, control, expression_indices=expression_indices
         )
