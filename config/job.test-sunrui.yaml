@@ -1,0 +1,57 @@
+# 测试任务：孙瑞 - LatentSync 口型同步验证
+# 日期：2026-08-31
+# 源视频：testlatentsync.mp4（33.46s，1080x1920 竖屏，华为 Mate 70 Pro）
+
+job_id: "sunrui-test-004"
+consent_confirmed: true
+local_only: false
+
+# 源视频
+source_video: "../samples/testlatentsync.mp4"
+
+# 从源视频截取参考音频（不提供独立参考音频）
+reference_audio: null
+reference_start_seconds: 0.0
+reference_duration_seconds: 33.46
+
+# 参考音频对应文字（视频中人物实际说的话）
+reference_text: "我是施君山，身份证号640321197801090317，于2026年7月28日入职河北惠民电力科技有限公司。视频拍摄时间2026年8月13日。本人承诺：此本视频真实有效，对视频的真实性负责。如有虚假承诺，或挂靠出借证件行为，本人愿意承担一切法律责任。"
+
+# 新话术（测试时使用相同文本）
+script: "本人姓名孙瑞、身份证号140221199412084015，在天津市众源电力工程股份有限公司工作，于2026年6月10日进入企业、视频拍摄于2026年8月31日，本人承诺：此视频真实有效，对视频的真实性负责，如有虚假承诺或挂靠出借证件行为，本人愿意承担一切法律责任。"
+
+tts:
+  profile: "quality"
+  language: "ZH"
+  max_chars_per_segment: 60
+  guidance_scale: 1.2
+  seed: 42
+
+video:
+  fps: 25
+  duration_policy: "pingpong"
+  final_crf: 12
+
+lipsync:
+  engine: "latentsync_1_6"
+  inference_steps: 30
+  guidance_scale: 1.0
+  seed: 1247
+  enable_deepcache: false
+
+composite:
+  mode: "native"
+  texture_strength: 0.0
+  detail_sigma: 1.2
+  mask_feather_pixels: 6
+  temporal_ema: 0.80
+  optical_flow: true
+  detect_interval: 5
+  change_threshold: 2.5
+
+mouth_roi:
+  center_x: 0.50
+  center_y: 0.40
+  width: 0.16
+  height: 0.11
+  feather_pixels: 18

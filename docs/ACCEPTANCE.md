@@ -1,7 +1,7 @@
 # MVP 验收标准
 
 > 本文档仅适用于 MuseTalk 本地回退链路。LatentSync 1.6 云端主线使用
-> [LATENTSYNC_CLOUD_ACCEPTANCE.md](LATENTSYNC_CLOUD_ACCEPTANCE.md)。
+> [LATENTSYNC_CLOUD_ACCEPTANCE.md](LatentSync 1.6 云端高画质验收标准 )。
 
 ## 1. 测试素材
 

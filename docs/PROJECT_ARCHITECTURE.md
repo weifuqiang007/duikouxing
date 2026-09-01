@@ -2,7 +2,7 @@
 
 > 注意：本文档保留 MuseTalk 本地回退链路的设计历史。
 > `codex/latentsync-1.6-cloud` 分支的高画质主架构以
-> [LATENTSYNC_CLOUD_ARCHITECTURE.md](LATENTSYNC_CLOUD_ARCHITECTURE.md) 为准。
+> [LATENTSYNC_CLOUD_ARCHITECTURE.md](LatentSync 1.6 云端高画质口型项目架构书) 为准。
 
 版本：0.2（动作/纹理解耦合成）
 日期：2026-08-18
