@@ -71,7 +71,8 @@ def video_landmark_series(app, path: Path, max_frames: int = 300) -> dict[str, n
     data = {k: [] for k in ("detected", "eye_distance", "stable_rms", "bbox_w", "bbox_h")}
     prev_box = None
     last = None
-    for _ in range(max_frames):
+    frame_limit = max_frames if max_frames > 0 else 1_000_000_000
+    for _ in range(frame_limit):
         ok, frame = cap.read()
         if not ok:
             break
@@ -130,6 +131,8 @@ def main() -> int:
     ap.add_argument("--lip-video", type=Path, default=None)
     ap.add_argument("--insightface-root", required=True, type=Path)
     ap.add_argument("--output-dir", required=True, type=Path)
+    ap.add_argument("--max-frames", type=int, default=300,
+                    help="视频特征最多分析多少帧；<=0 表示完整视频")
     args = ap.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -146,14 +149,18 @@ def main() -> int:
     )
     app.prepare(ctx_id=0, det_size=(640, 640))
     videos = {
-        "animated_head": video_landmark_series(app, args.animated_head),
-        "final_ema05": video_landmark_series(app, args.ema05_video),
-        "final_ema0": video_landmark_series(app, args.ema0_video),
+        "animated_head": video_landmark_series(app, args.animated_head, args.max_frames),
+        "final_ema05": video_landmark_series(app, args.ema05_video, args.max_frames),
+        "final_ema0": video_landmark_series(app, args.ema0_video, args.max_frames),
     }
     if args.lip_animated is not None:
-        videos["animated_rotation_lip"] = video_landmark_series(app, args.lip_animated)
+        videos["animated_rotation_lip"] = video_landmark_series(
+            app, args.lip_animated, args.max_frames
+        )
     if args.lip_video is not None:
-        videos["final_rotation_lip"] = video_landmark_series(app, args.lip_video)
+        videos["final_rotation_lip"] = video_landmark_series(
+            app, args.lip_video, args.max_frames
+        )
 
     report: dict = {
         "frames": len(ema05),
@@ -269,23 +276,47 @@ def main() -> int:
         )
 
     # 曲线图
-    frame = np.arange(len(ema05))
-    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
-    axes[0].plot(frame, 100 * (numeric(stitch, "before_rms_xy") / np.mean(numeric(stitch, "before_rms_xy")) - 1), label="LP before stitch RMS")
-    axes[0].plot(frame, 100 * (numeric(stitch, "after_rms_xy") / np.mean(numeric(stitch, "after_rms_xy")) - 1), label="LP after stitch RMS", alpha=.8)
-    axes[1].plot(frame, 100 * (videos["animated_head"]["stable_rms"] / np.mean(videos["animated_head"]["stable_rms"]) - 1), label="animated_head 68 stable RMS")
-    axes[2].plot(frame, 100 * (numeric(ema05, "alpha_0p5_area") / np.mean(numeric(ema05, "alpha_0p5_area")) - 1), label="alpha area EMA .5")
-    axes[2].plot(frame, 100 * (numeric(ema0, "alpha_0p5_area") / np.mean(numeric(ema0, "alpha_0p5_area")) - 1), label="alpha area EMA 0")
-    axes[3].plot(frame, numeric(ema05, "detected"), label="B detector success", drawstyle="steps-mid")
+    def relative_pct(values: np.ndarray) -> np.ndarray:
+        return 100 * (values / np.mean(values) - 1)
+
+    fig, axes = plt.subplots(5, 1, figsize=(16, 15), sharex=True)
+    full_before = numeric(stitch, "before_rms_xy")
+    axes[0].plot(relative_pct(full_before), label="full-exp: LP pre-stitch RMS")
+    if lip_stitch is not None:
+        axes[0].plot(relative_pct(numeric(lip_stitch, "before_rms_xy")),
+                     label="E3 rotation_lip: LP pre-stitch RMS", alpha=.85)
+
+    full_eye = videos["animated_head"]["eye_distance"]
+    axes[1].plot(relative_pct(full_eye), label="full-exp: animated eye distance")
+    if "animated_rotation_lip" in videos:
+        axes[1].plot(relative_pct(videos["animated_rotation_lip"]["eye_distance"]),
+                     label="E3 rotation_lip: animated eye distance", alpha=.85)
+
+    full_bbox_h = videos["animated_head"]["bbox_h"]
+    axes[2].plot(relative_pct(full_bbox_h), label="full-exp: animated bbox height")
+    if "animated_rotation_lip" in videos:
+        axes[2].plot(relative_pct(videos["animated_rotation_lip"]["bbox_h"]),
+                     label="E3 rotation_lip: animated bbox height", alpha=.85)
+
+    axes[3].plot(relative_pct(numeric(ema05, "alpha_0p5_area")),
+                 label="full-exp: alpha@0.5 area (EMA .5)")
+    axes[3].plot(relative_pct(numeric(ema0, "alpha_0p5_area")),
+                 label="E3: alpha@0.5 area (EMA 0)")
+    axes[4].plot(numeric(ema05, "detected"), label="full-exp: B detector success",
+                 drawstyle="steps-mid")
+    if lip_rows is not None:
+        axes[4].plot(numeric(lip_rows, "detected") - 0.04,
+                     label="E3: B detector success (offset -0.04)", drawstyle="steps-mid", alpha=.7)
     for ax in axes:
         ax.grid(alpha=.25)
         ax.legend(loc="upper right")
     axes[0].set_ylabel("relative %")
     axes[1].set_ylabel("relative %")
     axes[2].set_ylabel("relative %")
-    axes[3].set_ylabel("0/1")
-    axes[3].set_xlabel("frame")
-    fig.suptitle("Head shrink layered telemetry")
+    axes[3].set_ylabel("relative %")
+    axes[4].set_ylabel("0/1")
+    axes[4].set_xlabel("frame")
+    fig.suptitle("Full video: original full-exp vs E3 rotation_lip")
     fig.tight_layout()
     plot = args.output_dir / "shrink-layered-curves.png"
     fig.savefig(plot, dpi=160)
