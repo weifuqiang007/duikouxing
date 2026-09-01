@@ -96,14 +96,25 @@ def test_color_matcher_moves_toward_reference():
 import numpy.testing as npt
 
 from headswap.composite_head import (
+    build_neck_pivot_transforms,
     centered_smooth,
+    estimate_head_attachment,
+    estimate_neck_pivot,
     fit_plane_fill,
     hampel,
     inner_feather_alpha,
     motion_safe_union,
     offline_filter,
+    resolve_point_track,
     rigid_from_eyes,
+    smooth_point_track,
+    transform_point,
     warp_premultiplied,
+)
+from headswap.motion_control import (
+    RotationControl,
+    control_motion_template,
+    scale_relative_rotations,
 )
 
 
@@ -1372,3 +1383,112 @@ def test_jaw_luminance_gradient_band_only_and_smoothstep():
     )
     d1 = np.asarray(state["delta"]); d2 = np.asarray(state2["delta"])
     assert np.linalg.norm(d2 - d1) < np.linalg.norm(d1) * 0.2 + 1e-6
+
+
+# ---------------- 第八轮：rotation_exp + 头颈支点锁定（docs §33） ----------------
+
+def _rot(axis, degrees):
+    vec = np.zeros(3, dtype=np.float64)
+    vec[axis] = np.deg2rad(degrees)
+    return cv2.Rodrigues(vec)[0]
+
+
+def test_scale_relative_rotations_keeps_first_and_so3():
+    rotations = np.stack([np.eye(3), _rot(1, 4.0), _rot(1, -4.0)])
+    cfg = RotationControl(
+        pitch_gain=1.0, yaw_gain=0.5, roll_gain=1.0,
+        pitch_limit_deg=10.0, yaw_limit_deg=10.0, roll_limit_deg=10.0,
+        smooth_window=1,
+    )
+    out, diag = scale_relative_rotations(rotations, cfg)
+    npt.assert_allclose(out[0], np.eye(3), atol=1e-6)
+    assert diag["used_rotvec_deg"][1, 1] == pytest.approx(2.0, abs=1e-4)
+    for matrix in out:
+        npt.assert_allclose(matrix.T @ matrix, np.eye(3), atol=1e-5)
+        assert np.linalg.det(matrix) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_rotation_control_rejects_even_smoothing_window():
+    with pytest.raises(ValueError, match="正奇数"):
+        RotationControl(smooth_window=4).validate()
+
+
+def test_control_motion_template_freezes_translation_and_scale_but_keeps_exp():
+    template = {"motion": []}
+    for i in range(3):
+        template["motion"].append(
+            {
+                "R": _rot(0, float(i)).reshape(1, 3, 3).astype(np.float32),
+                "t": np.array([[i, i + 1, 0]], np.float32),
+                "scale": np.array([[1.0 + 0.1 * i]], np.float32),
+                "exp": np.full((1, 21, 3), i, np.float32),
+            }
+        )
+    exp_before = [x["exp"].copy() for x in template["motion"]]
+    controlled, rows = control_motion_template(template, RotationControl(smooth_window=1))
+    for i, item in enumerate(controlled["motion"]):
+        npt.assert_allclose(item["t"], [[0, 1, 0]])
+        npt.assert_allclose(item["scale"], [[1.0]])
+        npt.assert_array_equal(item["exp"], exp_before[i])
+    assert rows[2]["raw_tx"] == 2.0
+    assert rows[2]["used_tx"] == 0.0
+    assert rows[2]["raw_scale"] == pytest.approx(1.2)
+    assert rows[2]["used_scale"] == 1.0
+
+
+def test_head_attachment_does_not_use_mouth_points():
+    kps = np.array([[40, 40], [60, 40], [50, 55], [42, 70], [58, 70]], np.float32)
+    box = np.array([30, 25, 70, 85], np.float32)
+    q1 = estimate_head_attachment(kps, box)
+    changed = kps.copy()
+    changed[3:] += np.array([[100, -80], [-100, 90]], np.float32)
+    q2 = estimate_head_attachment(changed, box)
+    npt.assert_allclose(q1, q2, atol=0)
+
+
+def test_estimate_neck_pivot_uses_top_center_of_neck_component():
+    mask = np.zeros((120, 120), np.uint8)
+    mask[78:115, 45:76] = 255
+    box = np.array([30, 20, 90, 80], np.float32)
+    kps = np.array([[45, 45], [75, 45], [60, 60], [50, 72], [70, 72]], np.float32)
+    p = estimate_neck_pivot(mask, box, kps)
+    assert p is not None
+    assert p[0] == pytest.approx(60.0, abs=1.0)
+    assert 78 <= p[1] <= 84
+
+
+def test_resolve_point_track_interpolates_short_gap_and_falls_back_long_gap():
+    raw = [np.array([0.0, 0.0]), None, np.array([2.0, 2.0]), None, None, None]
+    fallback = [np.array([10.0 + i, 20.0]) for i in range(len(raw))]
+    out, source = resolve_point_track(raw, fallback, max_gap=1)
+    npt.assert_allclose(out[1], [1.0, 1.0])
+    assert source[1] == "interpolated"
+    assert source[3:] == ["face_fallback"] * 3
+    npt.assert_allclose(out[5], fallback[5])
+
+
+def test_smooth_point_track_has_no_length_or_phase_shift():
+    pts = np.stack([np.arange(9, dtype=float), np.arange(9, dtype=float) * 2], axis=1)
+    out = smooth_point_track(pts, window=3)
+    assert out.shape == pts.shape
+    npt.assert_allclose(out[1:-1], pts[1:-1], atol=1e-9)
+
+
+def test_neck_pivot_transforms_lock_attachment_without_accumulated_drift():
+    n = 30
+    ka0 = np.array([[40, 40], [60, 40], [50, 55], [44, 68], [56, 68]], np.float64)
+    kb0 = np.array([[80, 80], [120, 80], [100, 110], [88, 136], [112, 136]], np.float64)
+    a_kps = [ka0 + np.array([0.4 * i, 0.1 * i]) for i in range(n)]
+    b_kps = [kb0.copy() for _ in range(n)]
+    b_boxes = [np.array([60, 50, 140, 170], np.float64) for _ in range(n)]
+    neck = np.array([[50 + 0.4 * i, 82 + 0.1 * i] for i in range(n)], np.float64)
+    params, log = build_neck_pivot_transforms(
+        a_kps, b_kps, b_boxes, neck, smooth_window=3
+    )
+    assert len(params) == n
+    assert np.ptp(np.asarray(params)[:, 0]) == pytest.approx(0.0)
+    assert np.ptp(np.asarray(params)[:, 1]) == pytest.approx(0.0)
+    assert max(log["attachment_error_px"]) < 1e-9
+    for i in range(n):
+        mapped = transform_point(log["q_attach_used"][i], rebuild(*params[i]))
+        npt.assert_allclose(mapped, log["p_neck_used"][i], atol=1e-9)

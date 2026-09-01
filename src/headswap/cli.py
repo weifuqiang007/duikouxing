@@ -56,8 +56,25 @@ def load_headswap_job(path: Path) -> dict:
     if not data.get("consent_confirmed", False):
         raise HeadswapError("未确认人物肖像授权，任务拒绝运行")
     lp = data.setdefault("liveportrait", {})
-    if str(lp.get("animation_region", "all")) not in {"all", "exp"}:
-        raise HeadswapError("liveportrait.animation_region 只能是 all 或 exp")
+    motion_mode = str(lp.get("motion_mode", lp.get("animation_region", "all")))
+    if motion_mode not in {"all", "exp", "rotation_exp"}:
+        raise HeadswapError("liveportrait.motion_mode 只能是 all、exp 或 rotation_exp")
+    if motion_mode == "rotation_exp":
+        if bool(lp.get("transfer_translation", False)):
+            raise HeadswapError("rotation_exp 禁止 transfer_translation=true")
+        if bool(lp.get("transfer_scale", False)):
+            raise HeadswapError("rotation_exp 禁止 transfer_scale=true")
+        win = int(lp.get("pose_smooth_window", 7))
+        if win < 1 or win % 2 == 0:
+            raise HeadswapError("liveportrait.pose_smooth_window 必须为正奇数")
+    comp = data.setdefault("composite", {})
+    if comp.get("neck_pivot_enabled"):
+        if float(comp.get("external_rotation_gain", 0.0)) != 0.0:
+            raise HeadswapError("neck_pivot 模式禁止外部逐帧旋转：external_rotation_gain 必须为 0")
+        if str(comp.get("scale_mode", "const")) != "const":
+            raise HeadswapError("neck_pivot 模式要求 composite.scale_mode=const")
+        if comp.get("freeze_head_motion"):
+            raise HeadswapError("neck_pivot_enabled 与 freeze_head_motion 互斥")
     return data
 
 
@@ -121,13 +138,15 @@ def stage_prepare(job: dict, local, dirs: dict) -> None:
             shutil.copy2(side, target)
 
     force = bool(job.get("_force_current"))
+    max_seconds = float(job.get("video", {}).get("max_seconds", 0.0))
+    duration_args = ["-t", f"{max_seconds:.6f}"] if max_seconds > 0 else []
     # 烘焙旋转元数据 + 固定 30fps CFR，后续所有读取方（LivePortrait/cv2）拿到的是像素已转正的视频
     if not src_video.is_file() or force:
         _run(
             [
                 local.ffmpeg, "-y", "-i", copied_video,
                 "-c:v", "libx264", "-crf", "12", "-preset", "fast",
-                "-pix_fmt", "yuv420p", "-r", "30", "-an", src_video,
+                "-pix_fmt", "yuv420p", "-r", "30", "-an", *duration_args, src_video,
             ],
             dirs["logs"] / "prepare_video.log",
         )
@@ -137,7 +156,7 @@ def stage_prepare(job: dict, local, dirs: dict) -> None:
             _run(
                 [
                     local.ffmpeg, "-y", "-i", copied_video,
-                    "-vn", "-c:a", "pcm_s16le", "-ar", "48000", src_audio,
+                    "-vn", "-c:a", "pcm_s16le", "-ar", "48000", *duration_args, src_audio,
                 ],
                 dirs["logs"] / "prepare_audio.log",
             )
@@ -258,6 +277,13 @@ def stage_composite(job: dict, local, dirs: dict) -> None:
             "--x-offset", str(float(comp.get("x_offset_px", 0.0))),
             "--y-offset", str(float(comp.get("y_offset_px", 0.0))),
             "--transform-mode", str(comp.get("transform_mode", "eyes")),
+            *( ["--neck-pivot-enabled"] if comp.get("neck_pivot_enabled") else [] ),
+            "--neck-pivot-smooth-window", str(int(comp.get("neck_pivot_smooth_window", 7))),
+            "--neck-pivot-max-gap", str(int(comp.get("neck_pivot_max_gap", 5))),
+            "--attachment-offset-x", str(float(comp.get("attachment_offset_x", 0.0))),
+            "--attachment-offset-y", str(float(comp.get("attachment_offset_y", 0.0))),
+            "--external-rotation-gain", str(float(comp.get("external_rotation_gain", 0.0))),
+            "--max-attachment-drift-px", str(float(comp.get("max_attachment_drift_px", 3.0))),
             *( ["--freeze-head-motion"] if comp.get("freeze_head_motion") else [] ),
             "--freeze-reference-frames", str(int(comp.get("freeze_reference_frames", 30))),
             "--filter-mode", str(comp.get("filter_mode", "offline")),

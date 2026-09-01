@@ -51,6 +51,12 @@ def run_reenact(
     if not runner.is_file():
         raise RuntimeError(f"缺少 LivePortrait 启动包装脚本: {runner}")
 
+    motion_mode = str(settings.get("motion_mode", settings.get("animation_region", "all")))
+    if motion_mode not in {"all", "exp", "rotation_exp"}:
+        raise ValueError(f"不支持的 LivePortrait motion_mode: {motion_mode}")
+    official_region = "all" if motion_mode == "rotation_exp" else str(
+        settings.get("animation_region", motion_mode)
+    )
     command = conda_run(
         conda,
         liveportrait_env,
@@ -60,7 +66,13 @@ def run_reenact(
             "--driving", driving,
             "--output_dir", result_dir,
             "--device_id", str(gpu_id),
-            "--animation_region", str(settings.get("animation_region", "all")),
+            "--animation_region", official_region,
+            "--driving_option", str(
+                settings.get(
+                    "driving_option",
+                    "pose-friendly" if motion_mode == "rotation_exp" else "expression-friendly",
+                )
+            ),
             "--driving_multiplier", str(float(settings.get("driving_multiplier", 1.0))),
             "--driving_smooth_observation_variance",
             str(float(settings.get("smooth_variance", 3e-7))),
@@ -74,6 +86,21 @@ def run_reenact(
             "--audio_priority", "source",
         ],
     )
+    if motion_mode == "rotation_exp":
+        report = work_dir / str(settings.get("motion_report_name", "motion10-poses"))
+        command.extend(
+            [
+                "--headswap-motion-mode", "rotation_exp",
+                "--headswap-pose-gain-pitch", str(float(settings.get("pose_gain_pitch", 0.65))),
+                "--headswap-pose-gain-yaw", str(float(settings.get("pose_gain_yaw", 0.75))),
+                "--headswap-pose-gain-roll", str(float(settings.get("pose_gain_roll", 0.65))),
+                "--headswap-pose-limit-pitch", str(float(settings.get("pose_limit_pitch_deg", 3.0))),
+                "--headswap-pose-limit-yaw", str(float(settings.get("pose_limit_yaw_deg", 5.0))),
+                "--headswap-pose-limit-roll", str(float(settings.get("pose_limit_roll_deg", 3.0))),
+                "--headswap-pose-smooth-window", str(int(settings.get("pose_smooth_window", 7))),
+                "--headswap-motion-report", report,
+            ]
+        )
     command.extend(
         [
             "--flag_relative_motion",

@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -174,6 +175,211 @@ def decompose(m: np.ndarray):
 def rebuild(s: float, angle: float, tx: float, ty: float) -> np.ndarray:
     c, sn = s * math.cos(angle), s * math.sin(angle)
     return np.array([[c, -sn, tx], [sn, c, ty]], dtype=np.float64)
+
+
+def transform_point(point: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """用 2×3 仿射矩阵变换单点，显式用于头颈支点审计。"""
+    p = np.asarray(point, dtype=np.float64).reshape(2)
+    m = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    return m[:, :2] @ p + m[:, 2]
+
+
+def estimate_head_attachment(kps: np.ndarray, bbox: np.ndarray) -> np.ndarray | None:
+    """从眼睛/鼻梁估计 B 头颈连接点 Q，不使用持续发音的嘴角。
+
+    InsightFace 的五点顺序为双眼、鼻尖、双嘴角。本函数只读取前三点：X 主要跟随
+    双眼中心，少量吸收鼻尖的 yaw 位移；Y 沿眼中点→鼻尖方向延伸到下颌底部。
+    bbox 只作宽松限幅，避免检测尖峰把 Q 推出头部。
+    """
+    pts = np.asarray(kps, dtype=np.float64)
+    box = np.asarray(bbox, dtype=np.float64).reshape(4)
+    if pts.shape[0] < 3 or not np.isfinite(pts[:3]).all() or not np.isfinite(box).all():
+        return None
+    eye = 0.5 * (pts[0] + pts[1])
+    nose = pts[2]
+    h = max(float(box[3] - box[1]), 1.0)
+    qx = eye[0] + 0.25 * (nose[0] - eye[0])
+    qy = eye[1] + 2.55 * (nose[1] - eye[1])
+    qx = float(np.clip(qx, box[0] + 0.25 * (box[2] - box[0]), box[2] - 0.25 * (box[2] - box[0])))
+    qy = float(np.clip(qy, box[1] + 0.78 * h, box[1] + 1.08 * h))
+    return np.array([qx, qy], dtype=np.float64)
+
+
+def estimate_neck_pivot(
+    neck_mask: np.ndarray,
+    face_box: np.ndarray,
+    face_kps: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """在 A raw neck 主体顶部估计颈根支点 P（full-frame 像素坐标）。
+
+    只搜索脸框中心附近、下颌下方的 class14 区域，取顶部 5% 分位附近窄带的
+    中位中心。这样不会让远处衣领、手或证件决定支点，也不依赖嘴部关键点。
+    """
+    mask = np.asarray(neck_mask) > 0
+    box = np.asarray(face_box, dtype=np.float64).reshape(4)
+    if mask.ndim != 2 or not np.isfinite(box).all():
+        return None
+    h_img, w_img = mask.shape
+    bw, bh = max(box[2] - box[0], 1.0), max(box[3] - box[1], 1.0)
+    cx = 0.5 * (box[0] + box[2])
+    if face_kps is not None:
+        pts = np.asarray(face_kps, dtype=np.float64)
+        if pts.shape[0] >= 3 and np.isfinite(pts[:3]).all():
+            eye = 0.5 * (pts[0] + pts[1])
+            cx = 0.75 * eye[0] + 0.25 * pts[2, 0]
+    x0 = max(0, int(math.floor(cx - 0.42 * bw)))
+    x1 = min(w_img, int(math.ceil(cx + 0.42 * bw)) + 1)
+    y0 = max(0, int(math.floor(box[3] - 0.18 * bh)))
+    y1 = min(h_img, int(math.ceil(box[3] + 0.55 * bh)) + 1)
+    roi = mask[y0:y1, x0:x1]
+    ys, xs = np.nonzero(roi)
+    if len(xs) < 12:
+        return None
+    ys = ys + y0
+    xs = xs + x0
+    top = float(np.percentile(ys, 5))
+    band = (ys >= top - 1.0) & (ys <= top + max(5.0, 0.045 * bh))
+    if int(band.sum()) < 4:
+        return None
+    # neck 顶边常被下颌遮挡成左右两个不等大的细片。直接取顶带全部像素中位数会
+    # 在某一侧细片面积变化时横跳 50~100px（实片 frame0→299 的失败根因）。
+    # X 改由下方已连成完整脖子的 carrier band 决定：逐行取左右外边界中点，再
+    # 对行中点取中位数。Y 仍保留真实顶部，故不会把连接点下移到衣领。
+    carrier_y0 = max(y0, int(round(box[3] + 0.04 * bh)))
+    carrier_y1 = min(y1, int(round(box[3] + 0.18 * bh)) + 1)
+    mids = []
+    min_span = max(6.0, 0.25 * bw)
+    for gy in range(carrier_y0, carrier_y1):
+        row_x = np.flatnonzero(mask[gy, x0:x1]) + x0
+        if len(row_x) >= 4 and float(row_x[-1] - row_x[0]) >= min_span:
+            mids.append(0.5 * float(row_x[0] + row_x[-1]))
+    pivot_x = float(np.median(mids)) if mids else float(
+        0.75 * cx + 0.25 * np.median(xs[band])
+    )
+    return np.array([pivot_x, float(np.median(ys[band]))], dtype=np.float64)
+
+
+def _fallback_neck_pivot(face_box: np.ndarray, face_kps: np.ndarray) -> np.ndarray:
+    """neck mask 不可靠时的显式肩颈近似；不读取嘴点。"""
+    box = np.asarray(face_box, dtype=np.float64)
+    pts = np.asarray(face_kps, dtype=np.float64)
+    eye = 0.5 * (pts[0] + pts[1])
+    nose = pts[2]
+    x = 0.75 * eye[0] + 0.25 * nose[0]
+    y = box[3] + 0.03 * max(box[3] - box[1], 1.0)
+    return np.array([x, y], dtype=np.float64)
+
+
+def smooth_point_track(points: np.ndarray, window: int = 7) -> np.ndarray:
+    """Hampel + 对称平滑二维点；窗口必须为正奇数，零相位。"""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2 or not np.isfinite(pts).all():
+        raise ValueError("point track 必须为有限 N×2")
+    if window < 1 or window % 2 == 0:
+        raise ValueError("point smooth window 必须为正奇数")
+    out = np.empty_like(pts)
+    for axis in range(2):
+        clean = hampel(pts[:, axis], window=window)
+        out[:, axis] = centered_smooth(clean, window=window)
+    return out
+
+
+def resolve_point_track(
+    points: list[np.ndarray | None],
+    fallbacks: list[np.ndarray],
+    max_gap: int = 5,
+) -> tuple[np.ndarray, list[str]]:
+    """短缺失在相邻可靠点之间插值，长缺失显式使用 fallback。"""
+    if len(points) != len(fallbacks) or not points:
+        raise ValueError("point/fallback 轨迹长度不一致或为空")
+    n = len(points)
+    out: list[np.ndarray | None] = [
+        None if p is None else np.asarray(p, dtype=np.float64) for p in points
+    ]
+    sources = ["raw_neck" if p is not None else "missing" for p in points]
+    i = 0
+    while i < n:
+        if out[i] is not None:
+            i += 1
+            continue
+        start = i
+        while i < n and out[i] is None:
+            i += 1
+        end = i
+        gap = end - start
+        left = start - 1
+        right = end
+        if gap <= max(0, int(max_gap)) and left >= 0 and right < n:
+            p0, p1 = out[left], out[right]
+            assert p0 is not None and p1 is not None
+            for j in range(start, end):
+                t = (j - left) / (right - left)
+                out[j] = (1.0 - t) * p0 + t * p1
+                sources[j] = "interpolated"
+        else:
+            for j in range(start, end):
+                out[j] = np.asarray(fallbacks[j], dtype=np.float64)
+                sources[j] = "face_fallback"
+    return np.asarray(out, dtype=np.float64), sources
+
+
+def build_neck_pivot_transforms(
+    a_kps: list[np.ndarray],
+    b_kps: list[np.ndarray],
+    b_boxes: list[np.ndarray],
+    neck_pivots: np.ndarray,
+    *,
+    smooth_window: int = 7,
+    offset: tuple[float, float] = (0.0, 0.0),
+) -> tuple[list[tuple[float, float, float, float]], dict]:
+    """构造“常量 scale/angle + 动态支点平移”的逐帧外部变换。
+
+    scale 和基础角只做 A/B 画布标定，全片恒定；每帧唯一动态二维自由度是把
+    B 的 Q 对齐到 A 的 P。返回的误差以同一矩阵重算，供发现坐标系/矩阵不一致。
+    """
+    n = len(a_kps)
+    if not (n and len(b_kps) == len(b_boxes) == len(neck_pivots) == n):
+        raise ValueError("pivot transform 输入轨迹长度不一致或为空")
+    scales, angles, q_raw = [], [], []
+    for ka, kb, bb in zip(a_kps, b_kps, b_boxes):
+        ka = np.asarray(ka, dtype=np.float64)
+        kb = np.asarray(kb, dtype=np.float64)
+        va, vb = ka[1] - ka[0], kb[1] - kb[0]
+        na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+        if na < 1e-6 or nb < 1e-6:
+            raise ValueError("双眼距离为 0，无法标定 pivot transform")
+        scales.append(na / nb)
+        angles.append(math.atan2(va[1], va[0]) - math.atan2(vb[1], vb[0]))
+        q = estimate_head_attachment(kb, bb)
+        if q is None:
+            raise ValueError("B 头颈连接点估计失败")
+        q_raw.append(q)
+    scale = float(np.median(scales))
+    angle = float(np.median(np.unwrap(np.asarray(angles, dtype=np.float64))))
+    p_used = smooth_point_track(np.asarray(neck_pivots), window=smooth_window)
+    q_used = smooth_point_track(np.asarray(q_raw), window=smooth_window)
+    target = p_used + np.asarray(offset, dtype=np.float64)[None, :]
+    c, sn = scale * math.cos(angle), scale * math.sin(angle)
+    linear = np.array([[c, -sn], [sn, c]], dtype=np.float64)
+    params, errors = [], []
+    transformed = []
+    for p, q in zip(target, q_used):
+        translation = p - linear @ q
+        item = (scale, angle, float(translation[0]), float(translation[1]))
+        params.append(item)
+        mapped = transform_point(q, rebuild(*item))
+        transformed.append(mapped)
+        errors.append(float(np.linalg.norm(mapped - p)))
+    return params, {
+        "scale_const": scale,
+        "angle_const_rad": angle,
+        "p_neck_used": p_used.tolist(),
+        "q_attach_raw": np.asarray(q_raw).tolist(),
+        "q_attach_used": q_used.tolist(),
+        "q_attach_full": np.asarray(transformed).tolist(),
+        "attachment_error_px": errors,
+        "offset": [float(offset[0]), float(offset[1])],
+    }
 
 
 # ---------------------------------------------------------------- 离线滤波（§17.5.3）
@@ -1601,6 +1807,19 @@ def run_composite(args) -> int:
     check_neck_mode(bool(args.a_neck_preserve_enabled), bool(args.neck_collar_enabled))
     if args.a_neck_preserve_enabled and (args.necks_dir is None or not Path(args.necks_dir).is_dir()):
         raise RuntimeError("a_neck_preserve_enabled 需要 --necks-dir（先重跑 segment 生成 necks/）")
+    if args.neck_pivot_enabled:
+        if args.freeze_head_motion:
+            raise ValueError("neck-pivot-enabled 与 freeze-head-motion 互斥")
+        if args.necks_dir is None or not Path(args.necks_dir).is_dir():
+            raise RuntimeError("neck-pivot-enabled 需要 --necks-dir")
+        if args.filter_mode != "offline" or args.scale_mode != "const":
+            raise ValueError("neck pivot 要求 filter_mode=offline 且 scale_mode=const")
+        if abs(float(args.external_rotation_gain)) > 1e-9:
+            raise ValueError("neck pivot 下 external_rotation_gain 必须为 0，防止双重旋转")
+        if abs(float(args.scale_bias) - 1.0) > 1e-9 or abs(float(args.x_offset)) > 1e-9 or abs(float(args.y_offset)) > 1e-9:
+            raise ValueError(
+                "neck pivot 下旧 scale_bias/x_offset/y_offset 必须为 1/0/0；请改 attachment_offset"
+            )
     meta = json.loads(Path(args.meta_json).read_text(encoding="utf-8"))
     frame_meta = meta["frame_meta"]
     total = meta["frames"]
@@ -1675,27 +1894,69 @@ def run_composite(args) -> int:
         frozen_target_kps = np.median(ref_stack, axis=0).astype(np.float32)
 
     raw_params: list[tuple[float, float, float, float]] = []
-    for i in range(n_frames):
-        fm = frame_meta[min(i, len(frame_meta) - 1)]
-        kps_a = np.array(fm["kps"], dtype=np.float32)
-        target_kps = frozen_target_kps if frozen_target_kps is not None else kps_a
-        src = resolved[i]
-        if src is None:
-            raw_params.append(raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0))
-            continue
-        if args.transform_mode == "eyes":
-            p = rigid_from_eyes(np.array(src["kps"], dtype=np.float32), target_kps)
-            raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
-        elif args.transform_mode == "eyes_nose":
-            # §28.7 快速方案：眼睛+鼻尖（嘴点完全不进），滤波窗口配 5/7
-            p = rigid_from_eyes_nose(np.array(src["kps"], dtype=np.float32), target_kps)
-            raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
-        else:  # five_point（旧版对照）
-            m = similarity(np.array(src["kps"], dtype=np.float32), target_kps)
-            raw_params.append(decompose(m) if m is not None else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
+    pivot_log = None
+    if args.neck_pivot_enabled:
+        a_track: list[np.ndarray] = []
+        b_track: list[np.ndarray] = []
+        b_boxes: list[np.ndarray] = []
+        p_candidates: list[np.ndarray | None] = []
+        p_fallbacks: list[np.ndarray] = []
+        for i in range(n_frames):
+            fm = frame_meta[min(i, len(frame_meta) - 1)]
+            ka = np.asarray(fm["kps"], dtype=np.float64)
+            box_a_i = np.asarray(fm["bbox"], dtype=np.float64)
+            src = resolved[i]
+            if src is None:
+                raise RuntimeError(f"neck pivot 无可用 B 检测：frame {i}")
+            neck_path = Path(args.necks_dir) / f"neck_{i:06d}.png"
+            neck_mask = cv2.imread(str(neck_path), cv2.IMREAD_GRAYSCALE)
+            if neck_mask is None:
+                raise RuntimeError(f"neck pivot 缺少 mask：{neck_path}")
+            p = estimate_neck_pivot(neck_mask, box_a_i, ka)
+            a_track.append(ka)
+            b_track.append(np.asarray(src["kps"], dtype=np.float64))
+            b_boxes.append(np.asarray(src["bbox"], dtype=np.float64))
+            p_candidates.append(p)
+            p_fallbacks.append(_fallback_neck_pivot(box_a_i, ka))
+        p_raw_array, p_sources = resolve_point_track(
+            p_candidates, p_fallbacks, max_gap=int(args.neck_pivot_max_gap)
+        )
+        raw_params, pivot_log = build_neck_pivot_transforms(
+            a_track,
+            b_track,
+            b_boxes,
+            p_raw_array,
+            smooth_window=int(args.neck_pivot_smooth_window),
+            offset=(float(args.attachment_offset_x), float(args.attachment_offset_y)),
+        )
+        pivot_log["p_neck_raw"] = p_raw_array.tolist()
+        pivot_log["p_sources"] = p_sources
+        pivot_log["fallback_frames"] = int(sum(s != "raw_neck" for s in p_sources))
+    else:
+        for i in range(n_frames):
+            fm = frame_meta[min(i, len(frame_meta) - 1)]
+            kps_a = np.array(fm["kps"], dtype=np.float32)
+            target_kps = frozen_target_kps if frozen_target_kps is not None else kps_a
+            src = resolved[i]
+            if src is None:
+                raw_params.append(raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0))
+                continue
+            if args.transform_mode == "eyes":
+                p = rigid_from_eyes(np.array(src["kps"], dtype=np.float32), target_kps)
+                raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
+            elif args.transform_mode == "eyes_nose":
+                # §28.7 快速方案：眼睛+鼻尖（嘴点完全不进），滤波窗口配 5/7
+                p = rigid_from_eyes_nose(np.array(src["kps"], dtype=np.float32), target_kps)
+                raw_params.append(p if p else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
+            else:  # five_point（旧版对照）
+                m = similarity(np.array(src["kps"], dtype=np.float32), target_kps)
+                raw_params.append(decompose(m) if m is not None else (raw_params[-1] if raw_params else (1.0, 0.0, 0.0, 0.0)))
 
     # ---------- 滤波 ----------
-    if args.filter_mode == "offline":
+    if args.neck_pivot_enabled:
+        # P/Q 已各自做 Hampel + 零相位平滑；再次滤 tx/ty 会破坏逐帧支点不变量。
+        filt_params = list(raw_params)
+    elif args.filter_mode == "offline":
         filt_params = offline_filter(
             raw_params, hampel_window=args.hampel_window, smooth_window=args.filter_window,
             scale_mode=args.scale_mode, angle_window=args.angle_window,
@@ -1704,12 +1965,13 @@ def run_composite(args) -> int:
         filt_params = raw_params  # 在线模式在循环内用 SmoothedTransform
     online = SmoothedTransform(rot=args.rot_smooth, trans=args.trans_smooth, window=args.transform_window)
     transforms_log = {
-        "mode": f"{args.transform_mode}+{args.filter_mode}",
+        "mode": ("neck_pivot+translation_only" if args.neck_pivot_enabled else f"{args.transform_mode}+{args.filter_mode}"),
         "freeze_head_motion": bool(args.freeze_head_motion),
         "freeze_reference_frames": int(args.freeze_reference_frames),
         "frozen_target_kps": None if frozen_target_kps is None else frozen_target_kps.tolist(),
         "raw": raw_params,
         "filtered": filt_params,
+        "pivot": pivot_log,
     }
 
     # ---------- 遍数二：合成 ----------
@@ -1759,8 +2021,26 @@ def run_composite(args) -> int:
         "skin_bridge_px_mean": None,
         "audit_frames": 0,
         "jaw_gradient_skip": 0,
+        "neck_pivot_enabled": bool(args.neck_pivot_enabled),
+        "attachment_error_p95_px": None,
+        "attachment_error_max_px": None,
+        "attachment_first_last_delta_px": None,
+        "neck_pivot_fallback_frames": 0,
         "frame_range": [int(args.start_frame), None],
     }
+    if pivot_log is not None:
+        pivot_errors = np.asarray(pivot_log["attachment_error_px"], dtype=np.float64)
+        diag["attachment_error_p95_px"] = round(float(np.percentile(pivot_errors, 95)), 6)
+        diag["attachment_error_max_px"] = round(float(np.max(pivot_errors)), 6)
+        diag["attachment_first_last_delta_px"] = round(
+            float(abs(pivot_errors[-1] - pivot_errors[0])), 6
+        )
+        diag["neck_pivot_fallback_frames"] = int(pivot_log["fallback_frames"])
+        if float(np.max(pivot_errors)) > float(args.max_attachment_drift_px):
+            raise RuntimeError(
+                f"头颈支点误差 {float(np.max(pivot_errors)):.3f}px 超过 "
+                f"{float(args.max_attachment_drift_px):.3f}px"
+            )
     widths_sum = 0
     erased_px_sum = 0
     prev_mask_a = None
@@ -2281,6 +2561,23 @@ def run_composite(args) -> int:
             def b3(g):
                 return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
+            if pivot_log is not None:
+                anchor = out.copy()
+                p = np.rint(np.asarray(pivot_log["p_neck_used"][index])).astype(int)
+                q = np.rint(np.asarray(pivot_log["q_attach_full"][index])).astype(int)
+                cv2.drawMarker(anchor, tuple(p), (0, 255, 0), cv2.MARKER_CROSS, 28, 3)
+                cv2.drawMarker(anchor, tuple(q), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 24, 2)
+                cv2.line(anchor, tuple(p), tuple(q), (0, 255, 255), 2)
+                cv2.putText(
+                    anchor, "P neck=green, Q head=red", (20, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA,
+                )
+                cv2.putText(
+                    anchor, "P neck=green, Q head=red", (20, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA,
+                )
+                cv2.imwrite(str(args.debug_dir / f"frame_{index:04d}_pivot.png"), anchor)
+
             rp_vis = np.zeros((height, width), np.uint8)
             rp_vis[fill_protect] = 120  # 补洞保护区（灰）
             if residual is not None:
@@ -2448,6 +2745,34 @@ def run_composite(args) -> int:
             json.dumps(wall_rows, ensure_ascii=False), encoding="utf-8")
     args.output.with_suffix(".transforms.json").write_text(
         json.dumps(transforms_log), encoding="utf-8")
+    if pivot_log is not None:
+        pivot_csv = args.output.with_suffix(".pivots.csv")
+        with pivot_csv.open("w", newline="", encoding="utf-8-sig") as fp:
+            fields = [
+                "frame", "p_raw_x", "p_raw_y", "p_used_x", "p_used_y",
+                "q_raw_x", "q_raw_y", "q_used_x", "q_used_y",
+                "q_full_x", "q_full_y", "error_px", "p_source",
+            ]
+            writer_csv = csv.DictWriter(fp, fieldnames=fields)
+            writer_csv.writeheader()
+            for i in range(len(pivot_log["p_neck_used"])):
+                writer_csv.writerow(
+                    {
+                        "frame": i,
+                        "p_raw_x": pivot_log["p_neck_raw"][i][0],
+                        "p_raw_y": pivot_log["p_neck_raw"][i][1],
+                        "p_used_x": pivot_log["p_neck_used"][i][0],
+                        "p_used_y": pivot_log["p_neck_used"][i][1],
+                        "q_raw_x": pivot_log["q_attach_raw"][i][0],
+                        "q_raw_y": pivot_log["q_attach_raw"][i][1],
+                        "q_used_x": pivot_log["q_attach_used"][i][0],
+                        "q_used_y": pivot_log["q_attach_used"][i][1],
+                        "q_full_x": pivot_log["q_attach_full"][i][0],
+                        "q_full_y": pivot_log["q_attach_full"][i][1],
+                        "error_px": pivot_log["attachment_error_px"][i],
+                        "p_source": pivot_log["p_sources"][i],
+                    }
+                )
     args.output.with_suffix(".diag.json").write_text(
         json.dumps(diag, ensure_ascii=False), encoding="utf-8")
     print(f"OK: composited {diag['frames']} frames -> {args.output}")
@@ -2472,6 +2797,22 @@ def build_argparser() -> argparse.ArgumentParser:
     # 变换与滤波（§17.5 / §28.7 / §28.10）
     ap.add_argument("--transform-mode", choices=["eyes", "eyes_nose", "five_point"], default="eyes",
                     help="eyes=v4/v5；eyes_nose=§28.7 K1/K2（嘴点完全不进）；five_point=旧版对照")
+    ap.add_argument(
+        "--neck-pivot-enabled", action="store_true",
+        help="第八轮：常量 scale/angle，只用 P_A-Q_B 动态平移锁定头颈连接支点",
+    )
+    ap.add_argument("--neck-pivot-smooth-window", type=int, default=7,
+                    help="P/Q 的 Hampel + 零相位平滑奇数窗口")
+    ap.add_argument("--neck-pivot-max-gap", type=int, default=5,
+                    help="预留的 neck 低置信短缺失插值上限；超限使用显式 fallback")
+    ap.add_argument("--attachment-offset-x", type=float, default=0.0,
+                    help="头颈支点固定视觉标定 X，不允许逐帧变化")
+    ap.add_argument("--attachment-offset-y", type=float, default=0.0,
+                    help="头颈支点固定视觉标定 Y，不允许逐帧变化")
+    ap.add_argument("--external-rotation-gain", type=float, default=0.0,
+                    help="rotation_exp/neck pivot 下必须为 0，防止 LivePortrait 与外部双旋转")
+    ap.add_argument("--max-attachment-drift-px", type=float, default=3.0,
+                    help="对齐后 P/Q 最大允许误差，超限直接失败")
     ap.add_argument(
         "--freeze-head-motion", action="store_true",
         help="诊断：把 B 每帧锚点对齐到 A 前若干帧的固定中位锚点，只保留嘴型/表情",

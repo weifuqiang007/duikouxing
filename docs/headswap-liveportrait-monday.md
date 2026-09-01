@@ -6203,3 +6203,765 @@ corridor/orphan/gap/neck_temporal_mad 全部与 v6 持平。
 .\scripts\run_headswap.ps1 -Profile home -Job config\headswap.hs-p1-0004-v7-skin-bridge.yaml -Stage finalize
 # 独立验收指标在 work/composite_silent-v7-skin-bridge.diag.json 的 audit_* 键
 ```
+
+---
+
+## 33. 第八轮方案：LivePortrait 旋转驱动 + 头颈支点锁定（10 秒实验处方，供 GLM5 执行）
+
+> 编写日期：2026-08-31
+> 本节性质：**下一轮代码实现规范，不是已经完成的实现记录**。
+> 执行边界：GLM5 只能先做 10 秒实验，不得覆盖当前通过脸部、嘴部验收的
+> `final-v7-skin-bridge.mp4`，也不得直接跑全片或覆盖 `output/final.mp4`。
+> 当前基线提交：`5e5f71c`（`完成V7头颈连接与冻结头运动诊断`）。
+
+### 33.1 用户反馈、问题定性与本轮唯一目标
+
+用户及客户已经确认：V7 的**人物脸部形象、嘴唇清晰度和口型效果满意**。因此
+本轮不是重做人脸、口型、颜色或 skin bridge，而是只解决运动关系。
+
+冻结头部诊断版已经证明“让头完全不动”不可用：原视频人物说话时，身体和脖子
+会缓慢偏移；如果生成头固定在画面坐标中，头颈误差会随时间累积，后段出现脖子
+越来越偏到头的一侧。该现象不是普通的单帧贴歪，而是**参照坐标系错误**。
+
+正常人口播时，视觉上并不是一张平面头像沿屏幕 X/Y 方向机械平移，而是头部围绕
+颈根/头颈连接处发生很小的 yaw、pitch、roll 旋转，同时表情和嘴形变化。当前结果
+的主要违和感来自：
+
+1. LivePortrait 内部已经转移了一部分姿态、平移和尺度；
+2. 外部合成又按脸框/锚点追加平移、旋转或缩放；
+3. 两层运动可能重复补偿，且参考点偏向脸中心，而不是头颈连接支点；
+4. 因而生成头看起来像一张平面在水平面上滑动，头和 A 原脖子没有形成刚性的
+   解剖连接关系。
+
+**本轮唯一目标：**在不破坏 V7 脸、嘴、肤色桥接和遮罩质量的前提下，使生成头
+表现为围绕 A 的脖子做轻微自然旋转，并建立以下最高优先级不变量：
+
+> 对每一帧，B 头部的“头颈连接点”必须对齐 A 原视频脖子上端中心；该关系不能
+> 随时间漂移，不能因为说话、脸框变化或身体移动而累积偏差。
+
+注意：这里要求锁定的是**头颈连接支点**，不是强迫“脸框中心”等于“脖子中心”。
+人在 yaw 时，鼻子、眼睛和脸部视觉中心本来就会相对脖子左右移动；若强行把脸框
+中心锁死在脖子中心，反而会抵消真实旋转，重新变成二维滑动。
+
+### 33.2 可行性结论
+
+本方案在现有工程中可行，第一轮实验**不需要重新训练模型，也不需要先引入完整
+3D 数字人系统**。
+
+LivePortrait 当前代码已经显式预测并使用：
+
+- `pitch / yaw / roll`：三维头部姿态；
+- `exp`：表情和嘴形相关的隐式关键点位移；
+- `t`：平移；
+- `scale`：尺度；
+- `kp`：规范空间关键点。
+
+现有 `animation_region=all` 相对运动路径会同时转移旋转、表情、尺度比和 `t` 的
+相对变化。这适合普通 portrait animation，却不适合本项目“外部还要贴回 A 身体”
+的两阶段合成。应增加一个项目专用的 `rotation_exp` 模式：
+
+- LivePortrait 只负责嘴形/表情和相对三维旋转；
+- LivePortrait 的动态 XY 平移关闭；
+- LivePortrait 的动态 scale 关闭；
+- 外部合成只负责把头颈连接点翻译到 A 脖子支点；
+- 该模式下外部不得再次按帧追加 roll 或 scale，避免双重运动。
+
+这不是让头在屏幕中固定。A 的身体和脖子向哪里移动，头颈支点就跟到哪里；同时
+头部在该支点上做小幅三维旋转。
+
+### 33.3 三视图在本轮中的定位
+
+用户可以提供正脸和左右侧脸，这对后续提升侧转时的发型、耳朵、下颌轮廓和纹理
+完整性有价值，但必须明确：**标准 LivePortrait 不会自动把三张图融合成一个可任意
+转动的三维头模**。
+
+本轮先采用正脸 B 做 10 秒、小角度实验，建议把 yaw 控制在约 `±3°~5°`、pitch
+和 roll 更小。这个范围通常不需要真正的三视图融合。三视图留作第二阶段：
+
+1. 校准 B 在不同角度下的下颌/耳朵/头发边界；
+2. 判断单正脸在某个 yaw 后是否暴露纹理拉伸；
+3. 必要时做 yaw 条件化的参考图选择、纹理补偿或真正的 3D/多视图重建。
+
+**本轮禁止**同时跑三套 LivePortrait 后按 yaw 生硬交叉淡化。三路生成结果的身份、
+曝光和几何不完全一致，直接 cross-fade 很容易出现重影和跳脸，且会干扰本轮对运动
+架构的判断。
+
+### 33.4 正确的数据流和坐标职责
+
+整个流程必须分成五个职责清晰的阶段，不允许混用坐标系。
+
+#### 33.4.1 A：提取原视频相对运动
+
+从 A 的 LivePortrait motion template 或逐帧 motion info 中读取：
+
+- 首帧姿态矩阵 `R_A0`；
+- 第 t 帧姿态矩阵 `R_At`；
+- 首帧与第 t 帧表达 `exp_A0 / exp_At`；
+- 仅用于诊断记录的 `t_A0 / t_At`、`scale_A0 / scale_At`。
+
+相对旋转定义为：
+
+```text
+R_rel(t) = R_At · transpose(R_A0)
+```
+
+若工程当前矩阵约定为行向量/右乘，GLM5 必须用零姿态和单轴合成测试确认乘法顺序，
+不得只根据公式照抄。最终判据是：A 首帧时 `R_rel=I`；A 单独向右 yaw 时，B 也向
+同一视觉方向转动。
+
+不要把嘴部关键点用于全局头位姿或脖子跟踪。嘴在口播中持续运动，会把发音误判为
+头部移动。姿态优先采用 LivePortrait 的 `R`，外部验证可使用眉、眼角、鼻梁等相对
+稳定区域。
+
+#### 33.4.2 B：LivePortrait 只生成“旋转 + 表情”
+
+设 B 源图初始姿态和参数为 `R_B0 / exp_B0 / t_B0 / scale_B0`，构造：
+
+```text
+R_use(t)     = R_rel_scaled(t) · R_B0
+exp_use(t)   = exp_B0 + gain_exp · (exp_At - exp_A0)
+t_use(t)     = t_B0
+scale_use(t) = scale_B0
+```
+
+其中 `R_rel_scaled` 必须把 `R_rel` 转成 axis-angle 或 quaternion 后再按 yaw/pitch/roll
+增益缩放，然后恢复为正交旋转矩阵。**禁止对 3×3 矩阵逐元素线性插值**，否则会破坏
+正交性并产生隐式拉伸。
+
+首轮建议对角度做温和限幅和离线平滑：
+
+- yaw：绝对相对角建议不超过 5°；
+- pitch：建议不超过 3°；
+- roll：建议不超过 3°；
+- 平滑只处理姿态参数，不平滑嘴形表达，以免损坏口型同步；
+- 离线视频可使用对称窗口或 Savitzky-Golay，避免单向 EMA 引入可见相位滞后。
+
+#### 33.4.3 C：在 A 原始画面中估计脖子支点 `P_A(t)`
+
+`P_A(t)` 必须来自 A 原视频的原始分割/关键点，而不是来自生成头或最终 composite。
+推荐定义为“脖子上端中心”，并结合以下信息：
+
+1. raw neck/skin mask 的、与躯干连通的主连通域；
+2. 左右颈边界在下颌下方安全行的中点；
+3. 双肩/衣领中心作为低频稳定参考；
+4. 排除头部遮罩、背景孔洞、手和证件干扰。
+
+推荐先得到逐帧原始点，再做鲁棒去异常和零相位平滑。不得把第一帧支点固定到全片，
+也不得把每帧 face bbox center 当成脖子中心。
+
+若某帧脖子分割置信度不足：短缺失（例如 <=5 帧）使用相邻可靠帧插值；较长缺失
+回退到肩部/衣领刚体轨迹；每次 fallback 必须写入诊断 JSON，不得静默使用 `(0,0)`。
+
+#### 33.4.4 D：在生成的 B 头上估计连接点 `Q_B(t)`
+
+`Q_B(t)` 是生成头实际应该接到脖子的位置，不能等同于鼻子、脸框中心或 alpha
+外接矩形中心。推荐从以下几何构造：
+
+1. B 头部 alpha/head mask 的下部区域；
+2. 稳定 jawline/106 landmarks（排除嘴唇点）；
+3. 左右下颌向内收拢后，估计头颈连接带的中心；
+4. 以 V7 skin bridge 的上端/头 alpha 下端作为约束，避免支点落在下巴尖端。
+
+`Q_B(t)` 需要随 LivePortrait 的 yaw/pitch/roll 变化动态计算，因为旋转后下颌边界会
+变化。但其求法必须稳定，不能受嘴巴张合直接驱动。建议单独输出每帧 `Q_B`、置信度、
+fallback 类型，并在抽帧图上画十字。
+
+#### 33.4.5 E：外部合成只做支点平移
+
+最终外部变换只允许：
+
+```text
+delta(t) = P_A(t) - Q_B(t) + attachment_offset
+head_aligned(t) = translate(head_LP(t), delta(t))
+```
+
+其中 `attachment_offset` 是固定标定量，用于把“数学中心”调整到视觉最佳连接位；
+不得成为逐帧漂移补丁。
+
+在 `rotation_exp` 模式下：
+
+- `external_rotation_gain` 必须为 0；
+- `external_scale` 必须为常量；
+- 禁止再按 A 的 face bbox 做动态 scale；
+- 禁止再按鼻尖/脸中心补偿 X/Y；
+- 允许的动态二维运动只有 `P_A-Q_B` 产生的支点对齐平移。
+
+V7 已通过的 alpha、肤色匹配、skin bridge、raw skin underlay、白墙侵入 audit 和
+证件保护必须原样保留。运动改造不得重新打开旧的白缝、光晕或证件污染问题。
+
+### 33.5 建议代码改动边界
+
+GLM5 先阅读真实函数和数据形状，再决定最小改动位置；不要为了本轮重构整个管线。
+建议改动边界如下：
+
+1. `external/LivePortrait/src/live_portrait_pipeline.py`
+   - 如果必须改官方外部代码，应只增加项目专用、默认关闭的 `rotation_exp` 分支；
+   - 更推荐在本项目 wrapper 中构造 `x_d_new`，减少对 vendor 代码的侵入；
+   - 默认路径行为必须和当前 LivePortrait 完全一致。
+2. `src/headswap/liveportrait_reenact.py`
+   - 暴露/缓存每帧 `R、pitch、yaw、roll、exp、t、scale`；
+   - 增加 rotation-only/rotation-exp 参数构造；
+   - 导出 motion CSV/JSON，供可视化和复核。
+3. `src/headswap/composite_head.py`
+   - 增加 A 脖子支点 `P_A`、B 连接点 `Q_B` 的估计和轨迹平滑；
+   - 增加“支点平移且禁止二次 roll/scale”的模式；
+   - 复用现有 V7 skin bridge 和全部 audit。
+4. `src/headswap/cli.py` 和 job YAML
+   - 新参数必须显式、可追踪；
+   - 默认关闭，避免改变 V7 历史结果；
+   - 每个实验使用唯一输出名，禁止覆盖。
+5. `scripts/headswap_motion_metrics.py` / `scripts/headswap_anchor_plots.py`
+   - 增加姿态曲线、`P_A/Q_B` 曲线、支点误差和首尾漂移；
+   - 输出带标注的锚点抽帧图。
+6. `tests/test_headswap_units.py`
+   - 先补单测，再生成视频。
+
+如果现有 `liveportrait_reenact.py` 无法拿到 vendor 中间 motion info，允许增加一个薄
+wrapper，但禁止复制整套 LivePortrait pipeline 形成第二份难以维护的实现。
+
+### 33.6 建议配置参数及影响
+
+建议增加如下配置；名称可按现有 YAML 风格调整，但语义必须一一对应：
+
+| 参数 | 建议初值 | 作用与风险 |
+|---|---:|---|
+| `lp_motion_mode` | `rotation_exp` | `all/exp/rotation_exp`；本轮使用旋转+表情 |
+| `lp_transfer_translation` | `false` | 关闭 LP 动态 XY，防止与外部贴回重复 |
+| `lp_transfer_scale` | `false` | 关闭呼吸式缩放和脸框尺度噪声 |
+| `pose_gain_yaw` | `0.75` | 左右转动强度；过大单正脸会拉伸侧脸 |
+| `pose_gain_pitch` | `0.65` | 点头强度；过大容易暴露下颌/脖子断层 |
+| `pose_gain_roll` | `0.65` | 歪头强度；过大像摆头，且易与外部 roll 重复 |
+| `pose_limit_yaw_deg` | `5.0` | 单正脸安全限幅，首轮宁小勿大 |
+| `pose_limit_pitch_deg` | `3.0` | 限制抬头/低头造成的下巴拉伸 |
+| `pose_limit_roll_deg` | `3.0` | 限制摇摆 |
+| `pose_smooth_window` | `7` | 只平滑姿态；过大将滞后或抹掉微动 |
+| `neck_pivot_enabled` | `true` | 开启 A 脖子支点跟踪 |
+| `neck_pivot_smooth_window` | `7` | 去除分割抖动，必须使用无相位偏移方案 |
+| `neck_pivot_max_gap` | `5` | 短时低置信插值上限 |
+| `attachment_offset_x` | `0` 起调 | 固定视觉校准，不允许逐帧变化 |
+| `attachment_offset_y` | `0` 起调 | 正值方向须在配置注释中写清楚 |
+| `external_rotation_gain` | `0.0` | rotation_exp 下必须为 0，防止双旋转 |
+| `external_scale_mode` | `constant` | rotation_exp 下禁止动态脸框缩放 |
+| `max_attachment_drift_px` | `3.0` | 超过时测试/审计失败，不得仅告警继续 |
+
+参数约束应在启动时验证。例如 `lp_motion_mode=rotation_exp` 且
+`external_rotation_gain != 0` 必须直接报错；不能让互斥配置悄悄同时生效。
+
+### 33.7 核心伪代码（实现语义，不要求逐字复制）
+
+```python
+# A motion is cached once; all arrays use a documented coordinate convention.
+R_rel = R_A[t] @ R_A[0].T
+R_rel_scaled = scale_rotation_axis_angle(
+    R_rel,
+    yaw_gain=cfg.pose_gain_yaw,
+    pitch_gain=cfg.pose_gain_pitch,
+    roll_gain=cfg.pose_gain_roll,
+    limits_deg=cfg.pose_limits,
+)
+
+R_use = R_rel_scaled @ R_B0
+exp_use = exp_B0 + cfg.expression_gain * (exp_A[t] - exp_A[0])
+
+# Critical: no driving translation or dynamic scale in this mode.
+t_use = t_B0.copy()
+scale_use = float(scale_B0)
+
+head_rgb, head_alpha, head_landmarks = liveportrait_decode(
+    source_B,
+    R=R_use,
+    exp=exp_use,
+    t=t_use,
+    scale=scale_use,
+)
+
+P = neck_pivot_A[t]                         # raw A frame / A-body coordinates
+Q = estimate_B_attachment(head_alpha, head_landmarks)
+delta = P - Q + fixed_attachment_offset
+
+# No second per-frame roll or scale here.
+head_rgb, head_alpha = translate_only(head_rgb, head_alpha, delta)
+frame = composite_with_existing_v7_skin_bridge(frame_A, head_rgb, head_alpha)
+
+audit_attachment(P, transform_point(Q, delta))
+audit_no_background_in_skin_bridge(...)
+```
+
+实际代码必须解决 crop/local/full-frame 坐标转换。建议为点附带明确命名，例如
+`p_neck_full_px`、`q_attach_head_local_px`、`q_attach_full_px`，禁止全部都叫 `center`。
+所有仿射矩阵和点变换写单测，避免“图像用了一个矩阵、锚点用了另一个矩阵”。
+
+### 33.8 只跑 10 秒的实验矩阵
+
+用户明确认为 3 秒不足以看出累积漂移。本轮统一截取原片前 **10 秒**；若原视频为
+30 fps，则使用 `0..299` 共 300 帧。代码应按时间换算帧数，不可永久硬编码 300，
+但本轮报告必须写清实际 fps、起止帧和实际时长。
+
+建议生成以下 4 个版本：
+
+| 编号 | 内容 | 目的 | 建议输出名 |
+|---|---|---|---|
+| R0 | 当前 V7 原逻辑前 10 秒 | 基线，不重算则可直接精确截取 | `motion10-r0-v7.mp4` |
+| R1 | `exp` only + 脖子支点锁定，LP 无姿态 | 隔离“支点跟踪”本身贡献 | `motion10-r1-exp-pivot.mp4` |
+| R2 | `rotation_exp` + 支点锁定，姿态增益 1.0 | 检查完整 A 姿态是否过强 | `motion10-r2-rot100-pivot.mp4` |
+| R3 | `rotation_exp` + 支点锁定，yaw=.75、pitch=.65、roll=.65 | 推荐候选，抑制平面滑动和夸张摆头 | `motion10-r3-rot-soft-pivot.mp4` |
+
+另生成一个四宫格或横向对比视频：
+
+```text
+output/compare-motion10-r0-r1-r2-r3.mp4
+```
+
+要求：
+
+1. 四版使用完全相同的 10 秒、音轨、编码尺寸和 fps；
+2. 画面角落只标 R0/R1/R2/R3 和关键参数，不遮挡脸、脖子或证件；
+3. 同时提供 1.0× 正常速度和 0.5× 慢放对比，慢放文件名增加 `-slow`；
+4. 不得把 diagnostic 十字/曲线画进供用户判断观感的成片；标注版单独输出到 previews；
+5. 不跑 796 帧全片，待用户选中运动方案后再决定是否全片生成。
+
+### 33.9 必须输出的诊断材料
+
+除视频外，GLM5 必须生成：
+
+1. `motion10-poses.csv`：每帧 A 原始和实际使用的 yaw/pitch/roll、t、scale；
+2. `motion10-pivots.csv`：每帧 `P_A、Q_B、delta、对齐后误差、置信度、fallback`；
+3. `motion10-pose-curves.png`：A 姿态与 R1/R2/R3 实际姿态曲线；
+4. `motion10-pivot-curves.png`：A 脖子支点、B 对齐后支点和误差曲线；
+5. 锚点抽帧：至少帧 0、30、90、150、210、299，并补充运动极值帧；
+6. `motion10-report.json`：配置摘要、审计指标、编码信息、耗时和输出 SHA/大小；
+7. `motion10-review.md`：GLM5 对实现、测试、输出及已知问题的自检记录。
+
+诊断材料应能证明“头跟着脖子走”和“头围绕支点旋转”是两件同时成立的事情，不能
+只凭肉眼说已经解决。
+
+### 33.10 自动验收标准
+
+以下标准针对 10 秒实验。任何硬指标不通过，GLM5 必须在报告中标红并保留产物，
+不得把失败版本宣称为最终结果。
+
+#### 33.10.1 头颈支点与累计漂移
+
+- 对齐后支点误差：`p95 <= 1.5 px`，`max <= 3.0 px`；
+- 首帧与末帧的**相对头颈偏移差**：`<= 2.0 px`；
+- 误差曲线不得出现连续单方向增长的累计漂移；
+- A 脖子明显移动时，对齐后的 B 连接点必须同向、同帧跟随，最佳 lag 为 0；
+- 禁止用强制固定屏幕坐标的方式“做出低误差”。支点自身必须保留 A 的身体运动。
+
+#### 33.10.2 运动职责
+
+- `rotation_exp` 模式中，传入 LP 的 `t_use.xy` 全 300 帧恒定；
+- `scale_use` 全 300 帧恒定；
+- 外部逐帧 rotation 增益必须为 0，外部 scale 必须恒定；
+- 首帧相对旋转应接近单位矩阵，不能一开场跳头；
+- R2/R3 姿态方向必须与 A 相同，不得 yaw 左右反转；
+- 姿态曲线平滑但无明显相位滞后，不能嘴已经发音、头过几帧才动。
+
+#### 33.10.3 保持 V7 已通过质量
+
+- 口型相关性不得比当前基线明显下降；参考下限 `mouth_corr >= 0.98`，且相对 R0
+  下降不得超过 `0.01`；
+- 证件 ROI 保护指标不下降；若沿用既有 PSNR，建议仍 `>=34 dB`；
+- V7 的背景/墙体侵入接合区 audit 必须保持全 0；
+- 不得重新出现头颈白横纹、墙色缝、模糊光晕、硬边或马赛克；
+- 不得裁掉耳朵、头发或下颌；
+- 输出必须保留原音频且时长与 10 秒画面一致。
+
+### 33.11 人工验收标准（最终以用户看片为准）
+
+自动指标通过不等于业务通过。用户需要重点看正常速度和 0.5× 慢放，并回答：
+
+1. 脖子是否始终位于头部的合理中间位置，前后没有越偏越远；
+2. 人物说话时是否像头围绕脖子轻微转动，而不是一张平面脸左右滑；
+3. 身体轻微左移/右移时，头颈是否作为一个整体同步移动；
+4. yaw 时鼻子/眼睛允许相对脖子产生合理位移，但连接点不能脱开；
+5. 是否出现摇头晃脑、呼吸式缩放、果冻脸、二次旋转或突然跳动；
+6. 原来满意的脸部形象、嘴唇清晰度和口型是否保持；
+7. 下颌—脖子之间是否继续无白缝、无背景、无横向平切感；
+8. 证件及手是否完全未被污染。
+
+建议优先看片段：开头 0~3 秒（已知存在身体轻微晃动）、3~7 秒（观察连续说话
+时的微旋转）、7~10 秒（检查是否累计漂移）。若 R3 比 R2 更自然但略显僵硬，后续
+只调姿态 gain，不要重新修改合成遮罩。
+
+### 33.12 必须增加的单元/集成测试
+
+至少覆盖：
+
+1. `rotation_exp` 下 300 帧 `t_use` 和 `scale_use` 恒定；
+2. A 无相对姿态时，B 使用源姿态且首帧无跳变；
+3. 单轴正/负 yaw、pitch、roll 的视觉方向和矩阵乘法顺序正确；
+4. axis-angle/quaternion 增益后矩阵仍满足 `R.T @ R ≈ I`、`det(R)≈1`；
+5. 合成轨迹中 `translate(Q, P-Q) == P`，亚像素误差符合预期；
+6. 人工构造连续左移脖子轨迹 300 帧，头颈相对误差不会累计；
+7. `Q_B` 不使用嘴唇点；嘴部大幅张合时 Q 的抖动在阈值内；
+8. neck mask 短缺失插值、长缺失 fallback、无可靠 fallback 时明确失败；
+9. `rotation_exp + external_rotation_gain!=0` 配置校验失败；
+10. 新功能关闭时，V7 关键输出/参数行为不变；
+11. 10 秒成片帧数、fps、音轨和实际时长正确；
+12. V7 skin bridge、背景侵入、证件保护既有测试继续全部通过。
+
+### 33.13 实施顺序（GLM5 必须按顺序，不可边改边跑全片）
+
+1. 阅读现有 V7 与 LivePortrait 的 motion 数据路径，画出真实坐标/矩阵关系；
+2. 只增加 motion 导出，不改变画面，验证 R/t/scale/exp 数值和方向；
+3. 增加上述单测，先确保 rotation scaling 和支点数学正确；
+4. 在 feature flag 后实现 `rotation_exp`，默认关闭；
+5. 实现 `P_A` 和 `Q_B`，先输出 300 帧轨迹与锚点图，不急于合成；
+6. 验证 P/Q 的置信度、fallback 和首尾漂移；
+7. 接入“仅平移的支点对齐”，保留 V7 其他合成逻辑；
+8. 跑完整测试套件；
+9. 只生成 R0~R3 的 10 秒版本和对比片；
+10. 生成 §33.9 的全部材料并由 GLM5 自检；
+11. 停止执行，等待用户看片裁决；
+12. 用户选择方案后，才能讨论全片、三视图增强或参数微调。
+
+### 33.14 风险、失败征象与回滚路径
+
+1. **LivePortrait 的隐式旋转中心不等于真实颈椎支点。**本方案用外部 `P_A-Q_B`
+   修正连接位置，但不能把单张图变成完整 3D 头模；因此角度必须先保持轻微。
+2. **pitch 过大会暴露下颌底部纹理不足。**若出现双下巴、拉伸或脖子洞，先减小
+   pitch gain/limit，不能用扩大模糊遮罩掩盖。
+3. **单正脸大 yaw 会拉伸耳朵、头发。**先减小 yaw；确认运动架构正确后再评估
+   三视图/3D，而不是本轮混入多视图重建。
+4. **P_A 抖动会让整颗头抖。**优先修正连通域和异常点，再做小窗口零相位平滑；
+   不要加很重的 EMA 造成跟随延迟。
+5. **Q_B 受嘴形影响会“下巴跳”。**删除嘴唇点贡献，使用下颌两侧和 alpha 几何；
+   必要时让 Q 的低频部分来自头 mask，局部只做小幅修正。
+6. **双重补偿征象：**R2/R3 比 A 摇得更大、边转边缩放、头绕错误中心画圈。发现后
+   首先检查 LP t/scale 和外部 roll/scale 是否真的关闭。
+7. **若 rotation_exp 暂时效果差：**优先保留 R1（exp-only + 脖子支点锁定）作为
+   技术对照，再逐轴只开 yaw、随后加 pitch/roll；不得回到冻结屏幕坐标的版本。
+8. **若新功能导致脸/嘴或白缝退化：**立即回滚到提交 `5e5f71c` 的 V7 逻辑，
+   运动实验分支不得覆盖已认可产物。
+
+### 33.15 GLM5 完成后的汇报格式
+
+GLM5 完成后必须在本文末尾追加一节“第八轮 10 秒实现记录”，至少包括：
+
+- 修改文件、函数、行号/提交差异地图；
+- 最终采用的矩阵约定和经过测试的乘法顺序；
+- R0~R3 每版完整参数；
+- 全部测试命令和通过数；
+- 每个输出视频的绝对路径、帧数、fps、时长、音频状态和耗时；
+- §33.10 每个指标的实测值，不得只写“通过”；
+- P/Q 锚点图、姿态曲线、漂移曲线的路径；
+- GLM5 人工复查发现的问题，尤其是 7~10 秒是否仍漂移；
+- 推荐用户优先查看哪一版及原因；
+- 明确声明没有覆盖 `final.mp4` 和 `final-v7-skin-bridge.mp4`。
+
+在用户观看 10 秒结果并反馈前，GLM5 不得自行宣布“已解决”，不得继续做全片，也
+不得把三视图融合、背景修复或其他无关重构混入本轮。
+
+---
+
+## 34. 第八轮 10 秒实现记录：rotation_exp + 头颈支点锁定（2026-08-31，Codex 实施）
+
+### 34.1 实施状态与边界
+
+本轮已按 §33 实际编码并生成 10 秒 R0~R3。没有覆盖：
+
+- `jobs-home/hs-p1-0004/output/final.mp4`；
+- `jobs-home/hs-p1-0004/output/final-v7-skin-bridge.mp4`；
+- 原 796 帧全片。
+
+实现前的安全基线提交仍为：
+
+```text
+5e5f71c 完成V7头颈连接与冻结头运动诊断
+```
+
+本节记录的是该提交之后的工作区实现，等待用户看片后再决定是否提交和全片运行。
+
+### 34.2 修改文件地图
+
+1. `src/headswap/motion_control.py`（新增）
+   - `RotationControl`：姿态增益、角度限幅和奇数平滑窗口配置；
+   - `scale_relative_rotations()`：`R_i @ R_0.T` → Rodrigues axis-angle →
+     零相位平滑 → 分轴 gain/limit → SO(3) 重建；
+   - `control_motion_template()`：保留 `R+exp`，把 driving `t/scale` 固定为首帧。
+2. `scripts/liveportrait_runner.py`
+   - 剥离 `--headswap-*` 自定义参数，避免官方 tyro 拒绝；
+   - 运行时 monkey-patch `LivePortraitPipeline.make_motion_template()`；
+   - 不修改被 `.gitignore` 排除的 `external/LivePortrait` vendor checkout；
+   - 输出 `motion10-poses.csv/json`。
+3. `src/headswap/liveportrait_reenact.py`
+   - 新增 `motion_mode=all/exp/rotation_exp`；
+   - `rotation_exp` 对官方仍使用 `animation_region=all`，但 motion template 已把
+     t/scale 的相对变化清零；
+   - 该模式强制使用 `driving_option=pose-friendly`，避免 expression-friendly 的
+     全局 multiplier 再次改变运动职责。
+4. `src/headswap/composite_head.py`
+   - 新增 `estimate_head_attachment()`：Q 只读取双眼和鼻尖，不读取嘴角；
+   - 新增 `estimate_neck_pivot()`：P 来自 A raw neck；
+   - 新增短缺失插值/长缺失 fallback、P/Q Hampel+零相位平滑；
+   - 新增 `build_neck_pivot_transforms()`：全片常量 scale/基础 angle，逐帧只计算
+     `translation = P - linear @ Q`；
+   - 输出 `<composite>.pivots.csv`、transforms JSON、P/Q 抽帧图和硬审计；
+   - pivot 模式禁止 freeze、动态 scale、旧 x/y offset 和外部逐帧 rotation。
+5. `src/headswap/cli.py`
+   - 新模式及互斥配置校验；
+   - `video.max_seconds` 支持准确截取 10 秒 prepare 视频/音频；
+   - 透传全部 pivot 参数。
+6. `config/headswap.hs-p1-0004-motion10-r1.yaml`
+   - R1：`exp-only + pivot`。
+7. `config/headswap.hs-p1-0004-motion10-r2.yaml`
+   - R2：`rotation_exp`，yaw/pitch/roll gain 全 1.0。
+8. `config/headswap.hs-p1-0004-motion10-r3.yaml`
+   - R3：yaw=.75、pitch=.65、roll=.65。
+9. `scripts/headswap_motion10_report.py`（新增）
+   - 汇总视频、SHA256、LP t/scale、姿态曲线、P/Q 曲线、audit 和复核结果。
+10. `tests/test_headswap_units.py`
+    - 新增 axis-angle/SO(3)、t/scale 冻结、嘴点隔离、P 估计、缺失回退、无累计
+      漂移和同矩阵点变换测试。
+
+### 34.3 LivePortrait rotation_exp 的真实实现
+
+官方相对 `all` 路径原来计算：
+
+```text
+R_new     = (R_d_i @ R_d_0.T) @ R_source
+exp_new   = exp_source + (exp_d_i - exp_d_0)
+scale_new = scale_source * scale_d_i / scale_d_0
+t_new     = t_source + (t_d_i - t_d_0)
+```
+
+本轮没有复制或永久改 vendor pipeline，而是在 driving motion template 生成后执行：
+
+```text
+R_d_i     = controlled_relative_rotation_i @ R_d_0
+exp_d_i   = 官方原值，不改
+t_d_i     = t_d_0
+scale_d_i = scale_d_0
+```
+
+因此官方公式自然退化为：
+
+```text
+R_new     = 受控相对旋转 @ R_source
+exp_new   = 官方相对表情/嘴形
+scale_new = scale_source
+t_new     = t_source
+```
+
+R2/R3 的 300 帧实测：
+
+```text
+used_tx_range    = 0
+used_ty_range    = 0
+used_scale_range = 0
+```
+
+旋转不做 3×3 逐元素插值；每帧相对 R 先转 Rodrigues 旋转向量，平滑后重新锚定
+首帧为 0，再做 gain/limit，最后通过 SVD 投影回 `det(R)=1` 的 SO(3)。
+
+### 34.4 头颈支点算法和一次关键纠错
+
+#### 34.4.1 B 连接点 Q
+
+Q 不读取嘴角。X 主要取双眼中点，少量吸收鼻尖 yaw 位移；Y 沿眼中点→鼻尖方向
+延伸到下颌底部，并受 face bbox 宽松限幅。Q 每帧随 LivePortrait 内部旋转变化，
+但不会被发音时嘴巴张合直接推动。
+
+#### 34.4.2 A 脖子支点 P 第一版失败
+
+第一版从 raw neck **最顶部窄带全部像素的中位数**取 X。真实 neck 顶边受下颌
+遮挡，会成为左右两个面积不等的碎片。两侧碎片面积随帧变化时，中位数会突然落到
+某一侧，产生非常大的假横移：
+
+```text
+错误 P.x 10秒范围 = 100.357 px
+A 双眼中心 X 范围 = 22.489 px
+错误 P.x / A X std gain ≈ 7.96
+```
+
+这会重新制造用户最反感的“头在平面上滑动”。第一版产物已判定无效，未放入最终
+review 目录。
+
+#### 34.4.3 P 的正式修复
+
+P 的 Y 仍取 raw neck 真实顶部；P 的 X 改用下方已连成完整脖子的 carrier band：
+
+1. carrier Y：`bbox_bottom + 0.04~0.18 × face_height`；
+2. 每一行读取 neck 的最左/最右边界；
+3. 只有跨度 `>=0.25×face_width` 的完整颈部行才参与；
+4. 每行取 `(left+right)/2`，再对所有行中点取中位数；
+5. 最后 P/Q 分别做 7 帧 Hampel + 对称零相位平滑。
+
+修复后 10 秒：
+
+```text
+P.x range                    = 19.214 px
+P.y range                    = 15.643 px
+P.x vs A eye-center corr     = 0.917
+P.x vs A eye-center std gain = 0.924
+(P-face) 首尾相对变化        = 1.661 px
+P fallback frames            = 0 / 300
+```
+
+首尾相对变化小于 2px，说明没有冻结头版本的累计偏移；中间允许存在真实微旋转导致的
+脸中心相对脖子变化。
+
+#### 34.4.4 外部合成不变量
+
+外部全片只保留一个常量 scale 和常量基础 angle，逐帧动态量只有：
+
+```text
+delta(t) = P_A(t) - linear_const @ Q_B(t)
+```
+
+使用同一 2×3 矩阵重新变换 Q 后审核。R1/R2/R3 均实测：
+
+```text
+P-Q error p95 = 1.14e-13 px
+P-Q error max = 1.14e-13 px
+```
+
+即仅剩浮点误差，不存在数学坐标系累积漂移。
+
+### 34.5 输入素材污染事故与处置
+
+第一次 10 秒运行沿用了旧 YAML 中的桌面绝对路径。该桌面 `person1/shipin.mp4` 已被
+用户后续换成黑衣人物，和 `hs-p1-0004` 的白衣人物不是同一素材。首次输出虽然代码
+可运行，但业务输入错误，已判定无效。
+
+正式配置已锁定不可变的历史 job 输入：
+
+```text
+E:/duikouxing/jobs-home/hs-p1-0004/input/shipin.mp4
+E:/duikouxing/jobs-home/hs-p1-0004/input/portrait.png
+E:/duikouxing/jobs-home/hs-p1-0004/input/side_celian.png
+```
+
+正式 job id 使用 `hs-p1-0004-motion10-white-r1/r2/r3`，防止再次读取同名但内容已
+变化的桌面素材。
+
+### 34.6 正式 10 秒产物
+
+统一审核目录：
+
+```text
+E:/duikouxing/jobs-home/hs-p1-0004-motion10-review/
+```
+
+单版视频：
+
+```text
+output/motion10-r0-v7.mp4
+output/motion10-r1-exp-pivot.mp4
+output/motion10-r2-rot100-pivot.mp4
+output/motion10-r3-rot-soft-pivot.mp4
+```
+
+四宫格：
+
+```text
+previews/compare-motion10-r0-r1-r2-r3.mp4
+previews/compare-motion10-r0-r1-r2-r3-slow.mp4
+```
+
+两者分别为 1.0× 10 秒和 0.5× 20 秒。四个正式单版均为：
+
+```text
+1080×1920 / 30fps / 300帧 / 10.000秒 / AAC原声
+```
+
+诊断：
+
+```text
+reports/motion10-report.json
+reports/motion10-review.md
+reports/motion10-pose-curves.png
+reports/motion10-pivot-curves.png
+reports/verify-r0.json
+reports/verify-r1.json
+reports/verify-r2.json
+reports/verify-r3.json
+previews/pivot-anchors-r2/pivot-r2-f0000.jpg
+previews/pivot-anchors-r2/pivot-r2-f0030.jpg
+previews/pivot-anchors-r2/pivot-r2-f0090.jpg
+previews/pivot-anchors-r2/pivot-r2-f0150.jpg
+previews/pivot-anchors-r2/pivot-r2-f0210.jpg
+previews/pivot-anchors-r2/pivot-r2-f0299.jpg
+```
+
+### 34.7 自动验收结果
+
+#### 34.7.1 几何与接缝硬审计（R1/R2/R3 全部相同）
+
+```text
+attachment_error_p95/max                  = 浮点零
+neck_pivot_fallback_frames                = 0
+audit_changed_from_skin_max               = 0
+audit_wall_intrusion_max                  = 0
+audit_horizontal_wall_component_width_max = 0
+junction_corridor_residual_max            = 0
+jaw_neck_gap_px_max                       = 0
+```
+
+说明新运动模式没有重新打开白墙缝、skin bridge 或下颌—脖子几何断口。
+
+#### 34.7.2 68 点主脸复核
+
+| 指标 | R0 V7 | R1 exp+pivot | R2 rot100+pivot | R3 rot-soft+pivot |
+|---|---:|---:|---:|---:|
+| mouth_corr | 0.981 | 0.985 | 0.982 | 0.983 |
+| center_corr_x | 0.961 | 0.956 | 0.886 | 0.913 |
+| center_corr_y | 0.873 | 0.938 | 0.872 | 0.901 |
+| roll_corr | 0.884 | 0.446 | **0.956** | 0.915 |
+| roll_amp | 1.720 | 0.341 | **0.890** | 0.642 |
+| lag_x | 0 | 1 | -1 | 0 |
+| lag_roll | 3 | 5 | **0** | 1 |
+| halo ΔE median | 2.24 | 1.41 | **1.41** | 1.41 |
+| jaw seam ΔE median | 15.87 | 10.22 | **8.60** | 9.34 |
+| card PSNR dB | 33.7 | 33.7 | 33.7 | 33.7 |
+
+结论：
+
+- R1 证明单纯支点锁定能跟随身体，但 roll 明显不足，仍容易像平面；
+- R3 比 R1 有旋转，但姿态增益偏保守；
+- **R2 是自动指标首选**：嘴形保持 `0.982`，roll corr `0.956`、幅度 `0.890`、
+  lag `0`，最符合“围绕脖子旋转而非平移”的目标；
+- card PSNR `33.7dB` 和 R0 完全一致，说明本轮没有新增证件损伤；但它比 §33 理想
+  门槛 `34dB` 低 `0.3dB`，不能写成绝对过闸，只能写“与基线持平”。
+
+早期 `headswap_motion_metrics.py` 的 5 点简单指标对 yaw/pitch 后的脸中心变化惩罚较重，
+且不如 68 点 roll 稳定；其结果仍保留在报告中作为风险提示，但本轮运动判断以 68 点
+复核、P/Q 不变量和最终人工看片为主。
+
+### 34.8 测试结果
+
+```powershell
+.\.conda-envs\digital-human\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+102 passed in 0.68s
+```
+
+另验证：
+
+- LivePortrait 环境能正确剥离自定义 `--headswap-*` 参数并显示官方 `--help`；
+- R2/R3 motion CSV 均为 300 行；
+- 四版视频均为 300 帧/10 秒；
+- compare 正常版 10 秒，slow 版 20 秒；
+- 三个新版本均未覆盖 V7。
+
+### 34.9 看片顺序与待用户裁决
+
+建议用户按以下顺序：
+
+1. 先看 `previews/compare-motion10-r0-r1-r2-r3.mp4`；
+2. 再看 `previews/compare-motion10-r0-r1-r2-r3-slow.mp4`；
+3. 单独重点看 `output/motion10-r2-rot100-pivot.mp4`；
+4. 对比 `R2` 与 `R3`，判断 R2 是否自然，还是略显转动过强；
+5. 重点看 0~3 秒身体轻晃、7~10 秒是否累计偏移、下颌两侧是否仍连接。
+
+自动结果推荐 R2，但最终裁决只能由用户看片给出。在用户确认前：
+
+- 不跑 796 帧；
+- 不覆盖 final/V7；
+- 不引入三视图融合；
+- 不宣称业务最终通过。
