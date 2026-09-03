@@ -101,6 +101,14 @@ def _resolve(value: str, base: Path) -> Path:
 
 
 def load_local_config(path: Path) -> LocalConfig:
+    """
+    字段	                conda 环境	            用途
+    orchestrator_env	digital-human	    跑编排代码本体
+    dots_env	        dots-tts	        跑 TTS 语音合成模型
+    musetalk_env	    musetalk	        跑 MuseTalk 口型模型
+    latentsync_env	    latentsync	        跑 LatentSync 口型模型
+
+    """
     data = _read_yaml(path)
     try:
         envs = data["environments"]
@@ -109,12 +117,12 @@ def load_local_config(path: Path) -> LocalConfig:
         paths = data["paths"]
         runtime = data["runtime"]
         base = path.parent
-        config = LocalConfig(
+        config = LocalConfig(  # 加载本地环境的配置文件
             profile=str(data["profile"]),
             conda=str(executables["conda"]),
             ffmpeg=str(executables["ffmpeg"]),
             ffprobe=str(executables["ffprobe"]),
-            orchestrator_env=_resolve(str(envs["orchestrator_prefix"]), base),
+            orchestrator_env=_resolve(str(envs["orchestrator_prefix"]), base), # 这是主控/编排环境的 conda 目录——即跑本项目调度代码（pipeline 本体）的那个 Python 环境，区别于另外三个跑模型的独立环境.但是目前还没用得上。未来的拓展字段。
             dots_env=_resolve(str(envs["dots_tts_prefix"]), base),
             musetalk_env=_resolve(str(envs["musetalk_prefix"]), base),
             latentsync_env=_resolve(str(envs["latentsync_prefix"]), base),
@@ -140,8 +148,10 @@ def load_local_config(path: Path) -> LocalConfig:
 
 
 def validate_local_config(config: LocalConfig) -> None:
+    #todo 这里也需要写在一个配置文件中。不然方便做分发
     if config.profile not in {"office", "home", "cloud"}:
         raise ConfigurationError("profile 只能是 office、home 或 cloud")
+    #todo 如果我不用musetalk完全用不上
     if config.musetalk_batch_size < 1:
         raise ConfigurationError("musetalk_batch_size 必须大于 0")
     if config.tts_profile not in {"quality", "fast"}:
@@ -223,8 +233,11 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("reference_text 不能为空")
     if not job.script:
         raise ConfigurationError("script 不能为空")
+    #todo 未来这个需要生成uuid，不能说每次都需要人去手动填写。或者有点规律：用户id+时间戳+uuid。也是一种解决方案。还能通过用户id去关联计费功能。
     if not job.job_id or any(ch in job.job_id for ch in "\\/:*?\"<>|"):
         raise ConfigurationError("job_id 为空或包含 Windows 非法文件名字符")
+
+    #todo 如果我现在需要使用的是latentsync1.6 或者1.5的模型，那么根本不需要校验mouth roi。这个也需要优化。
     roi = job.mouth_roi
     for name, value in (
         ("center_x", roi.center_x),
@@ -254,6 +267,10 @@ def validate_job(job: JobConfig) -> None:
         raise ConfigurationError("composite.temporal_ema 必须在 [0, 1) 范围")
     if int(composite.get("mask_feather_pixels", 6)) < 0:
         raise ConfigurationError("composite.mask_feather_pixels 不能为负数")
+
+    #todo 引擎也需要可动态的配置，而不是在这里写死了。如果我要使用的是latentsync1.5的模型，需要改的地方太多了。需要维护一个list。
+    # 后面加上数据库之后再说。
+    # 包括下面需要添加的参数。也需要有一个统一的入口。
     engine = str(job.lipsync.get("engine", "musetalk_1_5"))
     if engine not in {"musetalk_1_5", "latentsync_1_6"}:
         raise ConfigurationError(

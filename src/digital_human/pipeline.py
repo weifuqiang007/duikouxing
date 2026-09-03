@@ -43,6 +43,9 @@ class Pipeline:
     # 生成音频理论上可以做成多线程，那就不建议返回值是none。
     # 在前期跑demo期间无所谓的。
     def run(self) -> Path:
+        #todo 获取数字身份。这个功能应该是上传视频之后存储的时候，使用uuid进行唯一标识的才对。为什么要这样写呢？
+        # 它是断点续传的安全锁——确保“续传”续的一定是同一份输入，防止改了配置还复用旧中间文件。
+        # 指纹 = hash(全部配置 + 视频内容 + 音频内容)。那这一块和我之前说的使用uuid还不是一件事。还是需要重新审视的。文件大不大？需要如何保存？
         fingerprint = self._job_fingerprint()
         manifest_path = self.root / "manifest.json"
         if manifest_path.is_file() and not self.force:
@@ -51,13 +54,18 @@ class Pipeline:
                 raise RuntimeError(
                     "相同 job_id 的输入或配置已经变化；请更换 job_id，或确认后使用 --force"
                 )
+        #todo 未来从minio中直接获取。到本地生成，然后生成一些中间文件。
         source_copy = self.input_dir / self.job.source_video.name
+        # 这个主要是防止重新跑任务所copy
         if self._should_run(source_copy):
             shutil.copy2(self.job.source_video, source_copy)
         reference = self.input_dir / "reference.wav"
         if self.job.reference_audio:
             if self._should_run(reference):
                 shutil.copy2(self.job.reference_audio, reference)
+
+        #todo 这一块需要写成一个自动化的功能：自动从原始视频中分离音频的文字，然后回填到cloude.yaml文件中
+        #todo 尤其需要注意duration second，在配置文件中一直是14.0，但是真实视频长度都会发生变化。这个参数需要进行改变
         elif self._should_run(reference):
             extract_reference_audio(
                 self.local.ffmpeg,
@@ -68,10 +76,11 @@ class Pipeline:
             )
 
         normalized_video = self.work_dir / "source_25fps.mp4"
-        # 获取视频的fps。应该是获取真实视频的fps，而不是写在配置文件或者是参数中的
+        #todo 获取视频的fps。应该是获取真实视频的fps，而不是写在配置文件或者是参数中的。
         fps = int(self.job.video.get("fps", 25))
         if self._should_run(normalized_video):
             normalize_video(self.local.ffmpeg, source_copy, normalized_video, fps)
+
 
         segments = split_script(
             self.job.script, int(self.job.tts.get("max_chars_per_segment", 60))

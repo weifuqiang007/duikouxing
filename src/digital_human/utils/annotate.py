@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .composite import box_to_roi, grab_frame
-from .config import MouthROI
+from digital_human.composite import box_to_roi, grab_frame
+from digital_human.config import MouthROI
 
 _MAX_DISPLAY = 900  # 显示窗口最长边（像素），避免超出屏幕
 
