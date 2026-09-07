@@ -81,7 +81,7 @@ class Pipeline:
         if self._should_run(normalized_video):
             normalize_video(self.local.ffmpeg, source_copy, normalized_video, fps)
 
-
+        # 调用 split_script()（audio.py:11）——一个中文分句器，把 script 按规则切成短句列表
         segments = split_script(
             self.job.script, int(self.job.tts.get("max_chars_per_segment", 60))
         )
